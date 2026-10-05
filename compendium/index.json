@@ -1,0 +1,840 @@
+{
+  "generated": "compendium/lint.cjs --reindex",
+  "count": 35,
+  "entries": [
+    {
+      "id": "a2a-intent-family",
+      "title": "A2A Intent Family",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Constellation.md#13169-message-classification-by-intent-board-directed-vs-a2a-intent",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "ack-tier",
+        "pre-send-probe",
+        "xss-boundary",
+        "asterism"
+      ],
+      "definition": "The classification of agent-to-agent CUSTOM messages by named intent (Report, Delegate, BlockerManifest, ULTRASAFE_*, etc.) on an allowlist, splitting board-directed from a2a-intent so the dashboard + watcher treat each correctly. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "named-intent allowlist (4-group classification) — board-directed vs a2a-intent; drives card render + meaningful-inbound filter"
+        },
+        {
+          "register": "plain",
+          "text": "messages between agents are tagged by what they're for, so the board and the watcher know how to handle each kind"
+        }
+      ]
+    },
+    {
+      "id": "ack-tier",
+      "title": "Ack Tier",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Constellation.md#1313-a2a-message-reliability--the-ack-layer",
+      "status": "active",
+      "superseded_by": null,
+      "links": [],
+      "definition": "The tier distinction in A2A acknowledgment — a transport-tier Ack is separate from the recipient agent surfacing the message body. Full definition lives in owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "transport-tier Ack != recipient inbox body arrival (at-most-once relay)"
+        },
+        {
+          "register": "plain",
+          "text": "a 'delivered' signal does not mean the other side actually read it"
+        }
+      ]
+    },
+    {
+      "id": "asterism",
+      "title": "Asterism",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Constellation.md#20-asterism--the-name-of-the-wire-contract",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "a2a-intent-family",
+        "ack-tier"
+      ],
+      "definition": "The name of the agent-to-agent wire contract the Constellation module speaks (CUSTOM envelope + routing/ack/declaration/selection/room surfaces, §2–§13). Mark: ⁂. The module is the deployment; Asterism is the pattern agents form on the wire. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "the A2A live-board wire contract (formerly the descriptive 'live-board protocol' label) — the harness-implementable surface, named distinctly from the Constellation deployment"
+        },
+        {
+          "register": "plain",
+          "text": "우리 에이전트들이 보드 위에서 서로 대화할 때 쓰는 통신 규약의 이름이에요 — 별자리(Constellation) 안에서 별들이 이루는 무리(asterism)처럼, 에이전트들이 만드는 연결 패턴이라는 뜻이에요"
+        }
+      ]
+    },
+    {
+      "id": "atomic-note",
+      "title": "Atomic Note",
+      "type": "glossary",
+      "register_class": "general",
+      "owner_spec": null,
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "computed-moc"
+      ],
+      "definition": "A note scoped to exactly one idea and addressed by a stable immutable id, composed with others by linking rather than nesting — the unit that makes a computed MOC and rename-safe cross-linking possible.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "one-concept-per-file with an opaque immutable id; links over hierarchy (Zettelkasten lineage)"
+        },
+        {
+          "register": "plain",
+          "text": "keep one idea per note and connect notes by links, instead of burying ideas inside big documents"
+        }
+      ]
+    },
+    {
+      "id": "blocker-tracking",
+      "title": "Blocker Tracking",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Constellation.md#1320-blocker-tracking--periodic-nudge-discipline--making-waiting-on-external-work-observable-and-time-bounded",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "deadlock-resolution"
+      ],
+      "definition": "The discipline of making 'waiting on external work' observable and time-bounded — a blocker manifest data structure + a periodic BlockerNudge cadence + a 4-tier nudge escalation (polite → explicit → deadline → human). See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "blocker manifest + BlockerNudge every N rearm cycles + 4-tier nudge escalation; waiting becomes observable, not silent"
+        },
+        {
+          "register": "plain",
+          "text": "when work is stuck waiting on someone else, the system keeps it visible and pings on a schedule instead of quietly stalling"
+        }
+      ]
+    },
+    {
+      "id": "board-worker",
+      "title": "Board Worker",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Constellation.md#13233-board-worker-is-a-projected-role-not-a-wire-role",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "collab-key",
+        "blocker-tracking"
+      ],
+      "definition": "A projected dashboard role (not a wire role) for an agent dedicated to maintaining the live board — derived from the backends.json registry, shown as its own tab group. The board worker mutates state.json on the main's delegation. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "projected (not wire) role from backends.json; a delegated agent that maintains the live board state.json"
+        },
+        {
+          "register": "plain",
+          "text": "an agent whose job is to keep the live status board updated, shown as its own group on the dashboard"
+        }
+      ]
+    },
+    {
+      "id": "charter",
+      "title": "Charter",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Corporate.md#22-charter-specificity--precedence-not-load-order-must",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "desk",
+        "durable-role"
+      ],
+      "definition": "A role’s written contract, living in its desk. Specificity comes from precedence, not load order: discovery runs root-to-cwd, so the charter wins by being merged last. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "per-role instruction file in the desk; nearest-wins by precedence (root→cwd discovery, charter merged last), never by a claimed reversed load order"
+        },
+        {
+          "register": "plain",
+          "text": "역할에게 주는 «직무 지시서» — 프로젝트 공통 본문과 부딪힐 땐 이 지시서가 이기지만, 남보다 먼저 읽혀서가 아니에요"
+        }
+      ]
+    },
+    {
+      "id": "collab-key",
+      "title": "Collab Key (ck-)",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Constellation.md#131611-key-management-unification--kind-enum-ssot-v251",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "board-worker"
+      ],
+      "definition": "A KEY-MGMT key of kind 'collab' (prefix ck-) admitting a peer agent to a board's collab channel — one of the kind enum (upstream/collab/local) governing join role + onboarding. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "kind='collab' key (ck- prefix) in the KEY-MGMT 5-state machine; gates peer collab-channel join"
+        },
+        {
+          "register": "plain",
+          "text": "a key that lets a partner agent join the shared board as a peer collaborator"
+        }
+      ]
+    },
+    {
+      "id": "compendium-module-spec",
+      "title": "Compendium Module Specification",
+      "type": "concept",
+      "register_class": "internal",
+      "owner_spec": "Compendium.md#1-concept--what-compendium-is",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "computed-moc",
+        "controlled-vocabulary"
+      ],
+      "definition": "The spec of a cross-cutting vocabulary substrate that navigates and synthesizes the module specs but does not restate their normative content — a source of information, not a source of truth. Full definition lives in owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "concept-anchored dual-register glossary + pointer-not-paraphrase charter + computed-MOC wiki + 4 lints, one-way authority Compendium->spec"
+        },
+        {
+          "register": "plain",
+          "text": "a glossary module that gathers terms from several modules in one place but only points to each module's own document for the real explanation"
+        }
+      ]
+    },
+    {
+      "id": "computed-moc",
+      "title": "Computed MOC",
+      "type": "glossary",
+      "register_class": "general",
+      "owner_spec": null,
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "atomic-note"
+      ],
+      "definition": "A map-of-content index auto-regenerated from frontmatter metadata — a navigation node that cannot drift because it is never hand-maintained.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "a derived view that removes the rot risk of a hand-maintained MOC — source = frontmatter, INDEX.md is the projection"
+        },
+        {
+          "register": "plain",
+          "text": "a way to rebuild the table of contents automatically from file information instead of editing it by hand"
+        }
+      ]
+    },
+    {
+      "id": "controlled-vocabulary",
+      "title": "Controlled Vocabulary",
+      "type": "glossary",
+      "register_class": "general",
+      "owner_spec": null,
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "compendium-module-spec",
+        "superseded-by"
+      ],
+      "definition": "A curated term set in which each concept has one preferred label plus admitted and hidden synonyms, so the same concept is not split across rival words and the same word is not overloaded across concepts.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "preferred / admitted / hidden_search_only labels per concept — collision control over an open term space"
+        },
+        {
+          "register": "plain",
+          "text": "agree on one main name per idea (and list the other names it goes by) so people do not talk past each other"
+        }
+      ]
+    },
+    {
+      "id": "counsel-reconvergence",
+      "title": "Counsel (reconvergence mode) / Principal–Advisor",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Superscalar.md#151-the-return-contract--counsel-is-not-review",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "divergence-reconvergence",
+        "issue-width"
+      ],
+      "definition": "The reconvergence mode in which a lane's output is offered rather than imposed: the advisor returns a perspective, the principal decides. Producer-Reviewer with the gate removed — the two shapes differ only at the merge, so the mode is declared at dispatch. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "non-gating reconvergence; advisory lane returns a perspective, not a verdict — no retire dependency, so Little's Law does not bind the width"
+        },
+        {
+          "register": "plain",
+          "text": "asking someone for a second opinion instead of asking them for approval — you still decide"
+        }
+      ]
+    },
+    {
+      "id": "deadlock-resolution",
+      "title": "Deadlock Resolution",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Constellation.md#1319-deadlock-resolution--formal-spec-prevention--detection--auto-resolution--escalation-layered-above-1313",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "blocker-tracking",
+        "ack-tier"
+      ],
+      "definition": "Constellation's layered handling of agents stuck waiting on each other — prevention, DFS wait-edge detection (2-agent sufficient), auto-resolution, and a 4-tier escalation ladder ending at the human via the decisions panel. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "wait-edge DFS detection + auto-resolution + 4-tier escalation, layered above the §13.13 ack layer"
+        },
+        {
+          "register": "plain",
+          "text": "when two agents are each waiting on the other and nothing moves, the system detects it and breaks the standoff (or asks a person)"
+        }
+      ]
+    },
+    {
+      "id": "decision-to-schedule-seam",
+      "title": "How Hyperbrief Gates Superscalar Retire",
+      "type": "concept",
+      "register_class": "general",
+      "owner_spec": null,
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "four-score-escalation",
+        "retire-axis"
+      ],
+      "definition": "How Hyperbrief's decision gate conditions entry into Superscalar's retire queue — an Explanation-tier link for a cross-module seam that has no single-module home.",
+      "glosses": [
+        {
+          "register": "plain",
+          "text": "the linking relationship where the decision-delegation module must pass an item before the work-cleanup module can retire it"
+        }
+      ]
+    },
+    {
+      "id": "desk",
+      "title": "Desk",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Corporate.md#2-the-desk--two-space-contract",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "locker",
+        "charter",
+        "durable-role"
+      ],
+      "definition": "A role’s private, gitignored working directory holding its charter, memory, and session. The harness runs here, which is how the charter gets nearest-wins precedence. Paired with the locker, the public half. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "gitignored per-role cwd holding charter/memory/session; running the harness here is how charter precedence is obtained (discovery ends at cwd)"
+        },
+        {
+          "register": "plain",
+          "text": "역할마다 하나씩 갖는 «자기 책상» — 그 역할의 지시서·기억·진행상황이 들어있고 공유되지 않아요"
+        }
+      ]
+    },
+    {
+      "id": "deterministic-hook",
+      "title": "Deterministic Hook",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Greatpractice.md#4-hook-mechanism--deterministic-enforcement",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "tier-hierarchy",
+        "maturation-gate",
+        "phronesis-boundary"
+      ],
+      "definition": "Greatpractice's enforcement mechanism — a deterministic if-then hook fired on lifecycle events, with tiered strictness (1st bold / 2nd revert-block / 3rd discuss). Hook block messages must themselves pass the voice lint. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "7-event if-then hook DSL with tiered BRD escalation; the hook's own block message is voice-linted"
+        },
+        {
+          "register": "plain",
+          "text": "an automatic rule-checker that nudges, then blocks, then asks for discussion when a practice is violated"
+        }
+      ]
+    },
+    {
+      "id": "divergence-reconvergence",
+      "title": "Divergence–Reconvergence",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Superscalar.md#15-topology--divergence-reconvergence-and-the-pattern-catalog",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "issue-width",
+        "speculation-gate",
+        "counsel-reconvergence"
+      ],
+      "definition": "The fan-out/fan-in topology of parallel sub-agent work — tasks diverge to run independently then reconverge at a barrier where results are merged. One of the §1.5 dispatch patterns. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "fan-out → independent execution → reconvergence barrier (merge); one of the §1.5 patterns"
+        },
+        {
+          "register": "plain",
+          "text": "split work to run in parallel, then bring the results back together at a meeting point"
+        }
+      ]
+    },
+    {
+      "id": "durable-role",
+      "title": "Durable Role",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Corporate.md#1-concept--the-three-orchestration-axes-and-the-durable-role",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "desk",
+        "charter",
+        "residency-class",
+        "roster",
+        "liaison"
+      ],
+      "definition": "Corporate’s unit — a named seat outliving any session or process, which is what lets it accumulate practice, be addressed across time, and own units. Not a Superscalar lane (anonymous, one fan-out) nor a Constellation agent (a process, not a job). See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "the organization-layer unit — a named seat outliving its processes; accumulation + addressability + ownership + auditability follow from that durability"
+        },
+        {
+          "register": "plain",
+          "text": "사람이 바뀌어도 남는 «자리» — 세션이나 프로세스 하나가 아니라 직책에 가까운 개념이에요"
+        }
+      ]
+    },
+    {
+      "id": "four-score-escalation",
+      "title": "4-Score Escalation",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Hyperbrief.md#21-escalation-4-score-each-indicator-0-3",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "nine-section-ir",
+        "tone-tier",
+        "decision-to-schedule-seam"
+      ],
+      "definition": "Hyperbrief's invocation trigger — four indicators each scored 0–3; total ≥4 (or any MUST-trigger condition) means the decision warrants a full brief rather than a silent agent call. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "4 indicators × 0–3; sum ≥4 OR a MUST-trigger → full Hyperbrief brief (else proceed/recommend)"
+        },
+        {
+          "register": "plain",
+          "text": "a quick four-part score that decides whether a choice is big enough to write up for a person instead of just deciding it"
+        }
+      ]
+    },
+    {
+      "id": "issue-width",
+      "title": "Issue Width",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Superscalar.md#1-concept-mapping",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "divergence-reconvergence",
+        "speculation-gate"
+      ],
+      "definition": "Borrowed from CPU superscalar design — how many sub-agent tasks are dispatched in parallel per cycle. The scheduling discipline tunes issue width against the cost-benefit gate rather than maximizing it blindly. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "parallel dispatch degree per cycle (CPU-superscalar metaphor); bounded by the cost-benefit gate, not maximized"
+        },
+        {
+          "register": "plain",
+          "text": "how many tasks are run at the same time — chosen deliberately, not just as many as possible"
+        }
+      ]
+    },
+    {
+      "id": "liaison",
+      "title": "Liaison",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Corporate.md#103-liaison-as-a-duty-profile",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "durable-role",
+        "board-worker"
+      ],
+      "definition": "The user-facing IDE or desktop seat, declared as a duty profile and deliberately **not** the organization’s main: intake and consultation only, no worklist ownership, no external voice. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "duty profile (§13.9.3 sense) for the IDE/desktop seat: intake + consultation only; not the org main, no worklist ownership, no external voice"
+        },
+        {
+          "register": "plain",
+          "text": "사용자와 직접 이야기하는 자리 — 조직의 대표가 아니에요. 상담과 요청을 받지만 작업 목록을 갖거나 밖에 대해 말하지는 않아요"
+        }
+      ]
+    },
+    {
+      "id": "locker",
+      "title": "Locker",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Corporate.md#2-the-desk--two-space-contract",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "desk",
+        "durable-role"
+      ],
+      "definition": "A role’s tracked public directory — the sharing channel: write a document there and pass the path. Also the cross-host exchange, since a desk does not span hosts. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "tracked per-role public dir; default sharing is write-a-document-and-pass-the-path, and it is the cross-host exchange since desks are host-local"
+        },
+        {
+          "register": "plain",
+          "text": "역할의 «공개 사물함» — 내용을 메시지로 밀지 않고 여기 문서를 쓴 다음 경로만 넘기는 게 기본이에요"
+        }
+      ]
+    },
+    {
+      "id": "maturation-gate",
+      "title": "Maturation Gate",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Greatpractice.md#5-maturation-gate--raw--draft--ratified",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "tier-hierarchy",
+        "retire-axis"
+      ],
+      "definition": "The raw→draft→ratified promotion gate for a practice, scored on a 5-axis multi-criteria maturity_score (cross-ref §5.1). A practice is enforced only once it clears the gate. See owner_spec for the axes.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "raw→draft→ratified state machine; 5-axis maturity_score + notability gate decide promotion to enforced"
+        },
+        {
+          "register": "plain",
+          "text": "a new practice has to prove itself across a few checks before the system starts enforcing it"
+        }
+      ]
+    },
+    {
+      "id": "nine-section-ir",
+      "title": "9-Section IR",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Hyperbrief.md#1-concept--what-hyperbrief-actually-is",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "tone-tier",
+        "four-score-escalation"
+      ],
+      "definition": "Hyperbrief's intermediate representation for a delegated decision — a structured 9-section JSON brief (header, why, consequences, options, …) that a deterministic renderer turns into the surfaced decision card. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "9-section JSON IR (header/why/consequences/options/…) → deterministic renderer → decision card"
+        },
+        {
+          "register": "plain",
+          "text": "a fixed-shape form a decision is written into, so it always renders into a consistent choice card"
+        }
+      ]
+    },
+    {
+      "id": "phronesis-boundary",
+      "title": "Phronesis Boundary",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Greatpractice.md#53-phronesis-codify-boundary--the-region-not-to-codify",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "maturation-gate"
+      ],
+      "definition": "The region Greatpractice deliberately does NOT codify — context-dependent practical judgment (phronesis) that resists being frozen into a rule. The boundary keeps the mandatory tier minimal. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "the codify/​don't-codify line — situated judgment (phronesis) is left to the agent, not frozen into an enforced rule"
+        },
+        {
+          "register": "plain",
+          "text": "some things are judgment calls that change with the situation, so the system on purpose does not turn them into fixed rules"
+        }
+      ]
+    },
+    {
+      "id": "pre-send-probe",
+      "title": "Pre-send Probe",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Constellation.md#13166-watcher-liveness-probe-discipline",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "a2a-intent-family",
+        "ack-tier"
+      ],
+      "definition": "The read-before-write discipline: before every outbound emit (and at every turn-close) probe the inbox from the last-surfaced cursor for meaningful inbound, then incorporate-or-abort. Constellation A2A has no in-flight rejection, so stale-context sends silently drift. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "cursor-tail probe before each emit + cycle-end rearm — at-most-once relay has no in-flight reject, so read-before-write prevents stale-context drift"
+        },
+        {
+          "register": "plain",
+          "text": "always check for new incoming messages right before sending, so you don't reply based on outdated information"
+        }
+      ]
+    },
+    {
+      "id": "readiness-rubric",
+      "title": "Readiness Rubric (two-lens GA)",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Hyperbrief.md#115-v10-readiness-rubric--two-evaluation-lenses-v055-dogfood-entry-04-reflection-v060-self-application--methodology--lenses--anchor-slots",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "four-score-escalation",
+        "tone-tier"
+      ],
+      "definition": "Hyperbrief's v1.0 (general-availability) readiness rubric — two evaluation lenses (methodology + self-application) with anchor slots, used to judge whether a module is ready to declare GA rather than guessing. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "two-lens GA rubric (methodology + self-application lenses, anchor slots) for v1.0 readiness judgment"
+        },
+        {
+          "register": "plain",
+          "text": "a checklist seen from two angles that decides whether a module is truly ready for its 1.0 release"
+        }
+      ]
+    },
+    {
+      "id": "residency-class",
+      "title": "Residency Class",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Corporate.md#71-residency-classes",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "durable-role",
+        "roster"
+      ],
+      "definition": "How long a role’s model process lives: resident, on-wake, on-demand (default), scheduled. A class is a cost commitment, so resident is top-tier-only apart from main and liaison. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "resident | on-wake | on-demand (default) | scheduled; resident is T4-only apart from main/liaison because the class is a cost commitment"
+        },
+        {
+          "register": "plain",
+          "text": "역할의 모델이 «언제까지 살아있는가» — 상주·깨울 때·부를 때(기본)·정해진 시간. 상주로 올리는 건 반복 비용을 약속하는 일이에요"
+        }
+      ]
+    },
+    {
+      "id": "retire-axis",
+      "title": "Retire Axis",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Greatpractice.md#77-retire-axis--active--probation--retired-3-state-state-machine-v030",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "maturation-gate",
+        "superseded-by",
+        "decision-to-schedule-seam"
+      ],
+      "definition": "A practice's lifecycle state machine — active → probation → retired — the eviction-first-class counterpart to maturation: a codified practice that stops earning its keep is demoted, not silently kept. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "active/probation/retired 3-state machine; eviction discipline mirroring the maturation gate (pruning is first-class)"
+        },
+        {
+          "register": "plain",
+          "text": "a practice can be marked active, on probation, or retired — so stale rules get demoted instead of lingering forever"
+        }
+      ]
+    },
+    {
+      "id": "roster",
+      "title": "Roster",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Corporate.md#101-corporatechart--structure-emitted-by-main",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "durable-role",
+        "residency-class"
+      ],
+      "definition": "The organization’s declared structure — seats, hosts, groups, links, rooms — projected to a board as a chart. Declaring a seat is not staffing it. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "the local declaration of seats/hosts/groups/links/rooms; projected as a chart. Declaration ≠ staffing, and an unstaffed seat’s missing state is information"
+        },
+        {
+          "register": "plain",
+          "text": "조직을 적어둔 «명단» — 여기 이름이 있다는 것이 그 자리가 지금 돌아가고 있다는 뜻은 아니에요"
+        }
+      ]
+    },
+    {
+      "id": "speculation-gate",
+      "title": "Speculation Gate",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Superscalar.md#speculation-is-speculative-divergence",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "issue-width",
+        "divergence-reconvergence"
+      ],
+      "definition": "The opt-in, andon-bound gate for speculative execution — dispatching work before its precondition is confirmed. Off by default (per the workspace serial + speculation-off policy); enabled only when the cost-benefit gate clears. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "speculative divergence = run-before-confirmed; opt-in + andon-bound, default off, cost-benefit-gated"
+        },
+        {
+          "register": "plain",
+          "text": "starting work before you're sure it's needed — only turned on deliberately, with a quick stop-cord if it's wasteful"
+        }
+      ]
+    },
+    {
+      "id": "superseded-by",
+      "title": "superseded_by",
+      "type": "glossary",
+      "register_class": "general",
+      "owner_spec": null,
+      "status": "active",
+      "superseded_by": null,
+      "links": [],
+      "definition": "The frontmatter field that records a deprecation redirect from an evicted entry to its replacement (skos:replacedBy) — making eviction a first-class, traceable redirect rather than a silent delete.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "skos:replacedBy on the entry — status:superseded + superseded_by:<id>, old surfaces collapse into aliases"
+        },
+        {
+          "register": "plain",
+          "text": "instead of deleting an outdated term, mark it replaced and point to the new one, so old links still resolve"
+        }
+      ]
+    },
+    {
+      "id": "tier-hierarchy",
+      "title": "Tier Hierarchy (macro/mezzo/micro)",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Greatpractice.md#2-tier-hierarchy--macro--mezzo--micro",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "maturation-gate",
+        "deterministic-hook"
+      ],
+      "definition": "Greatpractice's lazy 3-tier working set — macro (broad doctrine), mezzo (concrete practice), micro (atomic rule) — each tier with its own frontmatter density and edit policy. See owner_spec for the per-tier responsibility split.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "macro/mezzo/micro lazy hierarchy — tier sets frontmatter density + edit_policy; instantiate only the tier a practice actually needs"
+        },
+        {
+          "register": "plain",
+          "text": "practices are written at three zoom levels — big-picture, concrete how-to, and single rule — and you only create the level you need"
+        }
+      ]
+    },
+    {
+      "id": "tone-tier",
+      "title": "Tone Tier (L a.b.c)",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Hyperbrief.md#56-audience-tuned-rendering--audience_profile-3-axis--5-level",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "nine-section-ir",
+        "readiness-rubric"
+      ],
+      "definition": "Hyperbrief's audience-tuned rendering coordinate — a 3-axis (domain-familiarity, abbreviation, jargon-density), 5-level profile written L`a`.`b`.`c`. e.g. L2.2.2 is the plain register the live board uses for content. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "audience_profile = 3-axis × 5-level, notated L a.b.c; sets abbreviation + jargon density of rendered text"
+        },
+        {
+          "register": "plain",
+          "text": "a setting for how plain or technical the wording is, on three sliders — e.g. the board writes at a friendly level"
+        }
+      ]
+    },
+    {
+      "id": "xss-boundary",
+      "title": "XSS Boundary (esc)",
+      "type": "glossary",
+      "register_class": "internal",
+      "owner_spec": "Constellation.md#131612-dashboard-render-patterns--interaction-date-line-attachment-connection-upstream-visibility",
+      "status": "active",
+      "superseded_by": null,
+      "links": [
+        "a2a-intent-family"
+      ],
+      "definition": "The dashboard render discipline that all agent-supplied content is escaped (esc()) post-escape before insertion — attachments via sandboxed iframe, mermaid via textContent — so untrusted A2A/board content cannot execute as script. See owner_spec.",
+      "glosses": [
+        {
+          "register": "expert",
+          "text": "esc()-only render boundary + sandboxed-iframe attachments + textContent mermaid; untrusted content never parsed as live HTML"
+        },
+        {
+          "register": "plain",
+          "text": "everything other agents send is treated as plain text when shown, so it can't run hidden code in the dashboard"
+        }
+      ]
+    }
+  ]
+}

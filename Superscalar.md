@@ -1,0 +1,716 @@
+<!-- module: Superscalar; layer: execution-scheduling; part-of: EstreGenesis 2.5.0 (seed-integrated); status: Stage 1 dogfood baseline (§11 Entry 01-07, Entry 07 = resume-cache incident n=1) + resume-cache discipline (v0.4.3 §3.2 — journal-backed re-issue, determinism + idempotent-artifact preconditions) + (§11 Entry 01-06 with Entry 05 n=7→n=8 absorption sync to bundle 005) + autonomy-aware (v2.2.4 telemetry-integrated) + lane-class-aware (v0.3 read/write cap split) + nested-repo worktree limitation documented (v0.4 §3) + discipline-vs-parallelism meta-note (v0.4 §1) + Hyperbrief decision-delegation interlock (v0.4.1 §3.1 — orthogonal gate, serial evaluation: write/deploy/send lanes pass through cost-benefit gate AND hyperbrief-trigger-check, read-only exempt) + topology pattern catalog (v0.5.0 §1.5 — divergence/reconvergence shape vocabulary + 4 named patterns Pipeline/Fan-out·Fan-in/Expert-Pool/Producer-Reviewer, netwaif/multi-agent-starter MIT attribution) + five-tier composition vocabulary (v0.10.0 §5.1.1 — T1.5 Frontier Execution band split out of T1 on a temperament axis, always paired with verification gates + per-account entitlement check for invitation-gated models) + question-scoreboard main-lane OoO (v0.11.0 §5.3 — the /ooo toggle: one-line question ledger, measurement-first resolution ladder, bypass/assumption-run/park, loss·external-publish hard-gate carve-out, optional Constellation decisions-panel projection) + context-cache discipline (v0.13.0 §1.5.1 — counsel reconvergence + Principal-Advisor pattern (advisory lane returns a perspective, never gates a retire; mode declared at dispatch because the two shapes differ only at the merge); v0.12.0 §5.4 — the /context-caching toggle: memory-hierarchy borrowing; pin model+effort at session head, boundary-timed compaction with rewind-over-compact, post-boundary prefetch, fan-out cache accounting, per-harness flush lists, counter-measured never declared; volatile numbers in cache-registry.json with asOf/confirmedBy/revisit + singleSource marks) + frontier-main cost gate (v0.15.0 §5.1.4 — when the orchestrator itself runs on a T1 model, every fan-out lane binds model AND effort explicitly, T1 only for lanes whose failure cost justifies it, no T1 × top-rung lane by inheritance; enforced at the tool boundary by a pre-dispatch guard that denies unbound lanes rather than pinning a global subagent model; v0.15.1 corrects the stated Claude Code resolution order to the v2.1.251+ form — per-invocation → frontmatter → env default → main — and names the FORCE pin the guard must read) + in-tier selection layers (v0.16.0 §5.1.5 — community rank S/A–F/G: an evidence-gated sentiment signal with its own sample-size, re-fetch and revisit contract that never routes a lane alone; trust cost = expected cost per verified result at a stated aim (TC = mean cost over all attempts / reach rate), measured per model×harness×effort on a bottom-up aim ladder, grader must be able to fail + expected-test-count + tamper→invalid; selection order ceiling → allowance → trust cost → rank tie-break); seed-integration: v2.3.0 (2026-05-29) — Master #13 / Lite #10 / Compact #15; date: 2026-09-29; version: v0.16.0; depends-on: none (optional synergy: Constellation §13.16.9 A2A intents, Hyperbrief §2 trigger rubric — both orthogonal); license: Apache-2.0 -->
+
+# Superscalar — Aggressive Sub-Agent Execution Scheduling (design draft v0.3)
+
+> **EstreGenesis optional module — design draft v0.2 (deep-research integrated).** Where the base seed runs tasks **in declared order**, Superscalar borrows processor-architecture techniques to drive an agent's **own sub-agents** more aggressively: issue several independent tasks at once (*superscalar*), run ready tasks regardless of declared order (*out-of-order / OoO*), and — opt-in — start the likely branch of a gate *before* it resolves (*speculation / branch prediction*). The payoff is **latency hiding**: the real bottleneck in agent work is human review/approval time, not token throughput — so doing useful independent work during that wait shortens wall-clock time. (Natural apex of v1.6.0's *agent-time vs human-time* split.)
+>
+> **What v0.2 adds.** A 3-axis deep-research review (processor architecture / agent harness / work communication & management) validated the 1st scope (OoO baseline + gated speculation) as aligned with computer-architecture canon (Smith-Pleszkun 1988 ROB, Tomasulo 1967) and industry-verified patterns (Claude Code worktree isolation, Anthropic multi-agent ≈90.2% lift). This draft folds in the Stage-1 hardening — `issue_width` formula, read-only speculation scope, Toyota Andon transparency, deterministic budgets, MAST failure-mode anti-patterns — and stages future-work hooks (Stage 2/3 — register renaming, memory disambiguation, value prediction). See §9 for foundations and references.
+>
+> **Costs tokens.** OoO reordering is cheap and safe; speculation trades tokens (and possibly discarded work) for latency. Speculation is **off by default**, asked per use with its trade-off + downstream-sensitivity shown, and scoped/toggleable.
+>
+> **Independent module.** Unlike Constellation (a heavy live-board runtime), Superscalar rides the agent's **native sub-agent mechanism** (e.g. the Task tool + `git worktree` — Claude Code's `isolation: worktree` is the direct industrial analog) — low overhead, no server. Constellation is **not required**; if present it can optionally visualize the scoreboard and may empirically aid detection of MAST FM-1.3/2.6 cases (§7).
+>
+> _Plain-language note: "superscalar / out-of-order / speculation" are CPU terms; each section restates them plainly so any agent — not just ones that know the metaphor — can execute it._
+
+---
+
+## 1. Concept mapping
+
+| Processor | Superscalar (agent) | Stage | Notes |
+|---|---|---|---|
+| Superscalar issue (many instr/cycle) | dispatch several sub-agents at once | 1 | `issue_width` formula, §2 |
+| Out-of-order execution | run tasks whose deps are met, ignoring declared order | 1 | needs a dependency graph (DAG) |
+| Reorder buffer (ROB) | each task in its own **git worktree/branch**; result held until retire | 1 | isolation = architectural-state safety |
+| In-order retire/commit | PM (main) reviews + merges results **in declared order** | 1 | user-visible order preserved |
+| Hazard detection (RAW/WAR/WAW) | dependency + file-conflict analysis before dispatch/merge | 1 | misjudged deps → broken merge |
+| Branch prediction | predict a gating decision (approval/test/A·B) and start the likely path early | 1 | **speculation — opt-in, gated** |
+| Misprediction flush | discard the worktree/branch | 1 | flush cost = tokens already spent |
+| Speculative store buffer | speculative writes stay in the isolated worktree, never `main` | 1 | the irreversibility barrier |
+| **Register renaming** (Tomasulo) | same-file conflicts run in parallel via *alias branches* (`.alt-N` suffix), PM merges | 2 | removes WAR/WAW *without* serialization |
+| **Memory disambiguation** | dispatch on path-guess; verify at retire (rollback if guess was wrong) | 2 | low-priority lanes that resolve to no-conflict become free wins |
+| **Value prediction** | predict the gating outcome from `.agent/_lessons/` history (later) | 3 | v1 uses user-supplied confidence |
+
+Stages: **1** = this draft / immediate ship · **2** = post-v0.2 patch · **3** = experimental.
+
+### Meta-note — parallelism is not sufficient; orchestration discipline produces consistency (v0.4)
+
+The Superscalar mapping above frames the policy surface as "how do you parallelise without breaking architectural-state safety", which can mislead an adopter into reading the document as a *parallelism policy*. It is not. **Parallelism alone does not produce cross-lane consistency.** A naïve max-parallel dispatch (every dimension fires concurrently, no orchestration) achieves the latency win but leaves three structural gaps that no individual lane can close: (1) **duplicate findings are not deduplicated** — the same risk surfaced by four different lanes counts as four; (2) **inter-lane contradictions are not reconciled** — when two lanes both correctly observe a contradiction (e.g., one lane says "uses algorithm X", another says "uses algorithm Y", both grounded in source), neither lane has the other's context, so the contradiction persists as a silent quality defect downstream; (3) **completeness gaps are not surveyed** — each lane reports its own gaps, but no actor produces the *union of gaps* that drives the next iteration's scope.
+
+The §3 retire stage (in-order PM merge + consistency gate + completeness critic) is what produces cross-lane consistency. It is not a *scheduling* mechanism; it is a *coordination* mechanism. Removing it (Arm A in Entry 06's controlled A/B measurement below) preserves parallelism but **eliminates grounding (+118% crossRefs in Arm B), structural deduplication, contradiction resolution, and the completeness map** — naïve parallel is a strictly *faster but less coherent* output mode, not an equivalent one. The wall-clock cost of the discipline (Arm B 2.65× Arm A in Entry 06) is the cost of *phase serialisation* (freeze → consume → cross-cut → retire), not of parallel inefficiency; the lanes inside each phase still parallelise. An adopter choosing naïve-parallel is choosing speed over coherence — a legitimate choice for first-pass reconnaissance, but the wrong choice for handover-grade audit or cross-dimension consistency work. The §5 adoption-threshold table is the surface that surfaces this trade-off explicitly.
+
+---
+
+## 1.5 Topology — divergence, reconvergence, and the pattern catalog
+
+§1 maps the *mechanisms* (issue, OoO, ROB, retire, speculation). This section names the *shapes* those mechanisms compose into. Where §1 borrows the scalar-pipeline metaphor (issue → retire), the shape vocabulary borrows its **sister metaphor — SIMT** (single-instruction, multiple-thread; the GPU execution model where one stream fans across many lanes that may take different paths). Agent fan-out is structurally more SIMT than scalar: many lanes, loosely lock-step, often *heterogeneous* paths. SIMT supplies the two primitive verbs.
+
+_Plain-language note: "divergence / reconvergence" are GPU/SIMT terms — divergence = the lanes split off onto different paths; reconvergence = they merge back into one stream. Every part below restates the shape plainly so an agent that doesn't know the metaphor can still execute it._
+
+### The two primitive verbs
+
+- **Divergence** — work splits into concurrent lanes. Richer than plain "fan-out": divergence spans both the *homogeneous* split (N lanes of one task-shape) **and** the *heterogeneous* split (lanes take different paths — different lenses, producer vs reviewer, a speculated branch). `issue_width` (§2) is the *width* of a divergence; lane-class (read/write, §2) is its *kind*; the cost-benefit gate (§3) is its *admission test*.
+- **Reconvergence** — the divergent lanes merge back into one coherent result. It is the topological counterpart of divergence, and it is exactly where §1's meta-note bites: parallelism alone produces divergence; **discipline produces reconvergence**. Reconvergence is not one mechanism but a *family of modes*:
+
+| Reconvergence mode | What happens at the merge | Mechanism (already in this spec) |
+|---|---|---|
+| **synthesis** | divergent results combined into a *new whole* | synthesis barrier (§2); read-class lanes are disposable, consumed here |
+| **retire** | lanes committed *in declared order* | in-order retire + PM merge (§3) |
+| **review** | one lane's output *gated by another* before it commits | Producer-Reviewer review lane; Little's Law binds (§2) |
+| **counsel** | one lane's output is *offered* to another, which decides whether to use it | Principal-Advisor lane; **non-gating by construction** (§1.5.1) |
+
+A single reconvergence may use more than one mode — e.g. a write fan-out that retires in order *and* runs a consistency gate is **retire + synthesis**. The §3 retire stage's consistency-gate + completeness-critic (see §1 meta-note / §11 Entry 06) is synthesis-mode reconciliation layered onto retire-mode ordering.
+
+### The patterns (compositions of the two verbs)
+
+The first four names are imported as shared design vocabulary from `netwaif/multi-agent-starter` (MIT — §9). EG does not adopt them as new features; it *recognizes* them as the divergence→reconvergence shapes its existing `issue_width` / lane-class / retire / interlock machinery already expresses, and pins names to them so an operator can request a shape **by name**. The fifth is EG's own and is marked as such where it appears.
+
+1. **Pipeline** — divergence-free (or a single-lane chain). Stages run in sequence, each stage's output feeding the next. Reconvergence is *trivial* — in-order **retire** of one lane at a time. The resume cache (§3.2) re-enters a Pipeline at the longest unbroken prefix. Use when stages form a hard dependency chain (a RAW hazard end-to-end). Board: a single advancing channel.
+2. **Fan-out · Fan-in** — *homogeneous* **divergence** (N lanes, same task-shape, disjoint scope) reconverging by **synthesis** at the barrier. Width is set by read-class `issue_width` (§2 — the disposable, no-retire-contention class, runtime-ceiling-bound). Use for broad reconnaissance / coverage sweeps. Board: one progress chip per lane; the barrier's completion is a single `done`.
+3. **Expert Pool** — *heterogeneous* **divergence**: lanes differ by *lens* (correctness / security / perf / repro), not just by scope. Reconvergence is **synthesis with reconciliation**; when the lenses disagree, the Hyperbrief multi-lens interlock (§3.1) is the reconciliation actor. Use when one search angle won't find everything (diversity beats redundancy). This is the shape behind the §11 Entry 06 consistency-gate result — independent dimensions surfaced contradictory halves and synthesis-mode reconvergence met them at the merge boundary.
+4. **Producer-Reviewer** — **divergence** into a write-class producer lane + a distinct review lane; reconvergence is **review**-mode (the reviewer gates the producer's retire). Little's Law (§2) is the binding term — review throughput, not producer count, caps the width. A verifier role / Ultrasafe is the canonical reviewer instance. Use when output must be adversarially checked before it commits.
+
+5. **Principal-Advisor** — **divergence** into the principal's own lane and an advisory lane, reconverging in **counsel** mode: the advisor returns a *perspective*, and the principal decides what to do with it. Structurally this is Producer-Reviewer with the gate removed, and that removal is the entire content of the pattern — see §1.5.1, because two shapes that differ only at the merge cannot be told apart by looking at the dispatch. Use when the value sought is a second reading rather than a second judgment: an unfamiliar problem framing, a design whose failure modes you cannot name yet, a piece of writing whose effect on a reader you cannot check from inside. Not imported vocabulary — this one is EG's, named to sit beside the four above.
+
+### 1.5.1 The return contract — counsel is not review
+
+Producer-Reviewer and Principal-Advisor open the same shape and diverge only at the merge, so the mode has to be **declared in the request** rather than inferred at the merge. A lane that is not told which contract it is under will fall back to whichever its prompt sounds like, and each fallback is wrong in its own direction:
+
+- **Counsel read as review** silently adds a gate nobody approved, and hands it to a lane that was never asked to judge — often on partial input, since an advisor is usually given the question rather than the whole working context. The principal stops owning the decision without ever saying so.
+- **Review read as counsel** silently removes a gate. The producer retires on the strength of an opinion its reviewer meant as binding.
+
+Both failures are invisible at the dispatch and only show up in what got committed, which is the expensive place to find them. So the mode is named on the way out, and the merge records which one it was:
+
+| | Producer-Reviewer (`review`) | Principal-Advisor (`counsel`) |
+|---|---|---|
+| The lane returns | a verdict — pass or block, with reasons | a perspective — what it sees, and what it would weigh |
+| The merge does | gates retire | records it as one input; the principal decides |
+| Outcome is owned by | shared — the reviewer's block binds | the principal, unchanged |
+| Silence means | not yet reviewed; cannot retire | nothing at all. Absence of counsel is not consent |
+| Disagreement is | a stop | recorded, and may be overruled **with the reason written down** |
+
+**The advisor does not relieve the principal of the decision.** That is not a caution about trust; it is what makes the pattern cheap enough to use often. A lane that cannot block does not need the review-throughput accounting that Little's Law imposes on Producer-Reviewer (§2), and it can be dispatched on a question the principal has not finished forming. The moment an advisory return starts gating retires, the pattern has become Producer-Reviewer and inherits every constraint it was chosen to avoid.
+
+**Different lineage is structural, not a preference.** §5.1 already routes adversarial verification to a family other than the author's, for the reason that also applies here: a lane from the same lineage tends to share the author's blind spots, and a second reading that agrees for the same reasons is not a second reading. But *which* model advises well *on what* is an empirical claim, and this spec does not make one. Per-model advisory fitness belongs in the model registry's harness-profile block, under the evidence contract kept there — where, at the time of writing, every advisory row is unconfirmed or refuted. Shipping the mechanism with the routing unsettled is the honest state, and the mechanism does not depend on settling it.
+
+**Cost.** A counsel lane is a divergence and passes the §3 cost-benefit gate like any other. It is also paid in a lane's tokens and wall-clock rather than in the principal's own turn, which is the same who-pays asymmetry that puts the deepest briefing tier behind an explicit request (`Hyperbrief.md` §2.6). A rule that can summon counsel unasked bills someone who did not ask for it.
+
+### Speculation is speculative divergence
+
+§4's speculation is a **divergence onto a predicted branch** that may never reconverge: if the gate resolves against the prediction, the lane is **squashed** (the §1 misprediction-flush) *before* reconvergence rather than merged. The two-stage announce (§4) and the irreversibility barrier (§3) are the discipline that makes speculative divergence safe — a squashed lane must leave no committed side-effect. The full vocabulary is therefore **divergence → [optional speculation, possible squash] → reconvergence (synthesis | retire | review)**.
+
+### Constellation projection (optional)
+
+When Constellation (§6) is the scoreboard, the topology becomes *visible*: divergence is the lanes opening as board channels, each emitting progress (`§13.11.1`); reconvergence is the channels closing into the retire/synthesis event. Andon color (§4) marks lane state (amber = speculative, green = retired, red = squashed/aborted). The board does not change the scheduler — it *projects* the divergence→reconvergence shape so an observer reconstructs lane flow without reading agent-hidden state.
+
+---
+
+## 2. Core — out-of-order scheduling (Stage 1, default-eligible)
+
+- **Dependency DAG, not declared order.** Read the WORKLIST as a graph: an edge = "B needs A's output / touches A's files." Dispatch any task whose predecessors are done; declared order is only a tie-breaker.
+- **`issue_width` is a lane-class-aware dynamic cap.** Two lane classes carry distinct caps because their hazard surfaces differ:
+
+  ```
+  issue_width_write = min(
+    Anthropic effort band(task complexity),     // simple lookup → 1 agent · comparison → 2-4 · complex research → 10+
+    pace_mode cap,                              // Cautious 2 · Proactive 4 · Burst 6 · Sprint 8
+    Little's Law: PM_review_throughput / avg_task_duration,
+    Kanban WIP ≈ (team_size + 1),
+    autonomy_available_workers                  // workers with autonomous-mode active (see §4 worker autonomy precheck)
+  )
+
+  issue_width_read = min(
+    Anthropic effort band(task complexity),
+    runtime_concurrency_ceiling,                // physical bound (e.g. workflow min(16, cores - 2)); see "policy cap vs runtime ceiling" below
+    autonomy_available_workers
+  )
+  ```
+
+  **Why the split.** The two terms dropped from `issue_width_read` — Little's Law (review throughput) and Kanban WIP — model **retire-merge contention** that read-only lanes structurally don't have: no store buffer, no retire-merge ordering, no WAW hazard, and the lane's output is disposable on synthesis (consumed by the synthesis barrier, never merged into a shared mutable surface). Read-only / analysis lanes (subagent context sweeps, workflow read fan-outs, telemetry reads) carry **no irreversible side effects** — they inherit the same boundary §3 already draws for the irreversibility barrier (read / analyze = default-allowed; write / deploy / send = retire-gated). The pace_mode cap is also dropped from the read class because pace_mode is a *retire-side throughput* governor (PM review tempo), not a read-side fan-out governor.
+
+  **What still binds on write lanes.** The binding constraint on write lanes is rarely raw model capacity — it's usually **PM review throughput** (Little's Law makes that explicit), Kanban WIP (prevents WIP blow-up under WAW / merge contention), the Anthropic effort band (keeps simple tasks from over-dispatching), and pace_mode (v1.6.0 — user-chosen ceiling). The `autonomy_available_workers` dimension excludes workers that lack autonomous-mode on both classes (every A2A send / tool call becomes a user-synchronous permission prompt, which collapses Little's Law throughput regardless of nominal worker count).
+
+### Policy cap vs runtime concurrency ceiling
+
+The `issue_width_*` caps above are **policy bounds**. A separate **runtime concurrency ceiling** is the physical bound the underlying mechanism enforces — e.g. a workflow fan-out is bounded by `min(16, cores − 2)` per workflow; an agent-tool fan-out is bounded by the harness's max parallel tool calls. The two govern different surfaces and **do not subsume each other**:
+
+```
+effective_concurrent_read_lanes  = min(issue_width_read,  runtime_concurrency_ceiling)
+effective_concurrent_write_lanes = min(issue_width_write, runtime_concurrency_ceiling)
+```
+
+**Which dominates depends on the mechanism.** For workflow-based read fan-outs, the runtime ceiling typically dominates (the policy cap is conservative and frequently above the runtime cap, so the runtime cap is the binding term). For agent-tool-based fan-outs, the policy cap typically dominates (the harness's parallel-tool ceiling is usually high enough that policy bites first).
+
+**Hard vs soft.** `issue_width_write` is a **hard policy bound** — exceeding it is a policy violation regardless of runtime headroom (retire-merge contention scales with concurrent writes, and Little's Law caps it from the demand side). `issue_width_read` is a **soft preference** subject to the runtime ceiling above it: a read-only fan-out that exceeds `issue_width_read` but stays under `runtime_concurrency_ceiling` is **not** a policy violation (no retire-merge hazard, disposable on synthesis) — it is at most a calibration signal that the policy cap may be set conservatively for read fan-outs in this environment. Dogfood data point: an `issue_width_read = 6` policy cap was exceeded at width 7 in a workflow fan-out (case 7 in §11 Entry 05) with zero downside; the runtime ceiling (≥ 7 per the workflow's own cap) was the actual governor, and policy did not need to intervene.
+
+The §5 adoption thresholds use this distinction: the `merge-conflict rate > 15%` gate binds `issue_width_write` only.
+
+- **Autonomous dispatch** (the §4 watch-state autonomous principle, applied at dispatch-time): once a lane's predecessors are done and its task is part of the *declared* plan (`Phase` ordering, `planned` queue, in-order retire, blocked clearance), the scheduler dispatches it **without asking**. Confirming a planned dispatch is itself a Little's Law throughput leak (every confirmation is a user-synchronous gate) and is the same violation that Constellation.md §4 names at retire-time. Gates apply *only* at decision points: a new major branch (RRP / design), a push / deploy / external publish, or explicit user steering — never at the start of an already-decided `Phase`.
+
+  **Operational note** — Little's Law inputs use a **rolling window** (e.g. last 7 retires), never the instantaneous value (PM throughput swings with time-of-day, fatigue, task complexity). **Cold start** (no measurement data yet) — drop the Little's Law input entirely and rely on the other three until enough history accumulates.
+- **In-order retire.** Even when tasks finish out of order, the PM **merges them in declared order**, so user-visible history and dependent steps stay coherent (precise, in-order retirement).
+- **Hazard check before dispatch.** If two ready tasks touch the same files/contracts (WAW/WAR), serialize or fence (Stage 1) — or use *alias branches* (Stage 2, see §1) to parallelize without serialization.
+- **No prediction here** — every dispatched task is one the plan already calls for. This part is reversible and safe enough to enable broadly (still cost-gated, §3).
+
+---
+
+## 3. Reorder buffer = worktree isolation + cost-benefit gate + budget circuit breaker
+
+- **Each OoO/speculative task runs in its own `git worktree` + branch** (same repo, shared `.git` — far cheaper than full clone; Claude Code's `isolation: worktree` is the direct industrial analog). That worktree is the task's private architectural state = its ROB entry.
+  - **Nested independent-repo limitation (v0.4, surfaced at Entry 05 case 8)**: `git worktree` worktrees the *parent* repo. When the write target lives inside a **nested *independent* git repo** that the parent does not track (e.g., a parent docs/orchestration repo with a separate app repo nested inside — a common monorepo-adjacent shape), the per-lane parent worktree **does not contain the nested repo at all**. The lanes fall back to working in the shared nested repo, each on its own *branch* → **branch isolation, not worktree isolation**. The ROB's architectural-state isolation contract is *not* met; same-file concurrent writes on the nested repo's working tree would produce a real WAW hazard *despite* the `isolation: worktree` request being honored at the parent level. Mitigations: **(a)** worktree the *nested* repo per lane (not just the parent — the harness must detect nested-repo write targets and re-worktree); **(b)** guarantee file-disjointness across the lanes + accept branch isolation as the effective boundary (write-disjoint files on a shared working tree have no WAW); **(c)** harness emits a warning when nested-repo write targets are detected so the operator can pick (a) or (b) explicitly. Until the harness implements detection, the operator is the safety net — Stage-1 dispatch with `isolation: worktree` on a project with nested independent repos must include a file-disjointness pre-check at the lane manifest stage.
+- **Retire = PM review + merge, in order.** The main/PM agent verifies the branch (deps resolved · tests · no hazard) and merges. A merge conflict is a hazard the PM resolves — exactly WAW/WAR resolution.
+- **Cost-benefit gate (per lane spin-up):** open an isolated lane only when *estimated isolation + merge overhead < expected parallel / early-start benefit*. Inputs: worktree setup cost, task size, dependency fan-out, conflict likelihood, pace mode, **downstream sensitivity** (§4). Below threshold → run in-order in place.
+- **Irreversibility barrier — speculative side-effects are LLM-specific worse than CPU.** Read / analyze / isolated codegen may run in a lane. **Speculative write-side tools require explicit allowlist** — by default *outward-facing or irreversible* operations are **forbidden** in speculative lanes:
+  - ✅ default-allowed in speculation: file read, code analysis, isolated codegen inside the worktree, sandboxed test runs.
+  - ❌ default-forbidden: external API calls, shell commands with side effects, DB writes, deploys, deletions, sends/broadcasts. (These wait for retire.)
+  - The "store buffer" auto-isolates everything in a CPU; in an LLM this barrier is *manual* — keep the allowlist tight and auditable.
+- **Deterministic budgets (circuit breaker).** Do NOT ask the LLM to estimate its own cost — MAST FM-1.5 *"Unaware of termination conditions"* is one of the most common failure modes (~12% of traces). The harness enforces hard caps:
+  - per OoO lane: `max ≤ 50k tokens` (configurable)
+  - per speculative lane: `max ≤ 30k tokens` (tighter — wasted on misprediction)
+  - total concurrent lanes: `max ≤ 200k tokens` aggregated
+  - exceeded → automatic `abort` of that lane; the user is notified via the harness's notification channel — **Constellation board chip flips red + notification** when Constellation is present, otherwise **stderr / log / non-zero exit code**. (Anthropic production operators report the same conclusion: cost-circuit-breakers are mandatory because misbehavior compounds geometrically. Empirical baselines: ~4× chat-to-agent, ~15× multi-agent — the caps above are intentionally conservative and may be tightened *or* loosened with operational data.)
+- **Lane manifest (prerequisite for §7 MAST guards).** Every lane (OoO or speculative) registers with the harness on dispatch:
+
+  ```
+  { lane_id,
+    intent,                  // declared action (one-line natural-language)
+    gate_dependency,         // which gate's outcome this lane assumes (speculative only)
+    planned_commit_subject,  // for FM-1.3 duplicate-work cross-check vs sibling lanes
+    sibling_lanes }          // other active lanes for cross-check / SIGTERM targeting
+  ```
+
+  The harness uses this manifest to enforce §7's FM-1.3 / FM-1.5 / FM-2.6 guards (duplicate-work cross-check, gate-resolve SIGTERM to dependent speculative lanes, announce-vs-action audit). **Without the manifest, those guards cannot fire** — treat manifest registration as part of lane dispatch, not optional metadata.
+
+### 3.1 Hyperbrief decision-delegation interlock (v0.4.1 — orthogonal gate, serial evaluation)
+
+Superscalar and Hyperbrief are **orthogonal gates** evaluated **serially** at every fan-out decision and at every write/deploy/send action. Superscalar asks: *"is this fan-out worth the cost?"* Hyperbrief asks: *"does this require user delegation?"* The two gates compose without either subsuming the other.
+
+- **Read-only lanes are exempt from Hyperbrief by construction.** Per §2's read/write split, read-only lanes (subagent context sweeps, workflow read fan-outs, telemetry reads) have no irreversible side effects and inherit the same boundary as the §3 irreversibility barrier (default-allowed in speculation). Hyperbrief's trigger rubric (4-score escalation + 5 MUST-trigger conditions, see `Hyperbrief.md §2`) is structurally below threshold for read-only — the rubric is not even invoked on this class.
+- **Write / deploy / send lanes pass through both gates in order.** First Superscalar's cost-benefit gate (per-lane spin-up admission); if accepted, the lane enters Hyperbrief's escalation check before any side-effecting action. If `hyperbrief-trigger-check` returns `AUTONOMOUS_DECIDE` (sum < 4, no MUST-trigger), the lane proceeds with a one-line post-notify and no brief. If it returns `FULL_HYPERBRIEF` (sum ≥ 4 or any MUST-trigger), the lane is **paused** — a Constellation `DECISION_REQUEST + HyperbriefCard` pair is emitted to the user-board (or, in standalone mode, the brief is rendered to `.agent/_decisions/<id>.{md,html}` and surfaced inline), and the lane awaits ack-tier `decided` per Constellation §13.16.9. Other reversible sibling lanes continue under Superscalar latency-hiding.
+- **Multi-lane batching.** When several write/deploy/send lanes pass Hyperbrief's escalation check in the same fan-out, the lane manifest's `sibling_lanes` field (see above) lets Hyperbrief emit a **single** `HyperbriefCard` with the sibling lanes as MCDA alternative rows, rather than one card per lane. This prevents decision-flood — the user sees one consolidated brief covering the cross-cut, not n independent escalation queries.
+- **User outcome → Superscalar resume.** On the board's return envelope: `DECISION_RESPONSE { meta_branch: 'accept' }` resumes the lane; `DECISION_DEFER` queues the lane to a `defer_until` timestamp; `DECISION_REJECT_FRAMING` cancels the lane (the user has refused the question the agent posed); `DECISION_RESPONSE { meta_branch: 'request_investigation' }` spawns a research lane to gather the missing input. The retire stage's PM-review-and-merge step (see above) consumes whichever outcome arrived and feeds Hyperbrief's `§9 Decision Capture` automatically — closing the cross-module learning loop without operator intervention.
+- **Speculation discipline.** Speculative lanes (§4) must remain on the read-only / sandboxed-test side of the §3 irreversibility barrier per the existing rule. They never trigger Hyperbrief because they cannot reach the write/deploy/send boundary that the barrier protects. If a speculative lane's *retire-time* commit would cross the barrier, that commit is the side-effecting action, and *it* — not the speculative work — enters Hyperbrief's gate.
+
+**Pseudocode** (the canonical write/deploy/send lane shape under the interlock):
+
+```
+on fan_out_request(intent, lanes):
+  if not superscalar.cost_benefit_gate(intent, lanes): return RUN_INLINE
+  for lane in lanes:
+    if lane.class == 'write' and lane.action in IRREVERSIBLE_ALLOWLIST:
+      verdict = hyperbrief.trigger_check(lane.intent)
+      if verdict == FULL_HYPERBRIEF:
+        superscalar.pause_lane(lane)
+        emit DECISION_REQUEST + HyperbriefCard for lane
+        await ack_tier='decided' or timeout
+        switch user_outcome:
+          case accept:               superscalar.resume_lane(lane)
+          case defer:                superscalar.queue_lane(lane, defer_until)
+          case reject_framing:       superscalar.cancel_lane(lane)
+          case request_investigation: superscalar.spawn_research_lane(lane)
+      # AUTONOMOUS_DECIDE → no pause; lane proceeds with one-line post-notify
+  superscalar.dispatch(lanes)
+```
+
+**Cross-references**: `Hyperbrief.md §2` (trigger rubric), `Hyperbrief.md §9` (Decision Capture + Superscalar feed-back), `Constellation.md §13.16.9` (A2A-intent allowlist for the 5 Hyperbrief names + the `ack_tier='decided'` extension).
+
+### 3.2 Resume cache — journal-backed re-issue of interrupted fan-outs (v0.4.3)
+
+CPU mapping: **checkpoint / precise-exception recovery**. A wide fan-out can be interrupted mid-flight (token/session budget exhaustion, harness restart, transient API failure) *after some lanes have already retired*. Without a resume mechanism the only options are (a) full re-dispatch — paying every retired lane again — or (b) manual salvage. A **journal-backed resume cache** makes the interruption survivable: the orchestration harness journals each lane's `(prompt, opts) → result`; on re-issue of the same orchestration, the longest unchanged prefix of lane calls returns cached results instantly and only un-retired lanes execute live.
+
+Discipline (harness-neutral — these are the properties to demand, not an implementation):
+
+- **Determinism precondition.** The orchestration script must be referentially stable: no wall-clock reads, no randomness, no order-dependent lane identity. Otherwise the cache key drifts and the re-issue silently re-runs retired lanes (or, worse, wrongly hits). Inline static work-lists; pass timestamps in as arguments; stamp results after the run returns.
+- **Idempotent lane side-effects.** A lane that writes artifacts must tolerate re-execution (overwrite-with-same-content), because there is a real crash window between *artifact written* and *retirement journaled* — a lane can have produced its output yet still be re-run on resume. Treat artifact presence as advisory; the journal is the retire SSoT.
+- **Cost-benefit composition (§3 gate, §5 thresholds).** Expected interruption cost grows with fan-out width × lane duration. Above the ~30-60k token horizon where the dispatch gate opens, resume capability should be treated as a *prerequisite-grade* harness feature, not a nicety. If the harness lacks it, prefer smaller batches with an externally-checkpointed work-list (per-item completion files on disk + a pre-check that skips valid existing outputs) — the manual equivalent of the same property.
+
+Reference implementation: Claude Code `Workflow` resume (`resumeFromRunId` — same script + same args ⇒ cached prefix). The manual fallback above provides the property on any harness. Empirical anchor: §11 Entry 07.
+
+
+---
+
+## 4. Speculation (Stage 1 — opt-in, gated, Andon-bound)
+
+- **What it is.** Starting the *likely* branch of a not-yet-resolved gate (user approval, review verdict, a test outcome, an A/B choice) before it resolves, so the result is ready the instant the gate clears.
+- **Off by default.** When the agent spots a high-value speculation, it **asks the user** with the trade-off shown:
+  - predicted branch + agent's confidence
+  - latency saved if right
+  - token / discard cost if wrong
+  - **downstream sensitivity** — *if wrong, how much of the speculative work has to be redone?* (low = read/summarize, high = interface design or contract change). Low-sensitivity work is the natural speculation target; high-sensitivity work usually waits.
+
+  The user supplies the confidence (acting as the branch predictor); no automatic history-based predictor in v1 (Stage 3, fed by `.agent/_lessons/`).
+- **Two-stage announce** (Spectre lesson — *micro-architectural* side effects in CPUs become *cognitive* side effects in LLM/user space; even discarded work leaves an anchor):
+  1. *"considering X"* — no work started; just shown on the board / told to user.
+  2. After user `ack` → *"executing X (speculative lane <name>)"* — only then does the lane spawn.
+- **Default scope = read-only tools.** Per §3, speculation may not touch outward / irreversible side effects. Even on opt-in, the safe default scope is *read · analyze · isolated codegen · sandboxed tests* — explicit toggle required to widen.
+- **Toggle + scope.** Switchable mid-project, plus scope limits ("speculate on read/analysis only" · "never on code that will be committed" · "only within this task"). The toggle is **four modes and a read-back**, and the axis they graduate along is the one this section already names — *downstream sensitivity* — not a new one:
+  - `off` — **the default.** No speculative lane spawns. A deployment that never sets this is in this mode.
+  - `auto` — the behavior described above: the agent proposes, shows the four-element trade-off, and spawns only after `ack`. One decision per speculation.
+  - `on` — **low-sensitivity lanes are pre-authorized** (read · analyze · summarize inside the worktree, sandboxed tests) and spawn without asking; high-sensitivity lanes (interface design, contract change — work that must be largely redone if the prediction was wrong) still ask. This is the threshold form of the sentence above about which work is the natural speculation target.
+  - `always` — **every lane that stays inside §3's irreversibility barrier is pre-authorized.**
+  - `status` — reports the current mode and where it would apply next. A toggle without a read-back is a setting nobody can confirm, and an unconfirmable setting drifts from what its owner believes it to be.
+
+  One constraint governs all four and must not be read past: **the mode changes who authorizes a lane, never what a lane may touch.** §3's irreversibility barrier is unaffected by any mode, `always` included — `always` widens the set of lanes that need no per-instance ack, and widens nothing else. Read the other way it says something stronger: there is no mode in which speculation reaches a write, a deploy, a send, or a delete, so no operator setting can turn speculation into an outward-facing action. A deployment that wants a wider *scope* changes the scope limits, which is a separate and explicitly narrower decision than changing who signs off.
+
+  Andon (below) applies unchanged at every mode. A pre-authorized lane still announces, still colors its chip, still honors `/stop-spec`, and still logs a misprediction — pre-authorization removes the *question*, not the *visibility*. Losing the announcement at `always` would make the loudest mode the quietest one, which is the failure this section's two-stage announce exists to prevent.
+
+  State lives in **one marker** read at dispatch time, and is not mirrored into other settings surfaces: duplicated per-lane bindings have shipped state-convergence bugs (the same rule §5.1's tier toggle carries). Changing the mode is a declaration event where a board is present (Constellation.md §13.23.4) — change-triggered, latest-wins — so the toggle and its announcement are one unit of work, not two.
+- **Andon 3-element transparency** (Toyota Production System / Jidoka) — **enforced by the harness** (not the lane itself — a misbehaving lane cannot opt out), mandatory for every speculative lane:
+  1. **Visual signal** — board chip colored distinctly (amber = speculative, green = retired, grey = planned, red = aborted). Speculation MUST be visible. **Runtime process liveness is part of this visibility** — a watcher / scheduler / coordinator process dying silently (e.g. via a nested `run_in_background` spawn losing its child on parent exit) while lane chips still show green is the same silent-disable pattern at the runtime layer (real incident, 2026-05-29: an upstream main's watcher died this way after a push and ~30 min of inbound traffic went silently missed despite every surface signal — server, standby, HTTP — looking healthy). Surface tooling should expose process liveness alongside lane state (Stage 2/3 boost — adds a runtime-chip dimension to the existing lane chips). **Worker autonomy precheck** — before counting a worker as a dispatchable lane (i.e. before counting it in `autonomy_available_workers` of the §2 `issue_width` formula), verify the worker has autonomous mode active and protocol compliance (no per-action permission prompt; proper §13.9 `AgentHello` on join; self-state tracking accurate). A worker without autonomous mode is a *user-synchronous node*, not a parallel lane — every A2A send / tool call becomes a permission gate at the user, which is the same Little's Law collapse the autonomous-dispatch §2 rule prevents. Empirical: an upstream main observed Haiku-tier workers fail this precheck (auto-mode unavailable + permission per A2A + protocol non-compliance) and treated them as non-dispatchable on critical paths; Opus + Sonnet workers passed. Surface tooling should show worker autonomy state alongside the lane chip — a non-autonomous worker should render as a *manual* node (distinct from a planned lane), not silently count toward `issue_width`.
+  2. **Pull-the-cord (`/stop-spec`)** — single user command discards all speculative lanes immediately. Honor latency = the next instruction; never silently continue after a stop.
+  3. **Root-cause logging** — on misprediction (lane discarded), the harness appends a structured entry to **`.agent/_lessons/spec-discard/`** (a separate sub-directory so speculation history doesn't mix with general troubleshooting): branch predicted · branch actual · sensitivity · cost in tokens · cause · **`detection-source`** — `human-visual` (caught live on the board) vs `post-hoc-analysis` (caught only by retrospective log review). Feeds the §6 measurement signal and Stage-3 value prediction.
+- **Misprediction = isolated flush.** Discard the worktree/branch (the user never silently receives unrequested merged work). Spending is bounded by §3's circuit breakers; trust impact is bounded by Andon (no surprises).
+- **Constellation §13.11 board-emission link.** When Constellation is the scoreboard, Andon Visual signal composes with Constellation `§13.11.1` (mandatory progress emission at safe points — the observer reconstructs lane flow without reading agent-hidden state) and `§13.11.2` (no autonomous heartbeat during idle — false-alive on the board; real incident: `codex-watch.cjs` removed). Visual signal here IS §13.11.1 in practice — silent lane chips after a worker dies is exactly the failure §13.11.2 names. A2A reliability (`§13.13` ack layer — `msgId` + server-auto `Ack{delivered}` board-hidden + optional `AckProcessed` WILCO + Ping/Pong as application liveness probe, **not retransmit**; Two Generals termination on persistent silence) composes orthogonally — ack layer is silent by design and won't fill emission gaps; the two §s cover complementary failure modes.
+
+### 4.1 Timeout-composed speculation — the clarify-loose / approval-strict polarity (v0.7.0)
+
+Pending human gates fall into two families with **opposite** correct timeout behavior, and the vocabulary must keep them apart:
+
+- **Clarification gates** — "which way?" questions where every offered branch is safe (tier choice, naming, ordering). Correct policy is **loose**: a long window (reference practice on a resident-gateway harness: 3600 s), then a **sentinel** after which the agent proceeds on its best understanding, stating which default it took. Blocking an agent-day on a preference question is the failure mode here.
+- **Risk gates** — permission for a loss or external-publish action (push, deploy, send, delete, spend). Correct policy is **strict**: a short window (reference: 60 s) and **fail-closed** — expiry means *deny*, never proceed. The action waits or dies; it does not happen by silence.
+
+**The inversion is the sin**: self-proceeding on an expired risk gate converts a timeout into unauthorized execution; fail-closing a mere clarification converts a preference into an outage. A gate MUST be classified into exactly one family *before* its timer starts, and misclassification-on-purpose (labeling a risky action a "clarification" to inherit the loose pole) is a §7 anti-pattern.
+
+**Speculation composition.** While a *clarification* gate waits, the agent MAY — under this section's existing opt-in, scope and Andon rules, unchanged — pre-execute the **leading** branch in a discardable speculative lane. The sentinel then does one of two things: the answer never came → the lane's branch *is* the best-understanding default, and the lane retires into architectural state; the answer came and matches → same, latency saved; the answer came and differs → isolated flush, standard misprediction path. **Late steering**: an answer arriving *after* the sentinel is not an error and not ignorable — it is steering: re-aim the affected slice (or discard the retired lane's downstream) rather than restarting from zero or dismissing the late reply. *Risk* gates get **no** speculative pre-execution of the gated action itself — the action *is* the risk; at most read-only preparation within §4's default scope, clearly Andon-marked as prep for an unapproved action.
+
+**Provenance honesty.** The polarity itself is verified current practice on a shipping resident-gateway harness (measured windows above). The *composition* — timeout sentinel + speculative pre-execution + late-steering acceptance as one contract — has, as of 2026-07, no direct published precedent (near precedents exist: speculative pre-execution research, wait-time pre-work patterns); EG stakes the vocabulary here and treats every implementation as Stage-1 opt-in like all §4 speculation. Cross-links: Hyperbrief §2 (a clarification heavy enough to warrant a brief escalates there; §3.1's serial interlock is unchanged — decision evaluation is never speculated), Constellation §13.17/§13.19 (board defer + deadlock routes), `constellation/BOOTSTRAP.md` ch. 4 (operational walk-through).
+
+---
+
+## 5. Options, toggles, and adoption thresholds
+
+- Bootstrap / migration adds an **execution-scheduling** choice: `in-order` (default, safe) | `superscalar` (OoO core); under superscalar, `speculation: off (default) | ask | scoped`.
+- **Pace-mode link (v1.6.0):** issue-width band + speculation appetite scale with Cautious → Sprint (one input to the §2 formula, not the sole one).
+- **Token-budget caps** — see §3. Treat as hard ceilings, not soft hints.
+- Recorded in `AGENTS.md` core rules alongside language / tone / pace.
+
+### 5.1 Tiered model composition — the `/subscaler` toggle (v0.6.0)
+
+Dispatch discipline (§2) decides *what* fans out; **subscaler decides which model tier it fans out to**. When the main agent runs on a frontier reasoning model, the toggle makes execution-shaped work — code writing and editing above all — run on the strongest *execution*-tier model as subagents (one tier below the main, reasoning effort raised), instead of burning frontier tokens on well-specified emission. The name is the CPU lineage's own counterpart to superscalar: deliberately running work *sub-scale* — one tier down — because the orchestration layer above it is what carries the quality.
+
+**Evidence base (distilled from a 5-axis verified research pass; key public anchors cited inline):**
+- The two-model split has a measured ancestor: aider's architect/editor mode, where a reasoning model proposes and a cheaper editor applies, beat a stronger solo model on both quality and cost (the R1-architect + Sonnet-editor pairing scored above o1 solo at ~14× lower cost). The mechanism is **spec-completion then execution offload, not intelligence stacking** — the same model paired with itself also gains, and the split is documented as a remedy for edit-format failures. Spec completeness is the quality moderator.
+- Vendor guidance itself endorses tier composition (execution-tier teammates, frontier reserved for architectural judgment) while explicitly cautioning that *shared-context coding fits multi-agent decomposition poorly* — the toggle therefore targets fan-out contexts, not everything.
+- Prompt caches do not survive a model switch: a delegated subagent on a different model starts cache-cold. Small, cache-hot, deep-context work loses money on delegation; parallel fan-outs have already forfeited the shared cache, making them the natural application point.
+- Frontier→execution-tier price gaps (roughly 2×–10× per token across current vendor ladders) make the delta economically material at fan-out scale — but routing-savings evidence is workload-dependent, so no fixed saving is promised.
+
+**Toggle contract:** default **OFF**. Recommended ON for Workflow / parallel-dispatch fan-outs (3+ lanes, or any lane whose prompt is self-contained). State lives in **one marker file read at invocation time** (`.agent/subscaler.json` — `{"on": true, "pair": "<family>"}`); per-role model binding duplicated across settings surfaces has shipped state-convergence bugs in the wild, so one source of truth, no mirrors.
+
+**Delegation rubric** (the discipline the toggle switches on):
+- **Delegate**: spec-complete implementation · boilerplate · migrations · test scaffolding · mechanical multi-file edits · read-only exploration · summarization.
+- **Retain on the main model**: architecture decisions · ambiguous-requirement interpretation · cross-cutting design · complex debugging · final review · deep shared-context coding.
+- Every delegated lane carries **explicit acceptance criteria and a test gate** written by the orchestrator — the spec-completeness moderator made procedural. The §2 cost-benefit gate still runs first (is spawning worth it at all?); subscaler only chooses the tier of lanes that pass it.
+
+#### 5.1.1 Five tiers, not two models (v0.9.0 four-tier cut · v0.10.0 T1.5 split)
+
+Earlier versions named a two-row pair table (frontier main → execution sub) per vendor family. That shape was right and too coarse: a fan-out has more than two kinds of lane, the cheap end of a ladder is where most tokens actually go, and naming *models* in a spec guarantees the spec rots on the vendor's release cadence rather than on its own. So the **durable artifact is the tier vocabulary**, and which concrete models occupy each tier lives in a dated, replaceable data file — `plugins/superscalar/model-registry.json` (§5.1.3).
+
+| Tier | What it is | Select when |
+|---|---|---|
+| **T1 · Frontier Reasoning** | The vendor's deepest-reasoning flagship: highest price per token, thinking on by default and often not disableable, widest effort ladder (it owns the top rung the cheaper tiers lack). | The cost of a *wrong* answer exceeds the cost of the tokens — irreversible actions, ambiguous or under-specified input, architecture later work is built on, adversarial review of another model's output. Never for volume. |
+| **T1.5 · Frontier Execution** | The vendor's *start-here* flagship: frontier-class capability at roughly half T1 per token, positioned by the vendor as the default for complex agentic coding rather than for deepest deliberation. Split from T1 on temperament as much as price: it converts thinking into action sooner. | Complex multi-step execution where judgment remains but the frame is set — the daily-driver main loop, heavyweight implementation lanes. **Always pair with verification gates** (check-first, test gates): the slip mode is premature action, and effort does not buy deliberation. Decisions and adversarial review stay T1; spec-complete work drops to T2. |
+| **T2 · Agentic Execution** | The workhorse: near-frontier coding at roughly a third to a half of T1 per token, tuned for tool loops and multi-file edits, full effort ladder, large window. | The decision is already made and the spec is written — "do the thing correctly" rather than "decide what the thing is". This is where most tokens should go; escalation to T1 should be an exception you can name a reason for. |
+| **T3 · Bulk Worker** | Cheap-but-competent models the vendors themselves market for subagents: real edits and real tool use, but a smaller window or shallower reasoning ceiling than T2. | Wide parallel lanes whose unit of work is small, independently verifiable, and cheap to redo — read-heavy scans, per-file mechanical edits, test scaffolding. The economics say buy **width** here, not depth. |
+| **T4 · Resident Observer** | The cheapest always-on tier: lowest latency floor, thinking minimal or absent — some members have no effort parameter at all. | Anything that must run continuously and mostly report "nothing to do": inbox/board polling, event classification, triage routing. Budget it monthly, not per task. Its job is to decide **whether to wake a higher tier**, never to author code or make an expensive-to-reverse call. |
+
+**Why the T1.5 band exists (v0.10.0).** The four-tier cut left a 2× spread inside T1 — the registry's own price rows recorded it, the tier boundary absorbed it — and the routing-relevant half turned out not to be price. Dogfood observation (single workspace, 2026-08-01): the start-here flagship acts sooner than the deep flagship, and the effort dial does not buy back the missing deliberation, so the mitigation belongs in the *lane contract* (verification gates) rather than in a parameter. The temperament claim is recorded as an observation in the registry's caveats, with corroboration scheduled for the registry's revisit rather than asserted here as fact. Availability is a separate axis: invitation-gated models (registry `availability`) are listed for **recognition, not planning** — entitlement for that class is per-org/account and must be verified per account before a lane binds; unverified ⇒ unavailable ⇒ degrade down a tier at the same effort, never sideways to an unverified model.
+
+Selection also weighs **edit-format compliance** as an independent axis from raw capability — a split pair lives or dies on the editor emitting well-formed edits, and that is a published, model-differentiating metric.
+
+#### 5.1.2 Routing by task shape
+
+The tier is a property of **the lane's work shape**, not of the project or the operator's mood. The registry ships the full table with a stated reason per row; the shape of it:
+
+| Lane shape | Tier | Effort |
+|---|---|---|
+| Architecture / design decisions · ambiguous-requirement interpretation | T1 | default (`high`-class); step up only where evals show headroom |
+| Complex multi-step execution with residual judgment (daily-driver main loop, heavyweight implementation lanes) | T1.5 | `high`-class default; don't buy deliberation with effort — pair with verification gates (check-first / test gates) |
+| Spec-complete implementation | T2 | default, dropping a rung once evals hold |
+| Mechanical multi-file edit / migration | T2, or T3 where each file is independently verifiable | low–medium |
+| Test authoring | T2 | medium; raise when tests must infer intent rather than mirror a spec |
+| Read-only exploration / search | T3 | low |
+| Summarization / extraction | T3, or T4 where the output schema is fixed | low, or none/minimal where the vendor offers it |
+| Long-context review | T2 on a large-window model | medium — the binding constraint is window and price, not reasoning depth |
+| Resident board / inbox observation | T4 | minimal/none; low only when the watcher must classify intent rather than match a pattern |
+| Adversarial verification / red-team | T1, deliberately from a **different family** than the author | raised |
+
+#### 5.1.3 The registry, and why the volatile part is a data file
+
+`plugins/superscalar/model-registry.json` carries `asOf`, the tier definitions, one row per confirmed model (`apiModelId`, tier, context, price, the vendor's **exact** effort values, and a `confirmedBy` source URL), the routing table, evidence-anchored effort guidance, per-plan availability, per-harness lane-binding keys, and `caveats` for everything that stayed unverified. Three rules make it worth trusting:
+
+1. **A row requires a source.** Any model whose id could not be confirmed verbatim against a vendor page belongs in `caveats`, not in `models`. A plausible-looking model id is worse than a gap, because it will be pasted into a config.
+2. **Effort values are per model and per vendor, never global.** The level names are not comparable across models — vendors say so explicitly — so a harness that stores one global effort number and applies it to whatever model is active is storing a meaningless number. Bind effort *with* the model.
+3. **The file states its own expiry.** `revisit.date` + a watchlist of announced-but-unshipped changes (price reversions, retirement dates, models in preview) makes re-research **scheduled rather than reactive** — the point being to avoid both stale data and constant re-surveying. A verify axis reads the date: past it, the run reports a reminder; past a 45-day grace, it fails. That is the §0-axis-3 eviction discipline applied to the module's own data.
+
+**Effort discipline** (the registry carries the full evidence-anchored list; the load-bearing three): default first and escalate only on an *observed* failure mode, not on a task's importance — vendors document the top rung as prone to overthinking with diminishing returns, so blanket-max is a documented anti-pattern rather than merely expensive. **Step down the ladder before stepping across tiers**: a generation bump usually means the cheap rung of the new model beats the expensive rung of the old one. And effort is a **caching** decision as much as a quality one — changing it mid-conversation invalidates the prompt cache, so vary effort *across* workloads, not within a cache-dependent session.
+
+**Application surfaces**: per-harness lane-binding keys (Claude Code / Codex CLI / Cursor / Gemini CLI / Kimi Code / router layers) live in the registry's `harnessBinding`, because they change on the harness's cadence too. Two invariants that are spec-level rather than data-level: (a) prefer **per-invocation binding** over any global env pin — a pin can override even explicit per-lane choices and an excluded value can fall back to the inherited model *silently*, so observe actual application rather than assuming it; (b) a delegated subagent starts **cache-cold** on its own model, which is why fan-out (where the shared cache is already forfeited) is the natural application point and a cache-hot single-file edit is not. Procedure lives in the **`/subscaler` skill**.
+
+**Boundary:** Constellation §13.27.4 (loop-contract tier routing) governs *resident unattended loops*; subscaler governs *in-session delegation by a conversing orchestrator*. Cross-linked, deliberately separate jurisdictions.
+
+#### 5.1.4 Frontier-main cost gate (v0.15.0)
+
+Everything above assumes the orchestrator *chooses* a tier for each lane. The failure this section closes is the case where it chooses nothing: every current harness resolves an unbound lane to **the main conversation's model** (Claude Code v2.1.251+: per-invocation `model` → frontmatter `model` → the `CLAUDE_CODE_SUBAGENT_MODEL` default → main, with `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` above the whole chain since v2.1.257; a Workflow lane without `opts.model` inherits the same way), and a session-level effort setting such as `ultracode` (which sends the top-but-one rung) is inherited with it. When the main is a T1 model, "no choice" therefore silently selects the most expensive tier at its most expensive effort for lanes whose work shape (§5.1.2) mostly belongs two tiers down — and the delegated lanes cannot even reuse the main's prompt cache, because each starts cache-cold on its own context. Measured in this repository (2026-08-02): two workflows, 24 lanes, every one inheriting the frontier model with the delegation rule already written in a memory file and a marker.
+
+The gate has three clauses, and they are **normative when the main is T1**:
+
+1. **Bind every lane — model and effort — explicitly.** Omission is not delegation to the harness; it is the T1 choice made silently. Exploration, collection and mechanical work bind to T3/T2 at low–medium effort; adversarial verification and judgment bind to a T1-class model *of a different family where possible* at raised effort; T1 binds only to a lane whose failure cost justifies it (§5.1.1 T1 row), and the lane's label names that reason.
+2. **No T1 × top-rung lane by inheritance.** A lane that runs T1 at `xhigh`/`max` must say so in the dispatch itself (an explicit opt-in marker), never acquire it from the session. The vendor guidance for the current T1 model is that its *lowest* effort often beats the execution tiers on cost per task — so a lane that truly needs T1 usually needs it at the bottom of its ladder, not the top.
+3. **The rule is enforced at the tool boundary, not remembered.** A pre-dispatch guard reads the session's model and denies an unbound `Agent`/`Workflow` lane while the main is T1 (allowing the same call on a non-T1 main, because inheritance there is the cheap and correct default). Denial, not a global default: since v2.1.251 the plain `CLAUDE_CODE_SUBAGENT_MODEL` is a default that explicit lanes beat, so it would close the inheritance leak without touching an explicit `opus` — but it converts "no choice" into a silent cheap choice, and a refutation lane that forgot its `model` would run on the default with no signal; the guard makes the omission visible instead (the §5.1.3 "prefer per-invocation binding" invariant applied to the guard itself). The one thing that does override explicit bindings, `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` (v2.1.257+), is invisible from the spawn request, so the guard reads that variable and refuses while a pin would land every lane on a T1 model. Reference implementation: `plugins/superscalar/reference/lane-model-guard.cjs` (PreToolUse, `Agent|Workflow`; session model read from the transcript tail; unknown model ⇒ strict; malformed input ⇒ allow, because a guard that kills the tool on its own bug is the first incident). Shipped unwired on purpose — denying a harness's fan-out is a workspace decision, so the adopter adds the hook stanza.
+
+The gate composes with, and does not replace, §2: the cost-benefit gate decides *whether* a lane exists; this clause decides that an existing lane's price is chosen rather than inherited. Procedure: `/subscaler` Step 0.
+
+#### 5.1.5 Choosing inside a tier — community rank and trust cost (v0.16.0)
+
+Tiers say what a model is *for*. They do not say which of the several models in a tier to pick for this task, today, with the allowance that is left. Two further layers answer that, and they are deliberately kept apart because they carry different kinds of evidence.
+
+**Community rank — what practitioners say.** A relative rank per model for agentic / development work, on the scale **S, A–F, G**: S is clear consensus best-in-class; A–F descend relative to the current field; **G sits below F** for a flagship widely described as lagging the frontier. G is *evidence-gated* — a model enters it only when the collected posts say it has fallen behind, never because of who made it. `unranked` means too little first-hand evidence, or a subject that is a harness or a bundle rather than a model. The rank is an aggregate of the weakest evidence class the registry recognises (community reports: "a signal, not evidence" — `harnessProfile.evidenceContract`), so it inherits that class's rule: **it never routes a lane on its own.** It has three legitimate uses — break ties that measured data leaves equal, choose which models are worth measuring next, and flag *divergence* (a model ranked high that measures poorly, or the reverse), which is where harness differences, task-mix differences or hype show up. Its contract, checked mechanically: every rank carries its sample size; ranked subjects with zero evidence are `unranked`; a sample of collected posts is re-fetched in a fresh collector session and the counts must add up; model ids must resolve to registry rows; the block carries its own `revisit` date because sentiment goes stale faster than specification facts. Data: `model-registry.json` → `communityRank`.
+
+**Trust cost — what we measured.** The expected cost of obtaining **one verified result** at a stated quality level. Vocabulary:
+
+- **aim** — the target *result level*, not a difficulty label: within one aim every model is judged by the same hidden acceptance suite. Aims form a ladder mapped onto `taskShapeRouting` (mechanical multi-file edit → spec-complete implementation → multi-file feature with residual judgment → diagnose-and-fix → design-and-implement from a specification).
+- **reach** — the hidden suite passes completely. No partial credit: "the same level of result" read literally.
+- **one-shot** vs **refined** — reached on the first response, or after *k* refinement rounds. A refinement round gives only what CI gives a person: failing test names and assertion messages, never the test code (showing the code measures test-fitting, not the task).
+- **ceiling** — the highest aim a model × effort reaches reliably.
+- **trust cost** `TC = C̄ / p` and **trust time** `TT = T̄ / p` — mean cost (or wall time) over *all* attempts, failed ones and refinement rounds included, divided by the reach rate. A model that is cheap per attempt but rarely reaches pays for its misses here.
+
+Measurement discipline: the unit is **model × harness × effort** (the same model behaves differently under different harnesses, and that is how it is used); runs climb the aim ladder from the bottom and stop at the first unreached aim (lower-aim cost data is needed anyway — the point of the chart is how cheap the cheaper models are there); cost is reported twice, as API-equivalent currency from token counts × registry prices and, where a harness exposes it, as plan-quota consumption. The acceptance suite must be able to fail before it is trusted to pass: the untouched starting state fails, a reference solution passes, and at least two plausible wrong solutions fail. The grader asserts the **expected test count** (a submission that exits early and runs only part of the suite otherwise "passes"), hashes the hidden tests before and after, and scans the submission for reaching into the grader — a hit makes the run **invalid**, which is counted apart from "did not reach": failing and breaking the rules are different outcomes.
+
+**Selection order inside an aim**: ceiling ≥ aim → the harness still has allowance → lowest trust cost → community rank as the tie-break. The allowance clause is what turns this from a leaderboard into a scheduler: a plan whose window resets soon with allowance left is the cheapest capacity available, and work that tolerates any capable model (measurement runs, sweeps, research) is the natural consumer of it.
+
+**Adoption thresholds — switch behavior dynamically when these fire.** The threshold values are unchanged from prior versions; what is new is which **lane class** each one binds (see §2 for the read/write split):
+
+| Signal | Threshold | Action | Binds |
+|---|---|---|---|
+| Average merge-conflict rate | `> 15%` | `issue_width_write -= 2` (until rate recovers); investigate hazard mis-detection | **write only** (read-only lanes have no merge surface; conflict = NA) |
+| Speculative accuracy (lane retired vs discarded) | `< 60%` on last 10 speculations (rolling) | recommend `speculation: off` for next use; prompt user to recalibrate confidence input | symmetric (both classes — speculation is a separate axis from lane class) |
+| Concurrent-mode token cost vs equivalent in-order | `> 3×` (vs Anthropic baselines of ~4× chat→agent, ~15× multi-agent — be conservative) | re-evaluate cost-benefit gate inputs; tighten budget circuit breakers (§3) | symmetric |
+| MAST FM-1.3 step-repetition detections | `≥ 1 per session` | strengthen duplicate-work guard (§7); reduce `issue_width` on the affected class | symmetric (apply the reduction to the lane class where the duplicate-work was observed) |
+
+The merge-conflict gate's narrowing to `issue_width_write` reflects the §2 hazard analysis: Little's Law and Kanban WIP terms only bind retire-merge contention, which read-only lanes structurally don't have. A cap-exceeding read-only fan-out (e.g. case 7 in §11 Entry 05 — width 7 read-only at policy cap 6, zero downside) **does not** count against the merge-conflict signal. The other three signals apply symmetrically because they govern cross-cutting concerns (speculation accuracy / token cost / duplicate-work) rather than retire-merge contention specifically.
+
+### 5.2 Dispatch aggressiveness — the `/superscalar` mode toggle (v0.8.0)
+
+§2's cost-benefit gate answers *"is this particular fan-out worth it?"*. What it never answered is the question upstream of it: **how hard does the orchestrator look for fan-out in the first place?** That prior was implicit — and an implicit prior defaults to conservative, because a single-threaded habit passes the gate trivially by never proposing a second lane. The gate then reads as a *hurdle* rather than an arbiter, and the discipline's measured benefit (§11 Entry 06: the retire stage catches contradictions naïve parallelism leaves unresolved) goes unused for the ordinary case. This toggle makes the prior **explicit, switchable, and declarable**.
+
+**Three modes.** State is **one marker file** read at dispatch time — `.agent/superscalar.json`, `{"mode": "always" | "auto" | "off"}`; absent ⇒ `auto`. One source of truth, no mirrors (the §5.1 state-convergence lesson applies unchanged).
+
+| Mode | The prior it sets | Gate semantics |
+|---|---|---|
+| `off` | serial by default | No agent-initiated fan-out; independent work runs in declared order. An **explicit user request** to parallelize is still honored — this is a default, not a prohibition — and is recorded as an override rather than silently obeyed or silently refused. |
+| `auto` *(default)* | the gate arbitrates | Unchanged §2 behavior: propose fan-out where the work shape suggests it, then let the cost-benefit gate decide. |
+| `always` | fan out unless a blocker applies | **The burden of proof inverts.** With ≥2 independent lanes, dispatch in parallel *unless* one of the named blockers below holds. The gate still runs — as a **veto list**, not as a hurdle. |
+
+**`always` veto list** (each of these still forbids fan-out, and each is a measured constraint, not a preference): lanes are not write-disjoint and isolation is unavailable (§3, including the nested-repo worktree limitation) · the work admits no independent decomposition · deep shared-context work, which vendor guidance and §5.1 both flag as a poor decomposition target · total work below the empirical inline-wins floor (§2: ~8k inline wins, the 30-60k band is where it flips) · latency-critical interactive edits · `issue_width` already saturated (§1).
+
+**What `always` does NOT relax.** These hold identically in all three modes, and saying so is the substance of the design rather than a disclaimer: §4's irreversibility barrier (speculative lanes never touch external, irreversible, or outward-facing operations) · the §3.1 Hyperbrief interlock for write/deploy/send lanes · §5's in-order retire + consistency gate + completeness critic · the §1 `issue_width` ceilings — `always` moves the *prior*, never the *cap* · speculation, which remains a separate axis and stays default-off. An aggressiveness knob that also loosened the safety gates would be a categorically different and much worse knob.
+
+**Auto-demotion — the mode carries its own backpressure.** When a §5 adoption-threshold signal fires (merge-conflict rate > 15% · concurrent token cost > 3× the in-order equivalent · MAST FM-1.3 step-repetition ≥ 1/session), `always` **demotes to `auto`**, recording `autoDemotedFrom`, the triggering signal, and its observed value in the marker — so the demotion is visible and deliberately re-armable instead of silent. `off` is never auto-changed (an explicit stop stays stopped). This is what makes an aggressive prior safe to offer: the escalation is opt-in, the de-escalation is automatic and evidenced.
+
+**Relation to the §5 bootstrap setting.** The `in-order | superscalar` choice recorded in `AGENTS.md` states the project's *default posture*; the marker is the *runtime* mode, latest-wins, and is what a dispatch decision actually reads. Where they disagree, the marker wins and the divergence is worth a note in the next session's handoff.
+
+**Board declaration.** Where a Constellation board is present, a mode change is not finished until the board knows: `OpsState` carries `superscalar: {mode}` (Constellation §13.23.4 — change-triggered, latest-wins), same unit-of-work rule as the §5.1 toggle. A toggle without the announce leaves the status strip asserting stale state.
+
+### 5.3 Question scoreboard — the `/ooo` toggle (v0.11.0)
+
+§2 reorders **sub-agent lanes** around data hazards. The main lane itself still runs in-order against its most common hazard: **a question to the human**. Ask-and-wait is an in-order pipeline stalled on one very slow operand — and human response latency is this module's founding bottleneck (§1's agent-time vs human-time split). `/ooo` extends the OoO discipline to the main lane's own question dependencies: a question is a hazard on the items that need its answer, **not a stop signal for the queue**.
+
+**The scoreboard.** A question arising mid-task registers as **one line** — id · the question · which item(s) it blocks · what proceeds meanwhile — instead of halting the task. The one-line format is a contract with two teeth: (a) anything that won't compress to a line is not a question but a *decision*, and routes through the Hyperbrief trigger rubric (§3.1 interlock) instead of the scoreboard; (b) the compression is what makes answering cheap — the human can answer any subset, in any order, whenever they surface, which is precisely the asynchrony the reorder needs. A question whose every answer leads to the same next action is not a question and is dropped before it costs a read.
+
+**Resolution ladder** (per question, in order): ① **self-resolve by measurement** — most "questions" are unread files, and a question answerable from the workspace never reaches the human; ② **bypass** — execute everything independent of the answer while the blocked item parks (the default outcome, and the reason the toggle exists); ③ **assumption-run** — *only* under §4's speculation gates: proceed under a **named** default with a revisit marker, and a contradicting answer squashes and re-runs the affected slice only; ④ **park** — irreducible and speculation off ⇒ the item waits while the rest of the queue continues. The forbidden transition is the **silent guess**: an unnamed assumption is a bypass without a scoreboard entry, indistinguishable from confidence to every later reader — the scoreboard's whole value is that skipped questions leave a record that can steer.
+
+**What is never bypassed.** Questions gating **loss or external publish** (push · deploy · send · delete · destructive operations) park their item in every mode — not bypassable, not assumption-runnable, marker or no marker. `/ooo` moves the *waiting*, never the *gates*; identical in kind to §5.2's list of what `always` does not relax, and for the same reason — a latency knob that also loosened irreversibility gates would be a categorically worse knob.
+
+**Feedback intake — the steering half.** Answers arrive asynchronously (chat, decisions panel, inbound A2A). An arriving answer wakes **only its dependents** — the items blocked on it — never a global restart; a late answer that contradicts an assumption-run is *late steering* (squash the slice, re-run it, keep the rest). At every item boundary the scoreboard is re-checked before the next item issues. Each turn closes with the scoreboard delta — answered (and what they steered) · open (re-surfaced verbatim) · parked — because an open question the human never sees again *was* a silent guess, just with a paper trail.
+
+**Toggle contract.** State = one marker file read at task start: `.agent/ooo.json` — `{"on": true}`; absent ⇒ off. Default **OFF**: the standing posture stays ask-and-wait unless the workspace opts in; ON is standing (every task runs the scoreboard, no per-task ceremony), and a one-shot invocation runs a single task under the scoreboard without writing the marker. One source of truth, no mirrors — the §5.1 state-convergence lesson applies unchanged.
+
+**Constellation projection (optional).** Where board-joined, open questions mirror to the **decisions panel** (the one-liner + the interim default), answers landing there are intake like any other channel, and entries retire on resolution. The projection inherits the board's content-tone policy and requires low-latency intake — a scoreboard whose answers surface at next-session speed is in-order waiting with extra steps. Not board-joined ⇒ the chat scoreboard is the whole surface. Procedure lives in the **`/ooo` skill**; orthogonal to §5.2 (dispatch aggressiveness governs how eagerly *lanes* open; this governs whether the *main lane* stalls) and to §5.1 (tier composition — a parked item delegates at whatever tier its shape routes to, unchanged).
+
+### 5.4 Context-cache discipline — the `/context-caching` toggle (v0.12.0)
+
+The module's other borrowings cover issue (§2), reorder (§2, §5.3), speculation (§4) and heterogeneous cores (§5.1); this section adds the **memory hierarchy**. A conversing agent's prompt cache is the L1 its whole session runs against — on current vendor ladders a cache read prices around a tenth of a fresh input token while a cache write prices at 1.25–2×, so the working economics are a CPU's: the win is not *having* a cache but **keeping the working set hot and knowing exactly which operations flush it**. Two cache rules already lived in this spec scattered (§5.1: a delegated subagent starts cache-cold on its own model; effort is a caching decision because changing it invalidates the cache) — this section is their generalization into one discipline with one home.
+
+**The registry split, again.** Everything volatile — per-vendor multipliers, TTLs, minimum cacheable sizes, storage-rent rates, per-harness invalidator lists — lives in **`plugins/superscalar/cache-registry.json`**, dated (`asOf`), source-anchored (`confirmedBy` per row), with its own `revisit` date and watchlist, exactly the §5.1.3 contract. Facts confirmed only against the vendor's own page carry a `singleSource` mark rather than being silently blended with cross-confirmed ones. The spec deliberately quotes almost no numbers: numbers in prose rot on the vendor's cadence, and this module has already measured that failure shape twice.
+
+**The discipline (`self` mode)** — six rules, each anchored to a measured mechanism rather than a preference:
+
+1. **Pin at the session head.** Model and effort are each part of the cache key — vendor-documented, not folklore — so a mid-session switch of either recomputes the entire history. The switch *feels* free because its cost bills on the *next* turn. Need a different model mid-task? That is a subagent's job (which pays a bounded cold start on its own small prefix, not a full-history rebuild).
+2. **Boundary discipline.** Compaction replaces the conversation layer by design; the choice an agent owns is *when*. Compact at natural task boundaries, never mid-task by drift into auto-compact. To abandon a path, prefer **rewind over compact**: a rewind truncates back to a prefix that is already cached and was kept warm by every read-through since; a compact constructs a new prefix from scratch.
+3. **Prefetch at the boundary.** The OS-prefetch analogy, placed correctly: bulk context-loading belongs right *after* a boundary — reads land at the front of the new stable prefix and stay cheap for the whole task — and is wasted right *before* one, where the loaded context is about to be discarded.
+4. **Fan-out cache accounting.** A subagent is cache-cold on its own prefix (and on some harnesses runs a shorter TTL), while the parent's prefix is untouched. This prices delegation exactly where §5.1 already routes it — self-contained lanes and fan-outs that forfeited the shared cache anyway — and prices *against* delegating cache-hot deep-context single edits. Same routing table, now with the cache-side reasoning attached.
+5. **Know the flush list.** Mid-session environment mutations — tool-set changes, server connects/disconnects, speed-mode toggles — flush from the mutated layer down, and some fire *without operator action* (a tool server dying and auto-reconnecting is a flush on harnesses that load definitions into the prefix). The registry carries the per-harness list; consult it before any mid-session mutation, and treat an unexplained run of cache writes as a symptom to diagnose, not weather.
+6. **Measure, never declare.** Cache health is two counters the API reports on every response (cache-read vs cache-write tokens). A hit-rate claim not read from the counters is a declaration, and this workspace's own telemetry rule (§13.35.8's derived-never-declared, in Constellation's jurisdiction) applies unchanged.
+
+**`agent` mode** delegates the watching to a resident observer where Constellation is adopted: the resident reads *derived* telemetry (context occupancy, cache counters, last activity — zero model tokens, the telemetry-not-echo distinction), advises on boundary timing and observed flush events, and **never executes** compaction or mutations on its own authority — operator-command paths keep their own gates. Not board-joined ⇒ degrades to `self` with a notice.
+
+**Toggle contract.** One marker file read at session start: `.agent/context-caching.json` — `{"mode": "self" | "agent" | "off"}`; absent ⇒ off. Default **OFF**, and the reason is jurisdictional rather than cautionary: modern harnesses already automate the substrate (TTL selection and downgrade, breakpoint placement, prefix ordering, deferred tool loading), and automating it again from the skill layer would fight the harness. The skill's scope is what the harness does *not* decide for you — boundary timing, mutation cost awareness, fan-out accounting — and that scope is *expected to shrink* as harnesses absorb more of it. Procedure lives in the **`/context-caching` skill**; the shrinkage is the module's standard-substrate bet working as intended, not a defect to defend against.
+
+Superscalar needs no server. But if Constellation is already running, the live board can double as the **scoreboard / ROB view** — lanes as channels, retires as merge events, speculative lanes flagged amber per Andon (§4). Beyond visualization, the board may *empirically* improve MAST FM-1.3 / FM-2.6 detection (duplicate work · announce-vs-action mismatch) because cross-lane progress is human-visible.
+
+**Measurement procedure** — every `.agent/_lessons/spec-discard/` entry (§4) records a `detection-source` field: `human-visual` (caught live by the user / PM scanning the board) vs `post-hoc-analysis` (caught only by retrospective log review). The per-session ratio of `human-visual` detections is the empirical signal for whether the board (when on) is doing the catching. Track over time; if the ratio stays high with Constellation on and drops sharply when off, the hypothesis is supported. Purely optional; the scheduler logic is identical without the board.
+
+---
+
+## 7. Anti-patterns
+
+Built on the original five plus targeted MAST coverage (multi-agent system failure taxonomy, Cemri et al. NeurIPS 2025):
+
+- Speculating on irreversible / outward effects (barrier violation, §3).
+- Wide issue without hazard analysis → corrupted merges.
+- Silent speculation (no announce) → "why did you do unrequested work" + trust loss; Andon (§4) is the structural fix.
+- Speculating on low-confidence / cheap-to-wait / high-sensitivity gates → pure token waste (failed cost-benefit).
+- Out-of-order *retire* (merging out of declared order) → incoherent history / broken deps.
+- **Duplicate-work across lanes (MAST FM-1.3, ~13%).** Two lanes redo the same task because the DAG missed an edge. Guard: each lane's planned-commit subject is cross-checked against sibling lanes' before dispatch; conflict → abort one lane.
+- **Speculative-lane termination ignorance (MAST FM-1.5, ~12%).** A speculative lane keeps running after its gate has resolved (the branch is dead). Guard: the gate's resolver sends `SIGTERM` to dependent speculative lanes immediately; the harness enforces, not the lane.
+- **Announce-vs-action mismatch (MAST FM-2.6, ~13%).** A lane announced "predicting X" but actually does Y. Guard: on every tool call, check the lane's running annotation against its declared intent; mismatch → abort + log.
+- **Shared mutable contract → fence-only.** Common interfaces / shared function signatures / common type files cannot be parallel-issued — must be design-frozen or formally arbitrated before parallel work (concurrent-engineering "design-freeze milestone"). This is the WAW hazard at the architectural level.
+
+---
+
+## 8. Relationship to the seed
+
+- **Base seed** = in-order execution (default).
+- **Superscalar** = optional aggressive scheduler over the agent's native sub-agents; independent of Constellation; an evolution of §Task Decomposition Strategy (v1.3.5).
+- Depth follows the seed tier as usual; lighter tiers reference only the §2 core + this file.
+
+---
+
+## 9. Foundations & references
+
+This design was validated against three bodies of work via a 3-axis deep-research review (2026-05-28).
+
+**Processor architecture (the canon):**
+- Smith, J. E. & Pleszkun, A. R. (1988). *Implementing Precise Interrupts in Pipelined Processors.* — ROB origin; the in-order-retire pattern of §3 is its direct analog.
+- Tomasulo, R. M. (1967). *An Efficient Algorithm for Exploiting Multiple Arithmetic Units.* IBM System/360 Model 91 — register renaming (Stage-2 alias-branch pattern, §1).
+- Mutlu, O. et al. (2003). *Runahead Execution.* HPCA, Test-of-Time award — analog of running a no-side-effect "read-ahead" lane during a stall.
+- Kocher, P. et al. (2018). *Spectre Attacks: Exploiting Speculative Execution.* — origin of §4's two-stage announce mitigation (micro-architectural / cognitive side effects survive rollback).
+- Hennessy, J. & Patterson, D. *Computer Architecture: A Quantitative Approach.* — general reference.
+
+**Agent orchestration (industry):**
+- Anthropic (2025). *How we built our multi-agent research system.* — ~90.2% lift, ~15× tokens, effort-scaling rule (§2), production cost-circuit-breaker pattern (§3).
+- Claude Code docs — *Run parallel sessions with worktrees*, `isolation: worktree` — the direct industrial analog of §3.
+- Cemri, M. et al. (2025). *Why Do Multi-Agent LLM Systems Fail? (MAST).* NeurIPS 2025 Datasets & Benchmarks Track Spotlight, arXiv:2503.13657 — 14 failure modes; §7 anti-patterns cover FM-1.3 / FM-1.5 / FM-2.6 explicitly.
+- Leviathan et al. (ICML 2023, arXiv:2211.17192), Hua et al. (ICLR 2025, arXiv:2410.00079), Dynamic Speculative Planning (arXiv:2509.01920), Microsoft PASTE (arXiv:2603.18897) — speculative decoding / planning literature; this module is the agent-task analog.
+
+**Work communication & management (organizational science):**
+- Goldratt, E. (1997). *Critical Chain Project Management.* — feeding chain (OoO, §2) and buffer concept (§3 budgets).
+- Toyota Production System — Jidoka / Andon — §4's three-element transparency is Andon adopted verbatim.
+- Bogus / Molenaar / Diekmann, ASCE *Journal of Construction Engineering and Management* (2005–2013) — fast-tracking sensitivity model (§4 downstream-sensitivity term).
+- Atlassian / Planview Kanban WIP limits, Little's Law, *team size + 1* — §2 formula.
+- Edmondson (Harvard Business School) — psychological safety; CCL / SHRM trust research — why silent speculation costs trust asymmetrically (§4 Andon rationale).
+
+---
+
+## 10. Future work (Stages 2 & 3)
+
+**Stage 2 — post-v0.2 patch:**
+- *Register renaming* (alias-branch pattern, §1): same-file conflicts run parallel via `.alt-N` branches, PM merges with conflict resolution. Removes WAR/WAW serialization.
+- *Memory disambiguation*: speculative dispatch on path-guess, verify at retire; cheap no-conflict cases become free wins.
+- *Per-lane checkpoint*: explicit tag-commits before merges so rollback is `git reset` in ≤ 1 second.
+- *Sensitivity-aware speculation UI*: show projected downstream rework alongside confidence (§4).
+
+**Stage 3 — experimental:**
+- *Value prediction*: feed `.agent/_lessons/spec-discard/` (the §4 misprediction log) into a confidence-estimation model so the agent can pre-suggest speculation worth doing. Andon (§4) still applies — predictor *recommends*, user still acks.
+
+(The optional Constellation visualization mentioned in §6 — including its measurement procedure — also rides on the §4 logging infrastructure once Stage 3 ships, but the *scoreboard* itself is available at Stage 1 already.)
+
+---
+
+## 11. Dogfood log (Stage 1 baselines)
+
+The first real-world Stage 1 application is recorded here as the seed of empirical data for Stage 2/3 tuning. Each entry is one issue-window worth of measurements.
+
+### Entry 01 — 2026-05-29 · Constellation Phase C reference generalization
+
+- **Scope**: upstream live-board main generalized 4 runtime files (`server.cjs` · `local-bridge.cjs` · `watchdog.cjs` · `self-wake-watcher.sh`) into `constellation/reference/runtime/` for Constellation v2.2.2.
+- **Dispatch**: 3 sub-agent lanes (L1 = local-bridge + self-wake-watcher · L2 = watchdog · L3 = server), main as supervisor + ROB.
+- **`issue_width`** = 3 (binding constraint: Kanban floor `team_size + 1`).
+- **Speculation**: off (Phase C scope was already-decided work — no branch to predict).
+- **Retire order**: in-order C2 → C3 → C4 over declared sequence; single batch review at the end.
+- **MAST guards**: FM-1.3 / FM-1.5 / FM-2.6 all trivially satisfied — each lane owned a disjoint file set with no shared mutable contract (natural WAW avoidance from the file-scope split).
+- **Token budgets** (per §3): L1 62k · L2 38k · L3 58k. The 50k per-lane cap was narrowly exceeded twice (L1 by 24%, L3 by 16%); aggregated 158k stayed comfortably under the 200k total cap.
+  - *Calibration note*: the cap may need to widen to ~65k for codegen-heavy lanes; flag for re-tuning once a few more entries accumulate.
+- **Andon §4**: visual signal applied (lane chips orange → green at retire). No spec-discard entries (speculation off).
+- **Wall-clock**: ≈ 8 min total (≈ 6 min lanes in parallel + ≈ 2 min supervisor spot-check). Theoretical serial baseline ≈ 3 × 6 min = 18 min → roughly 2.25× wall-clock compression (sub-linear because retire is single-threaded).
+- **Outcome**: clean commit `7fee20e` (`v2.2.2`); no rework; NOTES §1 disclaimer added as a single follow-up to handle grep-pattern meta-mentions (caught at supervisor spot-check, not lane work).
+
+This first entry validates the §2 / §3 / §7 design at issue_width=3 with no speculation; it gives no signal yet on §4 speculation behavior or the §5 `< 60% accuracy` threshold (no speculative lanes were dispatched). Stage 2 / 3 work should aim to start collecting that signal.
+
+### Entry 02 — 2026-05-29 · upstream live-board Report 2 fixes (cost-benefit gate selects *inline*)
+
+- **Scope**: 3-Finding patches (Constellation.md §2 AgentHello wire-shape literal · `self-wake-watcher.eux` cursor unit + self-heal · `reference/dashboard/app.js` A2A classifier).
+- **Cost-benefit gate (§3) evaluation**: 3 candidate lanes — each Edit was on a *disjoint* file (P3a / P3b / P3c, MAST FM-1.3/1.5/2.6 trivially satisfied by file split). Estimated lane sizes: P3a ~3k · P3b ~3k · P3c ~2k = total ≈ 8k. Estimated lane-spawn + manifest + retire overhead ≈ 2-3k each = ≈ 6-9k. → **Spawn overhead ≈ parallel benefit**; per §3 ("only spin up an isolated lane when isolation+merge overhead < expected parallel/early-start benefit"), the gate selected **`issue_width = 1` (inline in-order)** despite the disjoint-file pre-condition.
+- **Dispatch**: inline in P3a → P3c → P3b order (no DAG edge between them — declared order was arbitrary).
+- **Speculation**: off (all three Findings were already-decided fixes with verified upstream shim code).
+- **Wall-clock**: ≈ 5 min inline (P1 fetch ~30s · P2 review 1m · P3 three Edits ~3m · P4 relay ~30s). Theoretical 3-lane parallel: ≈ 4-5 min after the overhead. **Gate decision was correct** — parallel would have saved < 1 min net.
+- **Tokens** (approximate, per-phase): P1 fetch ~3k · P2 Read artifacts ~6k · P3 Edits ~6k · P4 relay ~2k → ≈ 17k total, **comfortably under** the §3 single-lane cap (50k) and aggregated cap (200k).
+- **MAST guards**: FM-1.3 / FM-1.5 / FM-2.6 — N/A (single lane); the disjoint-file property held *as a property of the work*, not of the dispatch.
+- **Andon §4**: visual signal applied in reporting (lane chip language used — amber on start, green on retire); no `/stop-spec` events; no `.agent/_lessons/spec-discard/` entries (speculation off).
+- **Outcome**: clean v2.2.3 push (commit alongside this Entry 02 record).
+- **Calibration signal — first data point for inline-vs-spawn boundary**: at ≈ 8k total work and disjoint files, the gate selects inline. The boundary likely lies somewhere between **Entry 01** (~158k total → spawn obviously wins) and **Entry 02** (~8k total → inline obviously wins). Stage 2 work could target a controlled-size experiment around the 30–60k band to find the empirical crossover.
+
+### Entry 03 — 2026-05-29 · v2.2.4 patch (Report 2 follow-up: server-stamped truth + leniency-WARN + role hint clarification + runtime liveness extension)
+
+- **Scope**: 4-file disjoint patches — `constellation/server.eux` (sourceStampFallback + targetFallback + new derive `source_stamp_truth`) · `constellation/local-bridge.eux` (AgentHello recognition broadened + WARN) · `Constellation.md` §2 (role-field hint vs truth clarification) · `Superscalar.md` §4 (runtime process liveness added to Visual signal element).
+- **Cost-benefit gate (§3)**: 4 candidate lanes (disjoint file MAST guarantee). Estimated lane sizes: server.eux ~4k · local-bridge.eux ~2k · Constellation.md ~1k · Superscalar.md ~2k = total ≈ 9k. Estimated spawn overhead ≈ 2-3k × 4 = ≈ 8-12k. **Inline still wins** (same shape as Entry 02; the lane count rose from 3→4 but the per-lane size stayed small, so the gate decision did not flip). `issue_width = 1` (inline in-order).
+- **Speculation**: off (main's opinions were direct prescriptions, no branch).
+- **Tokens** (approximate): P1 fetch = 0 (main's relay was the source) · P2 Read anchor regions (server.eux/local-bridge.eux) ~3k · P3 five Edits ~6k · P4 relay ~2k → ≈ 11k total.
+- **Wall-clock**: ≈ 4 min inline.
+- **MAST**: N/A single-lane; disjoint-file property held as a property of the work.
+- **Andon §4**: visual signal applied in reporting; no `/stop-spec` events; spec-discard log unchanged.
+- **Outcome**: clean v2.2.4 push.
+- **Calibration confirmation**: Entry 02 → Entry 03 confirms the inline gate is stable across 3 vs 4 disjoint-lane scope at small per-lane size. Empirical crossover for *spawn-wins* likely still in the 30-60k band hypothesized at Entry 02; will need a Stage 2 controlled experiment to pin down.
+
+### Entry 04 — 2026-05-30 · downstream full-stack distillation A/B re-run (controlled measurement)
+
+- **Scope**: a downstream adopter's payment-stack `.eux` distillation A/B re-run on the same 4 components. The 1st-pass full-stack experiment had been measurement-invalidated by external interruptions (rate-limit / account-switch / `_proposals/003` flap / IDE restart); the upstream main directly dispatched worker subagents for a controlled re-run. arm A (naive parallel, 4 lanes one-component-each) vs arm B (Superscalar discipline, 4 lanes that *further sub-decompose inside the lane* into 15 `.eux` files).
+- **`issue_width`**: 4 both arms. Superscalar's discipline here operates *inside* each lane (sub-split + self-QA tree under the lane), not via cross-lane width.
+- **Speculation**: off (already-decided component scope, both arms).
+- **Measurements**:
+  - Tokens — arm A 433,951 · arm B 549,730 → **+26.7%**.
+  - Wall-clock — arm A 229.7s · arm B 521.1s → **+126.8%**. ⚠️ **Measurement caveat (load-bearing)**: this is *sequential* arm-execution on a single dashboard, NOT concurrent-lane time. It measures the in-lane sub-split + self-QA *serial* overhead of the discipline, not its headline benefit (parallel-lane latency hiding). Reading +127% as "Superscalar is 2× slower" is the misread the caveat exists to prevent. A truly concurrent measurement needs a different harness (concurrent dashboards per arm — a §13.16-class operational point in `Constellation.md`).
+  - Files / lines — arm A 4 / 385L · arm B 15 / 1319L → 3.75× files, 3.4× lines (the sub-split is *visible* on disk as well as inside the lane).
+- **Quality jury**: LLM subagent, 5-axis (format / fidelity / coverage / discovery / decomposition). Both arms scored equivalent on the same 4 components. ⚠️ **Caveat on LLM-as-judge**: the drift-check RRP (2026-05-29) measured LLM-as-judge inter-annotator agreement at κ ≈ 0.1-0.2 and ruled it unfit as a gating measurement. This Entry weights the **source-line spot-check (13/13 match against actual source)** as primary objective evidence; the 5-axis score is *supporting*, not load-bearing. Methodologically, this is `§7` anti-pattern avoidance — the score is published but its weight is bounded.
+- **Hallucination**: 0 both arms. The §4 Andon hallucination-cost concern is bounded when both lanes operate under source-grounded distillation discipline; the cost being measured here is *time and tokens*, not *quality drift*.
+- **Discovery payoff — Superscalar's actual gain**: arm B's *expanded coverage* (3.75× files) surfaced **3 new real bugs in the expansion territory** that arm A did not reach — a multi-hour confirmation timeout in a financial-process flow (operationally severe: orphaned authorizations) · a phone-number-suffix authentication-bypass at a fixed-digit match (operationally severe: auth bypass) · a hardcoded test deep-link in a release-channel binary (operationally severe: test-environment leakage to production). Each is a class-defining operational severity, not a cosmetic find. The token surplus (+117k) bought *coverage*, and the coverage caught bugs naive single-pass would not.
+- **MAST guards**: FM-1.3 / FM-1.5 / FM-2.6 — disjoint file scope per lane in both arms (no shared mutable contract). arm B's in-lane sub-split was tree-structured (parent → children) so no WAW. N/A on cross-lane re-entry (single-arm-at-a-time measurement).
+- **Andon §4**: visual signal applied (both arms reported lane status); no `/stop-spec` events; spec-discard log unchanged (speculation off).
+- **Outcome — ROI separation** (the headline calibration signal):
+  - **Token ROI = positive**: +27% tokens bought ~3× scope expansion + 3 operationally-severe real bugs in the expansion territory. Token-per-marginal-bug favorable.
+  - **Time ROI = weak (in this measurement environment)**: +127% wall-clock is 4.7× the token-increase rate, but mostly *expansion-driven* (B made 3.75× more output). Held to *equal scope*, the in-lane overhead alone is ~+15-20% (jury estimate, weighted per the LLM-as-judge caveat above).
+  - **Therefore**: Superscalar's value is **scope · traceability · `[estimate] → [confirmed]` confidence**, not equal-scope efficiency. *"Broad, handover-grade distillation"* → Superscalar discipline justified. *"Fast core extraction"* → naive arm A sufficient (core security / consistency findings caught at −27% tokens, −56% time, with one bug-class A actually caught more sharply than B). The §5 adoption-thresholds table gains its first quantified anchor here.
+- **Calibration signal — both arms surface their characteristic gain**: a clean first dogfood entry where the *trade-off itself* is the result. A's tighter precision on its own scope (one race-condition bug caught more sharply than B) and B's broader coverage + new bugs are both real; the choice is workload-dependent, not arm-dominant. Stage 2's adoption-threshold tuning has its first calibrated reference point.
+
+### Entry 05 — 2026-06-01 · downstream adopter Stage 1 dogfooding (n=8) — read/write lane-class cap asymmetry + nested-repo worktree limitation
+
+- **Source**: downstream adopter — real-time chat-service microservices; full seed adoption incl. the Superscalar and Constellation modules; Burst pace mode (`issue_width` cap = 6); n = 8 retired lanes over ~3 days; case-based ledger, measured values only.
+- **Case mix**: 1 board-worker A2A (PM-doc refresh, width 2) · 5 read-only research subagents (codebase context sweeps, width 2 each) · 1 workflow fan-out (seed-upgrade delta-mapping = 7 reader lanes + synthesis barrier — exceeded policy cap 6, zero downside) · **1 worktree write dispatch (case 8 — first write-lane parallelism + first worktree use; 2 parallel UI write tasks `isolation: worktree` + 1 read-only research lane, total width 3, 0 merge conflict from disjoint files; see §2b limitation below)**. Speculation = 0/8 · worktree-isolation direct use = 1/8 (case 8, with §3 caveat) · OoO = Y on all (ready-first dispatch). Write lanes: max width = 2 (case 8's two disjoint UI tasks); read-only lanes: 6.
+
+### Entry 05 sub-finding §2b — worktree isolation does not span nested independent repos (case 8, new)
+
+Case 8 (the adopter's first worktree write-lane dispatch) surfaced a structural limitation of the `isolation: "worktree"` mapping documented now at §3. The adopter's frontend was a **separate git repository nested inside the parent project repo**, not tracked by the parent — the standard monorepo-adjacent shape (parent docs/orchestration repo with a separate app repo inside). When two write lanes were dispatched with `isolation: "worktree"`, the parent-repo worktree each lane received **did not contain the nested frontend repo at all**. The lanes fell back to working in the *shared* nested frontend repo, each on its own *branch* → **branch isolation, not worktree isolation**. The shared working tree was cross-visible: one lane observed the other's uncommitted changes mid-flight.
+
+The reason it did not break here: the two lanes touched **disjoint files**, so the separate-branch merges were clean (0 merge conflict). But the ROB isolation `§3` promises was **not** actually achieved — had the lanes touched the same file, the shared working tree would have produced a real WAW hazard *despite* the `isolation: "worktree"` request being honored at the parent level.
+
+**Request to upstream (R3)**: `§3` (a) document the limitation and the two mitigations (worktree the nested repo per lane / guarantee file-disjointness + accept branch isolation as effective boundary), and (b) suggest the harness detect nested-repo write targets and warn or re-worktree. **Reflected upstream at §3 nested-repo bullet (v0.4)** — three mitigations (a/b/c) now documented; pre-detection harness work remains the open Stage-2 surface.
+
+**Secondary lesson — presence verification ≠ behavioral verification (MAST FM-2.6 adjacent)**: in case 8, one write lane's output passed a *structural* self-verification (the new UI menu element + its 4 actions rendered in the live DOM) but carried a *behavioral* bug (two of the actions applied their effect only on widget reopen, not live) that only **user behavioral testing** caught. The lesson for lane self-verification discipline: a lane verifying an interactive feature should be instructed to **exercise the action → state-change path**, not just confirm the control renders. (Adjacent to MAST FM-2.6 announce-vs-action: "implemented X" passed structurally while X's runtime effect was incomplete.) `§7`'s announce-vs-action audit could fold this in as the dual: announce-vs-action catches the dispatch-side lie ("I did X" when X wasn't done); presence-vs-behavioral catches the verify-side lie ("X is present" when X doesn't *work*).
+
+
+- **`§2` confirmations**:
+  - **Latency-hiding thesis — confirmed.** All 8 lanes hid agent-time during review-wait or independent-work windows. Write-lane width never exceeded 2 (case 8's two disjoint UI tasks); the real bottleneck is review throughput + independent-work availability, not model throughput.
+  - **Speculation off-by-default — held (0/8).** No case simultaneously met the three ask-triggers (high-confidence likely branch + low downstream sensitivity + meaningful latency saving). The conservative default cost nothing.
+  - **MAST FM-1.3 (duplicate work) = 0.** Case 7's 7 readers used area-disjoint manifests; case 8's 2 write lanes touched disjoint files; no two lanes overlapped in either dispatch. The lane-manifest cross-check (§3 / §4 / §7 MAST guards) was effective at width 7 and at the first parallel-write dispatch. FM-1.5 / FM-2.6 not triggered (though §2b's verify-side dual — presence vs behavioral — is the post-hoc lesson).
+  - **In-order retire held.** Declared order preserved at the synthesis/merge step in all multi-lane cases.
+- **`§5` adoption-threshold readout — all green at n=8**:
+
+  | Signal | Threshold | Measured (n=8) | Status |
+  |---|---|---|---|
+  | avg merge-conflict rate | `> 15%` → `issue_width_write -= 2` | 0% (0/3 write-mergeable: case 1 + case 8's two lanes; read-only excluded) | OK |
+  | speculative accuracy (last 10) | `< 60%` → spec off | n/a (0 spec) | — |
+  | concurrent token cost vs in-order | `> 3×` → cap re-tune | qualitative: hidden latency > token premium; tokens spent during review-wait | OK |
+  | FM-1.3 detection | `≥ 1/session` → guard up | 0 | OK |
+
+  No threshold tripped; no auto-adjustment fired. Case 7's cap-exceed was a read-only lane (conflict = NA); case 8's two write lanes merged clean. Empirical confirmation of the §5 lane-class differentiation.
+- **Unexercised surface**: worktree-isolation now exercised once (case 8) but only at the parent-repo level — the nested-repo target degraded it to branch isolation (§2b); a *same-repo same-file* concurrent write (the case worktree isolation is meant for) has **not** been stress-tested · speculation 0/8 (Stage 2/3 features still zero data) · wide *write* fan-out — write width reached 2 (case 8), still lightly tested from the write side (disjoint files, no real contention yet). Implication: the conservative Stage-1 defaults are strongly validated; the §2b limitation is a Stage-2 harness work item (nested-repo detection); the entry still provides no signal for advancing to Stage 2/3 speculation features.
+- **Relation to Entry 04**: complementary, not redundant. Entry 04 varied **in-lane depth** at fixed width 4 (below cap); Entry 05 varies **cross-lane fan-out during review-wait** (latency-hiding) and probes the read-only-fan-out-above-cap regime Entry 04 did not reach. Case 8 added the first *worktree write* lane data point but its two lanes were independent UI tasks (not in-lane sub-split), so it still does not corroborate Entry 04's in-lane-overhead estimate. What case 8 adds instead is the §2b worktree-isolation caveat — a limitation Entry 04's single-arm sequential measurements would not have surfaced (it never ran two concurrent worktree write lanes on a nested-repo target). Neither subsumes the other; both feed §5.
+- **Outcome — P1 + R1 + R2 + R3 reflected upstream**:
+  - **P1 — lane-class cap asymmetry (actionable)**: case 7's width-7 read-only fan-out with zero downside is the empirical anchor for the §2 read/write split adopted at v0.3.0.
+  - **R1 — `§2`/`§5` lane-class cap split**: adopted in §2 (`issue_width_read` drops Little's Law + Kanban-WIP terms — they only model retire-merge contention) and §5 (merge-conflict gate binds `issue_width_write` only).
+  - **R2 — policy cap vs runtime concurrency ceiling relationship**: clarified in §2's new "Policy cap vs runtime concurrency ceiling" sub-section. `issue_width_write` is a hard policy bound; `issue_width_read` is a soft preference subject to the runtime ceiling above it. Effective concurrent lanes = `min(policy_cap, runtime_ceiling)`; which dominates is mechanism-dependent (workflow fan-out → runtime dominates; agent-tool fan-out → policy dominates).
+  - **R3 — worktree isolation on nested independent repos (new, case 8)**: reflected in §3's "Nested independent-repo limitation" bullet (v0.4) — three documented mitigations (worktree the nested repo per lane / guarantee file-disjointness + accept branch isolation / harness emits warning when nested-repo write targets detected); harness-side auto-detection remains the open Stage-2 surface, with the operator as the safety net until then.
+- **Cross-reference**: `_proposals/005_2026-06-01_superscalar-dogfooding-stage1/` — full bundle (EN + KO twin + README).
+- **Calibration signal**: first dogfood entry to probe the read-lane class above policy cap; resolves a previously-silent divergence between the single-cap formula and runtime ceilings on read-only fan-outs. Case 8 added the first *worktree write-lane* data point — width 2, disjoint files, 0 conflict — but the §2b limitation means worktree-isolation is still untested in the *same-repo same-file concurrent write* shape that §3 is designed for. Stage 2 work on wide-write merge-conflict + the nested-repo harness-detection feature remains unaddressed by this entry; Entry 01-04 baselines retain primacy on the parent-repo write surfaces.
+
+### Entry 06 — 2026-06-01 · controlled A/B measurement on a 9-dimension backend audit (Superscalar discipline OFF vs ON, parallelism held constant)
+
+- **Source**: a downstream backend-audit dogfood — full-source deep-dive on a 9-dimension payment-backend (Java/Spring/MyBatis multi-module), with Superscalar **discipline** isolated as the single experimental variable. **Both arms parallelised** (workflows multi-parallel dispatch); the only difference was the orchestration discipline (design-freeze → consume → cross-cut → in-order retire + consistency gate + completeness critic).
+- **`issue_width`**: both arms ran width-9 at peak (9 dimensions: 3 foundation + 5 consumer + 1 cross-cut). Speculation = 0 both arms (already-decided audit scope).
+- **Experimental control quality**: A → B sequential execution on the same hardware with no external interruptions — clean signal compared to the Entry 04 controlled re-run (which was a sequential A/B on the same dashboard, but on a different workload domain). Both arms operated on byte-identical source.
+
+#### Quantitative measurement (raw totals)
+
+| Metric | Arm A (discipline OFF, naïve max-parallel) | Arm B (discipline ON) | Δ | Reading |
+|---|---:|---:|---|---|
+| Components covered | 145 | 144 | ≈0 | Equivalent coverage — both arms reached full source |
+| Endpoints enumerated | 314 | 485 | **+54% (B)** | B's grounded enumeration was more exhaustive, especially the auth matrix |
+| Raw findings | 121 | 109 | −12 | B pre-retire; A had no dedup stage |
+| **Findings after dedup** | (not performed) | 62 unique risk-groups (47 merged, 38 cross-dim pairs) | — | **B-only artifact** — see §3.1 below |
+| **crossRefs (grounding)** | 49 | **107** | **+118% (B)** | B's headline win — grounded citations replace assumption |
+| **assumptions (speculation surface)** | 62 | **37** | **−40% (B)** | B replaced speculation with sourced fact |
+| critical-severity findings | 13 | 14 | +1 | Equivalent — same true-positive class |
+| high-severity findings | 36 | 36 | 0 | Equivalent |
+| **Cost — agents** | 9 | 10 | +1 | Retire agent added |
+| **Cost — tokens** | 1.24 M | 1.34 M | **+8% (B)** | Modest token premium |
+| **Cost — wall-clock** | **8.9 min** | 23.6 min | **2.65× (A faster)** | Phase serialisation cost, not parallel inefficiency |
+
+#### Grounding causality (per-dimension breakdown)
+
+The crossRef increase concentrated in **consumer + cross-cut dimensions** — the dimensions whose work *receives* a frozen contract from upstream foundation:
+
+| Dimension | Role | crossRefs A → B | assumptions A → B |
+|---|---|---|---|
+| foundation-1 | foundation | 5 → 5 (≈) | 7 → 4 |
+| foundation-2 | foundation | 6 → 6 (≈) | 8 → 6 |
+| foundation-3 | foundation | 5 → 6 (≈) | 6 → 5 |
+| **consumer-1 (web-api class)** | **consumer** | **5 → 24 (4.8×)** | 7 → 4 |
+| **consumer-2 (office-admin class)** | **consumer** | 6 → 9 | 7 → **3** |
+| **consumer-3 (office-front class)** | **consumer** | **7 → 18 (2.6×)** | 7 → 5 |
+| **consumer-4 (payment-integration class)** | **consumer** | **5 → 12 (2.4×)** | 6 → **2** |
+| **consumer-5 (build-deploy class)** | **consumer** | 5 → 10 (2×) | 7 → 4 |
+| **cross-cut (security)** | **cross-cut** | **5 → 17 (3.4×)** | 7 → 4 |
+
+The foundation-3 dimensions stayed roughly flat (5→5, 6→6, 5→6) — they are the contracts' *source*, with no upstream to ground onto. The consumer + cross-cut dimensions are where design-freeze's grounding effect materialises, which is the line-level confirmation that **"design-freeze produces grounding" is a causal claim, not a coincidence**.
+
+#### B-only artifacts (the structural gap of naïve parallel)
+
+Arm A *cannot produce* the following by construction (no orchestration stage exists in naïve max-parallel). Arm B's retire stage produced them deterministically:
+
+- **3.1 Dedup** — Arm B's retire stage merged 47 cross-dimension duplicate findings into 62 unique risk groups and identified two maximum-distribution risks (one observed across 7 dimensions, another across 6) — these became the security-audit top priorities purely because they were the risks seen *concurrently* by the most independent lanes. Arm A's 121 raw findings included the same risks counted up to 4× (one platform-constant risk surfaced independently in 4 dimensions, all 4 counted separately with no consolidation actor).
+- **3.2 Consistency gate — real-world contradiction resolution (★ the headline result)** — broken-reference scan returned 0 across all consumer→foundation citations. One **real contradiction** was caught and resolved: a foundation dimension declared an authentication-hash class as one algorithm (with a security-library helper), while three consumer dimensions independently observed and grounded the *opposite* algorithm (raw, salt-less hashing in production paths, with the security-library entry-point marked as dead code in foundation comments). Arm B's retire gate paired the two observations, line-grounded the conflict, and resolved the **declared algorithm = dead utility, effective algorithm = the consumer-observed one (insecure)** — a security-relevant outcome that the audit could ship on. **Arm A also surfaced both halves** (one dimension correctly observed the declared class, another correctly observed the effective class) but **no actor reconciled them**; the contradiction persisted as a silent quality defect downstream of the audit. The retire gate is what made the difference — Arm B's *consistency gate* is precisely the actor that meets the two halves at the merge boundary. **This single case is the live demonstration of the §1 meta-note**: parallelism is not sufficient; discipline produces consistency.
+- **3.3 Completeness critic** — Arm B's retire stage produced an explicit "gaps map" — 11 named completeness gaps spanning unscanned scope (e.g., a controller class of ~40 unread endpoints), unread auxiliary domains, missing schema/DDL coverage, framework-version CVE survey gaps, and one *unavoidable* gap (operational-server in-residence credential values — by definition not in source). Arm A's 9 dimensions each reported their own gaps independently, but with no actor producing the *union of gaps*, the audit had no backlog for "what does the next iteration look at?" — a handover-quality defect.
+- **3.4 Systematic prior-finding cross-reference (S1…S16)** — Arm B's retire stage line-grounded the audit against a pre-existing handover-inventory's risk register (16 entries from a prior cycle), achieving **0 refutations + 16 confirmations + 6 entries with severity escalation evidence** (the new audit grounded the inventory entries more sharply than the inventory itself stated). Arm B also surfaced **4 new findings (X1…X4) — 3 of which were cross-confirmed by 3 independent consumer dimensions** (a previous-cycle independent-discovery validation that elevated the confidence ceiling on those new findings). Arm A's cross-cut dimension touched S1…S16 but only as one lane's solo work — no cross-dimension corroboration, no integrated reconciliation between S1…S16 and the new findings.
+
+#### Cost-benefit summary
+
+| Axis | Winner | Magnitude |
+|---|---|---|
+| Component coverage | Tie | 145 ≈ 144 |
+| Endpoint enumeration | **B** | +54% |
+| Grounding (crossRefs) | **B** | **+118%** |
+| Speculation suppression (assumption count) | **B** | **−40%** |
+| Deduplication | **B** | A did not perform (no orchestration stage) |
+| Consistency (real contradiction resolution) | **B** | A surfaced both halves but did not reconcile |
+| Completeness (gap union + S-cross-reference) | **B** | A did not perform |
+| **Wall-clock** | **A** | **2.65× faster** |
+| Tokens | A | B +8% |
+
+**Reading**: Arm A (naïve max-parallel) is faster — and a legitimate choice for *first-pass reconnaissance scans* where speed dominates. Arm B (Superscalar discipline) is slower because the discipline serialises the phases (freeze → consume → cross-cut → retire) and adds a retire agent — **not** because parallelism inside each phase is throttled. The cost of the discipline is the cost of **phase serialisation**, not parallel inefficiency. Held to **equal scope** the in-phase parallelism inside Arm B is identical to Arm A's; what Arm A saves is the phase-serialisation overhead.
+
+#### Calibration signal — first cleanly-measured wall-clock signal
+
+Entry 04's measurement caveat was that the +127% wall-clock there was *sequential single-dashboard arm-execution* (not concurrent), so it confounded in-lane sub-split overhead with the headline parallel-latency-hiding benefit. **Entry 06 closes that confound**: both arms parallelised (workflows multi-parallel dispatch in both), and the A → B sequential execution removed external-interruption noise that had invalidated the original 2026-05-30 A/B. The 2.65× wall-clock signal is therefore **the cleanly-measurable cost of the discipline's phase serialisation**, with the parallelism-vs-no-parallelism axis held constant. Combined with the +8% token cost, the trade is: a 2.65× wall-clock + 8% token premium buys grounding (+118%), assumption suppression (−40%), dedup, consistency-gate contradiction resolution, completeness gap-map, and integrated S-cross-reference. For handover-grade audits and cross-dimension consistency work the trade is favourable; for fast first-pass reconnaissance the trade is unfavourable.
+
+#### Reflected upstream
+
+- **§1 meta-note (v0.4)** — "parallelism is not sufficient; orchestration discipline produces consistency" — Entry 06's hash-algorithm-contradiction case is the load-bearing anchor.
+- **§5 adoption-thresholds (no threshold change)** — Entry 06 confirms the existing thresholds remain green; the trade-off table is what gains an explicit anchor, not the gates.
+- **§11 baseline catalogue** — Entry 06 is the first cleanly-measured *discipline-vs-no-discipline* A/B with parallelism held constant; Entry 04 (in-lane sub-split A/B at fixed width) and Entry 06 (cross-lane discipline A/B at full width) together form the **two-axis empirical anchor** for `§5` adoption-threshold tuning.
+
+*Privacy: redacted per `_proposals/` default — the audit's domain (payment-backend), language/framework (Java/Spring/MyBatis), and the specific algorithm contradiction class are generic identifiers; no service names, hosts, repos, or specific identifiers cited. The full unredacted measurement bundle remains in the dogfood directory under `assets/reports/` (gitignored).*
+
+### Entry 07 — 2026-06-11 · mid-flight session-budget interruption recovered by resume cache (n=1, incidental)
+
+- **Setting**: 53-lane read-only translation fan-out (CHANGELOG English-normalization; 1 lane = 1 entry) followed by a deterministic assembly stage with count/format verification gates.
+- **Interruption**: session token budget exhausted mid-run — 25 lanes retired cleanly; 28 lanes failed at the *harness* tier (budget rejection, not work-content failures).
+- **Recovery**: single re-issue with the journal-backed resume cache (§3.2). All 25 retired lanes returned from the journal with zero re-execution; 9 further lanes had already written their output artifacts before their retirement could be journaled (the §3.2 crash window) and were idempotently overwritten on re-run; the remaining lanes executed live. Final: 53/53 lanes + a verification lane PASS — zero content loss, zero duplicate cost on retired work.
+- **Reading**: validates both §3.2 preconditions in one incident — the *idempotent-artifact* rule (9/53 lanes landed in the artifact-written-but-not-journaled window) and the *determinism* precondition (the script carried an inlined static work-list; a timestamp-bearing list would have changed the cache key and missed everything).
+- **Caveats**: n=1 and incidental (not a controlled measurement); all lanes read-only — write-lane resume composes with §3 worktree isolation in principle but is unmeasured.
+
+<!-- graph-nav -->
+
+## Related
+
+- **Sibling modules** — [Constellation](Constellation.md) · [Hyperbrief](Hyperbrief.md) · [Greatpractice](Greatpractice.md) · [Ultrasafe](Ultrasafe.md) · [Compendium](Compendium.md)
+- **Plugin** — [superscalar plugin](plugins/superscalar/README.md)
+- **Project overview** — [README.md](README.md)

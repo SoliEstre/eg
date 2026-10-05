@@ -1,0 +1,44 @@
+@component gateway-client
+@intent Parent manifest of the Constellation gateway-client runtime adapter family (v1.1 split per phase_2 2026-06-04 — supersedes v2.5.3 single-file `metadata:` form). The 12-dim SSoT contract (canonical promoted from Hermes refined on 2026-06-01, commit b4c5e3d) is now expressed via eux-format v1.1's `@directive` super-set + `@deps`-based modular split, addressing G3/G6 from the 2026-06-03 brew-dogfooding gap catalog (large module surface-only validation + single .eux content-cramming). Cluster sub-modules: `-handshake` (connection lifecycle + role + url_patterns), `-a2a` (envelope + routing + delivery + ack tier with Hyperbrief decided extension), `-attachments` (§13.11 rule 5 transport-mode discipline — formalized from prose), `-key-mgmt` (§13.16.11 KEY-MGMT client-side surface — formalized from prose). The parent manifest carries cross-cluster operational directives (`@runtime` / `@redaction` / `@operation_discipline`) so the family shares a single operational policy contract.
+@expansion temperature=0.2 model=agent/claude template=estreux/v0.1
+@targets vanilla
+@profile protocol-adapter
+@source constellation/gateway-client.eux(v2.5.3 pre-split 264 lines · metadata: 12-dim) split-source for `-handshake` + `-a2a` clusters · Constellation.md(§13.11 rule 5) source for `-attachments` cluster · Constellation.md(§13.16.11) source for `-key-mgmt` cluster · eux-format-v1.md(EstreUX commit 77e12f9 §2.5 7 directive + §4.5 임계) split format basis
+@deps
+  -handshake: constellation/gateway-client-handshake.eux              # connection lifecycle + role + url_patterns + AgentHello
+  -a2a: constellation/gateway-client-a2a.eux                          # envelope + routing + delivery + ack tier (delivered/commitment/application/decided)
+  -attachments: constellation/gateway-client-attachments.eux          # §13.11 rule 5 transport-mode + sha256 verification
+  -key-mgmt: constellation/gateway-client-key-mgmt.eux                # §13.16.11 KeyIssue/List/Revoke/Label + AgentNameChanged broadcast
+@runtime
+  engine: turn-held (15s drain window — see -a2a @machine turn_held)
+  concurrency: single-connection (one WS per adapter instance; multi-instance adopters spawn parallel adapters)
+  keepAlive: ws-ping only (transport layer)
+  poll_interval_ms: 15000                                              # safe-point window for turn-held drain
+  forbidden:
+    - display_heartbeat (app-layer Heartbeat emission for "still here" without actual activity)
+    - auto_pong (bridge auto-emits Pong masks application liveness — Pong owner is active runtime turn only)
+    - idle_heartbeat_as_activity (use ws-ping at transport layer, never app-layer as activity proxy)
+@redaction
+  hook: pre-send + pre-log                                             # both inbound log and outbound emit paths
+  targets:
+    - credential (token, upstreamKey uk-*, collabKey ck-*) — surface only first 8 chars in logs
+    - PII (user-supplied identifiers in UserPrompt bodies)
+    - real service / workspace / repo names (use generic anonymization for public traces)
+    - raw tool result secret leaks (per §13.14 redaction discipline)
+  authority: §13.14 reference-build redaction discipline = canonical redaction SSoT; this manifest scopes the adapter family
+@operation_discipline
+  principle: event-driven emit (activity-linked outbound; no autonomous heartbeat under idle)
+  upstream_peer:
+    - continue own track after informational OnboardAck (upstream/collab roles)
+    - do not wait for Delegate unless AgentList classifies us as local
+    - recommend-and-proceed for non-branching choices (per Constellation.md §13.18 autonomous execution)
+    - do not defer progressable work to a fresh context (per §13.21 fresh-context defer anti-pattern)
+    - materialize large work before context boundary risk (per §13.16.6 6th element)
+  wait_state:
+    - emit BlockerManifest before all-blocked idle wait (per §13.20)
+    - emit BlockerNudge by cadence while blocker remains
+    - route human escalation to board decisions panel (per §13.17 — never inline AskUserQuestion structured-choice prompts in main chat)
+  anti_patterns:
+    - false-alive heartbeat
+    - ack storm (auto-emit AckProcessed on every inbound without agent judgment)
+    - silent drop of A2A-intent class (every unknown name → wake fail-safe, never silent absorption)

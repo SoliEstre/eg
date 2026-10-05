@@ -1,0 +1,1065 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/SoliEstre/EstreGenesis/plugins/hyperbrief/schema/hyperbrief.schema.json",
+  "title": "HyperbriefIR",
+  "description": "Hyperbrief JSON IR — the single output the LLM emits. MD/HTML are rendered deterministically from this. See Hyperbrief.md for normative rules.",
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/$defs/FullBrief" },
+    { "$ref": "#/$defs/SummaryBrief" },
+    { "$ref": "#/$defs/BlockedStub" }
+  ],
+
+  "$defs": {
+
+    "tagged_text": {
+      "type": "string",
+      "description": "All fact-assertion strings MUST carry an epistemic tag. Optional provenance tag follows.",
+      "pattern": "^\\[(verified|inferred|assumed|unknown)\\](\\[(관찰|추론|외부:[^\\]]+|가정)\\])?\\s+\\S.+$"
+    },
+
+    "score_0_3": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3
+    },
+
+    "tone_level_1_5": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5,
+      "description": "5-level Likert scale. See Hyperbrief.md §5.6 for axis-specific rendering rules. Default 2 per axis."
+    },
+
+    "AudienceProfile": {
+      "type": "object",
+      "description": "3 orthogonal tone axes (§5.6). MUST NOT be collapsed into a single complexity score.",
+      "required": ["audience", "abbreviation", "jargon"],
+      "properties": {
+        "audience": {
+          "$ref": "#/$defs/tone_level_1_5",
+          "description": "Domain familiarity: L1 general / L2 general-dev mid (default) / L3 dev / L4 dev-expert mid / L5 expert-academic."
+        },
+        "abbreviation": {
+          "$ref": "#/$defs/tone_level_1_5",
+          "description": "Surface compression: L1 full sentences / L2 natural with light compression (default) / L3 bullet-heavy / L4 telegraphic / L5 spec-density."
+        },
+        "jargon": {
+          "$ref": "#/$defs/tone_level_1_5",
+          "description": "Domain-term density: L1 no jargon / L2 jargon with 1-line gloss on first use (default) / L3 jargon free / L4 framework cited not explained / L5 citations terse."
+        }
+      }
+    },
+
+    "AudienceProfileFallback": {
+      "type": "object",
+      "description": "Tone-floor fallback affordance (§5.6.7). HTML surfaces a button; MD listens for trigger phrases. v0.5 adds telemetry-driven learning of trigger_phrases_md.",
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "button_label": {
+          "type": "string",
+          "default": "뭔 소리야? 한국어로 번역해줘 (내가 알아들을 수 있는 말로)",
+          "description": "Playful copy on the HTML re-render button."
+        },
+        "trigger_phrases_md": {
+          "anyOf": [
+            { "type": "array", "items": { "type": "string" } },
+            { "type": "string" }
+          ],
+          "default": ["뭔 소리", "안 읽혀", "무슨 말", "이해 안", "더 쉽게", "너무 어렵", "다시 풀어", "쉽게 다시", "한국어로", "한국말로", "level 2 라고", "L2 라고", "이게 level", "이게 L"],
+          "description": "When the user response after a MD brief contains any of these substrings, regenerate at {1,1,1}. v0.7.7 — accepts **either** a string array **or** a markdown string, because the `_md` suffix reads as 'a markdown blob goes here' while the schema demanded an array, and the name is what an implementer trusts: this repository's own ultrasafe MCP shipped `trigger_phrases_md: \"\"`, which the array-only form made invalid. Normalization is defined once, in the renderer engine's exported `normalizeTriggerPhrases` — a string yields its markdown list items (`- x` / `* x` / `1. x`) when any are present, else its non-empty lines; an array is trimmed and emptied of blanks; non-string array elements are DROPPED rather than coerced, since a stringified number is a phrase that can never match and would sit in the list looking like coverage. Consumers MUST use that one normalizer: N independent readings of this field produce N different phrase lists, and the symptom — 'the plain-language escape hatch does not respond on one surface' — is silent. An empty result means *no phrases*, never *the default list*; the default is declared here and MUST NOT be re-copied into consumers."
+        },
+        "telemetry": {
+          "type": "object",
+          "description": "v0.5 — telemetry-driven phrase learning. When enabled, adopter MAY append user responses that DID trigger the fallback (or that the user labeled as confusion despite no auto-trigger) to a phrase-learning log; periodic offline review promotes recurring phrases into trigger_phrases_md.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false, "description": "Opt-in. Default off to keep behavior deterministic." },
+            "log_path": { "type": "string", "description": "Path to a jsonl phrase-learning log; default .agent/_decisions/hyperbrief-trigger-phrase-log.jsonl" },
+            "promotion_threshold": { "type": "integer", "default": 3, "minimum": 1, "description": "Phrase must recur this many times across distinct decision_ids before promotion is offered." }
+          }
+        },
+        "term_pairing": {
+          "type": "object",
+          "description": "v0.6 — term-pairing display policy. Controls when abbreviations / jargon are paired with their expanded forms across surfaces. Composes with the 3-axis AudienceProfile (which sets tone level); this slot controls FREQUENCY (mode) and SCOPE of pairing display. Skill parses command-form strings like 'L1.I.C', 'L2.E.A', 'L1.I.C+B', with suffix '!' = retroactive_apply force-yes, '?' = always-prompt. Default mode 'N' / scope ['D'].",
+          "properties": {
+            "mode": {
+              "enum": ["E", "I", "N"],
+              "default": "N",
+              "description": "Pairing frequency policy. E = every occurrence pairs the expansion; I = initial occurrence per scope-unit pairs (subsequent abbreviated), with low-frequency override (≤ 3 occurrences in scope-unit ⇒ pair every time); N = none, surface terms as-is per AudienceProfile.jargon level."
+            },
+            "scope": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "enum": ["C", "D", "B", "R"]
+              },
+              "default": ["D"],
+              "description": "Surfaces where the pairing policy applies. C = conversation (live chat output), D = document (rendered MD/HTML brief), B = board (Constellation A2A board emit), R = review (inline review lines). Shortcut 'A' in command-form expands to [C, D, B, R]. Multi-scope supported (e.g., C+B)."
+            },
+            "retroactive_apply": {
+              "enum": ["Y", "N", "prompt"],
+              "default": "prompt",
+              "description": "Whether to retroactively rewrite already-emitted surfaces in scope upon policy change. Y = force retroactive apply, N = forward-only, prompt = ask user. C (conversation) scope is structurally forward-only and ignores this field (auto-applies to new output only without prompting)."
+            },
+            "dictionary_ref": {
+              "type": "string",
+              "description": "Optional reference to an external term dictionary (path or anchor) the renderer should consult to classify abbrev / jargon and supply expansions. When absent, renderer falls back to an inline minimal map or skips pairing for unknown terms."
+            },
+            "dictionary_inline": {
+              "type": "object",
+              "description": "Optional inline minimal term map keyed by surface form, with expanded form as value. Used when dictionary_ref is absent or as override. Renderer prefers inline over ref on key collision.",
+              "additionalProperties": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+
+    "RecommendedArtifact": {
+      "type": "object",
+      "description": "Artifact body attached to §8 recommendation (e.g., a patch text the user is voting on). MUST NOT be referenced abstractly — body required (§10.1 MUST-18, AF-20). v0.5 adds optional sub-fields for structured code artifacts (language hint, line_count metric, hash) so the renderer can apply syntax-aware formatting and the validator can detect tampering.",
+      "required": ["artifact_type", "target_file", "body", "rationale_one_line"],
+      "properties": {
+        "artifact_type": {
+          "enum": ["patch", "spec", "code", "design", "config", "other"]
+        },
+        "target_file": { "type": "string" },
+        "target_anchor": {
+          "type": "string",
+          "description": "Heading anchor, line range, or section ID within the target file."
+        },
+        "body": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Actual text/code the reader is voting on. Empty body with non-trivial reference is AF-20."
+        },
+        "rationale_one_line": { "$ref": "#/$defs/tagged_text" },
+        "language": {
+          "type": "string",
+          "description": "v0.5 — language hint for syntax-aware rendering (e.g., 'javascript', 'typescript', 'json', 'markdown', 'python', 'bash', 'diff', 'yaml'). Optional but RECOMMENDED for code/config/patch artifacts. Renderer applies fenced code-block language tag in MD; HTML syntax-highlighting if available.",
+          "examples": ["javascript", "typescript", "python", "json", "markdown", "yaml", "bash", "diff"]
+        },
+        "line_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "v0.5 — line count of `body` (auto-computed by emitter; renderer cross-checks against `body.split('\\n').length` and warns on mismatch). Stable comparison metric across cycles for drift detection."
+        },
+        "body_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "v0.5 — sha256 hex of `body` (lowercase). Auto-computed by emitter; renderer cross-checks. Detects accidental body tampering between IR emit and decision archive."
+        }
+      }
+    },
+
+    "SurfaceProfileEstimate": {
+      "type": "object",
+      "description": "v0.5 — auto-computed estimate of the EFFECTIVE audience_profile based on the rendered surface. Populated by the renderer (NOT by the LLM). Compared against the IR's DECLARED audience_profile (§0); if any axis declared-vs-estimate gap is >= 2 levels, the renderer auto-injects a profile-mismatch warning (AF-18). Heuristics are not authoritative — they exist to surface declared-vs-effective drift, not to override the declared profile.",
+      "properties": {
+        "audience": {
+          "$ref": "#/$defs/tone_level_1_5",
+          "description": "Estimated effective audience level from the rendered surface, driven by english_noun_ratio. v0.7.6 correction: this description previously also named acronym density and first-use-gloss presence, which the renderer never fed into this axis — those are abbreviation-axis inputs and now drive that axis instead."
+        },
+        "abbreviation": {
+          "anyOf": [{ "$ref": "#/$defs/tone_level_1_5" }, { "type": "null" }],
+          "description": "v0.7.6 — Estimated effective abbreviation level from the rendered surface, driven by abbreviation content: the share of distinct abbreviations left BARE at first use (abbrev_bare_ratio), damped by absolute density (abbrevs_per_1000_tokens). Level 1 = expanded on first use, 5 = bare. Until v0.7.5 this description named avg sentence length, and the renderer implemented exactly that — so the axis measured sentence length and never looked at an abbreviation: a text of short plain sentences with no acronyms at all scored 5 (bare), and two texts with identical abbreviation content scored 5 vs 1 purely because one used longer sentences. Sentence length remains reported in raw_metrics for calibration; it is not this axis. **null = not measurable** — a text carrying no abbreviations has not expanded them all, there was nothing to expand, and a declared-vs-estimate gap MUST NOT be computed from a null."
+        },
+        "jargon": {
+          "$ref": "#/$defs/tone_level_1_5",
+          "description": "Estimated effective jargon level from rendered surface (e.g., per-1000-tokens frequency of canonical framework names — RAPID/Cynefin/MCDA/Toulmin/Hyrum/etc — without inline gloss)."
+        },
+        "raw_metrics": {
+          "type": "object",
+          "description": "Optional raw inputs to the estimate, for telemetry / calibration.",
+          "properties": {
+            "english_noun_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+            "avg_sentence_length_chars": { "type": "number", "minimum": 0 },
+            "jargon_terms_per_1000_tokens": { "type": "number", "minimum": 0 },
+            "gloss_pattern_present": { "type": "boolean", "description": "v0.7.6 rename of first_use_gloss_present — the old name claimed more than the expression tested (any parenthetical anywhere satisfied it, related to an abbreviation or not). Abbreviation-specific glossing is abbrev_first_use_glossed / abbrev_bare_ratio." },
+            "abbrev_occurrences": { "type": "integer", "minimum": 0 },
+            "abbrev_distinct": { "type": "integer", "minimum": 0 },
+            "abbrevs_per_1000_tokens": { "type": "number", "minimum": 0 },
+            "abbrev_first_use_glossed": { "type": "integer", "minimum": 0, "description": "Count of distinct abbreviations expanded at their FIRST occurrence — later expansions do not count, because the axis is about what a reader meeting the term for the first time was given." },
+            "abbrev_bare_ratio": { "type": ["number", "null"], "minimum": 0, "maximum": 1, "description": "(abbrev_distinct - abbrev_first_use_glossed) / abbrev_distinct. null when abbrev_distinct is 0 — see the abbreviation axis note on why that is not 0 or 1." },
+            "bullet_density": { "type": "number", "minimum": 0, "maximum": 1 },
+            "epistemic_tag_form": { "type": "string", "enum": ["bracket", "korean", "superscript", "mixed"] }
+          }
+        },
+        "declared_vs_estimate_gap_warning": {
+          "type": "boolean",
+          "description": "true when any axis |declared - estimate| >= 2."
+        }
+      }
+    },
+
+    "ArchiveConfig": {
+      "type": "object",
+      "description": "§9 archive_config — preserves decision + brief + related user prompts + applied artifacts + meta learnings as a load-bearing development record.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Default ON. Disable per-brief for low-value decisions."
+        },
+        "archive_path": {
+          "type": "string",
+          "description": "Path to archive bundle directory. Default: .agent/_decisions/<id>.archive/ (standalone) or _proposals/<bundle>/dogfood-entry-NN.md (proposals-tracked)."
+        },
+        "elements": {
+          "type": "array",
+          "items": {
+            "enum": ["brief_original", "decision", "related_user_prompts", "recommended_artifacts_applied", "meta_learnings"]
+          },
+          "default": ["brief_original", "decision", "related_user_prompts", "recommended_artifacts_applied", "meta_learnings"]
+        }
+      }
+    },
+
+    "decision_id": {
+      "type": "string",
+      "pattern": "^hb-[0-9]{8}-[a-z0-9]{6}$",
+      "description": "Format: hb-YYYYMMDD-<6 lowercase alphanum>"
+    },
+
+    "node_id": {
+      "type": "string",
+      "pattern": "^N[0-9]+$"
+    },
+
+    "EscalationHeader": {
+      "type": "object",
+      "required": ["irreversibility", "blast_radius", "time_horizon", "reversal_cost", "sum", "autonomy_refusal_reason"],
+      "properties": {
+        "irreversibility": { "$ref": "#/$defs/score_0_3" },
+        "blast_radius": { "$ref": "#/$defs/score_0_3" },
+        "time_horizon": { "$ref": "#/$defs/score_0_3" },
+        "reversal_cost": { "$ref": "#/$defs/score_0_3" },
+        "sum": { "type": "integer", "minimum": 0, "maximum": 12 },
+        "autonomy_refusal_reason": { "$ref": "#/$defs/tagged_text" }
+      }
+    },
+
+    "RAPID": {
+      "type": "object",
+      "required": ["recommender", "decider", "performer", "input_contributors", "agree_holders"],
+      "properties": {
+        "recommender": { "type": "string" },
+        "decider": { "type": "string" },
+        "performer": { "type": "array", "items": { "type": "string" } },
+        "input_contributors": { "type": "array", "items": { "type": "string" } },
+        "agree_holders": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "MetaBranch": {
+      "type": "object",
+      "description": "§7 voluntariness affordance — the four branches always open to the reader. Extracted to a $def in v0.8.0 so the SummaryBrief tier references this exact shape rather than carrying a copy. A duplicated meta-branch is the first thing to drift, and what a drifted copy loses is the reader's right to refuse the question.",
+      "required": ["accept", "reject_framing", "defer", "request_investigation"],
+      "properties": {
+        "accept": { "type": "string" },
+        "reject_framing": { "$ref": "#/$defs/tagged_text" },
+        "defer": { "$ref": "#/$defs/tagged_text" },
+        "request_investigation": { "$ref": "#/$defs/tagged_text" }
+      }
+    },
+
+    "DecisionPrompt": {
+      "type": "object",
+      "description": "§6 Decision Prompt. Extracted to a $def in v0.8.0 and referenced by both FullBrief and SummaryBrief — §6 is already specified as sufficient on its own to route a decision, which makes it the one section the summary tier cannot compress.",
+      "required": [
+        "question_to_user",
+        "essence_one_line",
+        "core_tradeoff_one_line",
+        "recommendation_with_confidence_one_line"
+      ],
+      "properties": {
+        "question_to_user": {
+          "type": "string",
+          "pattern": "\\?\\s*$",
+          "description": "MUST end with '?'"
+        },
+        "essence_one_line": { "$ref": "#/$defs/tagged_text" },
+        "core_tradeoff_one_line": { "$ref": "#/$defs/tagged_text" },
+        "recommendation_with_confidence_one_line": { "$ref": "#/$defs/tagged_text" },
+        "ai_view_vs_devils_advocate": {
+          "type": "object",
+          "properties": {
+            "ai_view": { "$ref": "#/$defs/tagged_text" },
+            "devils_advocate": { "$ref": "#/$defs/tagged_text" }
+          }
+        }
+      }
+    },
+
+    "DecisionCaptureStub": {
+      "type": "object",
+      "description": "§9 Decision Capture. Extracted to a $def in v0.8.0 and referenced by both FullBrief and SummaryBrief — a decision made off a summary is still a decision that can turn out wrong, so revisit_date registers at every tier.",
+      "required": ["revisit_date", "ledger_pointer"],
+      "properties": {
+        "revisit_date": {
+          "type": "string",
+          "description": "ISO8601 date when hyperbrief-revisit should fire."
+        },
+        "ledger_pointer": {
+          "type": "string",
+          "description": ".agent/_decisions/<id>.json (standalone) or constellation ledger SSE id."
+        },
+        "outcome_actual": { "type": ["string", "null"] },
+        "outcome_vs_decision_quality_delta": { "type": ["string", "null"] },
+        "archive_config": { "$ref": "#/$defs/ArchiveConfig" }
+      }
+    },
+
+    "FullBriefFallback": {
+      "type": "object",
+      "description": "§5.6.10 escalation affordance (v0.8.0) — AudienceProfileFallback's sibling pointed the other way: one action from a summary up to the full evidence, where that one goes down to maximal plainness. Same auto-localize discipline (MUST-19 / MUST-25) and the same single `normalizeTriggerPhrases` normalizer; only the direction differs. Mandatory on every SummaryBrief, because a summary asks the reader to accept the agent's compression of the reasoning and must therefore keep the reasoning one action away (AF-30).",
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "button_label": {
+          "type": "string",
+          "default": "풀 브리핑으로 보여줘 (근거까지)",
+          "description": "Copy on the escalate-to-full-brief button. The skill MUST populate this in the user's prevailing conversation language at IR-emit time (MUST-25); this default is the last-resort value for IR-direct / programmatic / test invocations only. Reference literals: EN \"Show me the full brief.\" · KO \"풀 브리핑으로 보여줘 (근거까지)\" · JA \"詳しいブリーフを見せて。\""
+        },
+        "trigger_phrases_md": {
+          "anyOf": [
+            { "type": "array", "items": { "type": "string" } },
+            { "type": "string" }
+          ],
+          "default": ["풀 브리핑", "자세히", "근거", "더 자세", "전체 브리핑", "너무 간략", "짧아", "상세하게"],
+          "description": "When the user's response to a summary contains any of these substrings, generate the FullBrief for the SAME decision_id before attempting any other answer (MUST-25). Accepts either a string array or a markdown string, and MUST be read through the renderer engine's exported `normalizeTriggerPhrases` — the same one AudienceProfileFallback.trigger_phrases_md uses, for the same reason: N independent readings produce N different phrase lists and the failure is silent on every surface but one. An empty result means *no phrases*, never *the default list*; the default is declared here and MUST NOT be re-copied into consumers. The Korean default includes \"너무 간략\" because the complaint that a surface is too terse is itself the most reliable request to go deeper."
+        }
+      }
+    },
+
+    "SummaryBrief": {
+      "type": "object",
+      "description": "v0.8.0 SUMMARY_BRIEF tier (§2.5 + §4 SummaryBrief body) — the tier between a one-line post-notify and nine sections, and the default floor. Every entry in `required` below is load-bearing for a named debiasing property rather than for completeness: options carrying both gain and loss preserve framing balance (§5a), no_action_cost preserves the null option (§5f), meta_branch preserves voluntariness (§7), key_unknowns preserves epistemic honesty (§5), section_8_summary.switch_if keeps the recommendation conditional rather than a request for consent (§8), and full_brief_fallback keeps the reader one action from the evidence this tier omits (§5.6.10). A summary missing any of them is not a shorter brief; it is a nudge, which is the failure mode the whole module exists to block (AF-30). What a summary MAY omit is evidence — MCDA, pre-mortem, Toulmin CIs, blast-radius enumeration, the node tree — and only evidence.",
+      "required": [
+        "status",
+        "decision_id",
+        "section_0_summary",
+        "section_6_decision_prompt",
+        "summary_core",
+        "section_8_summary",
+        "full_brief_fallback",
+        "section_9_decision_capture_stub"
+      ],
+      "properties": {
+        "status": { "const": "summary" },
+        "decision_id": { "$ref": "#/$defs/decision_id" },
+        "brief_tier_resolved": {
+          "type": "string",
+          "enum": ["off", "summary", "full"],
+          "description": "The brief_tier setting in force when this summary was emitted (§2.5 precedence order). Recorded so a reader can distinguish a summary that was the configured floor from one produced by explicit request — and so an operator who pinned `full` can see that they did not get it. A setting that cannot be observed in the output is a setting nobody can verify."
+        },
+        "section_0_summary": {
+          "type": "object",
+          "description": "The §0 classifier, reduced to what routes attention: the same escalation arithmetic a full brief would report (a summary does not get to skip justifying its own tier), the reversibility class, the domain, and the tone declaration.",
+          "required": [
+            "escalation",
+            "reversibility_class",
+            "reversibility_badge_color",
+            "cynefin_domain",
+            "deadline",
+            "audience_profile"
+          ],
+          "properties": {
+            "escalation": { "$ref": "#/$defs/EscalationHeader" },
+            "reversibility_class": {
+              "enum": ["two_way", "one_way_with_migration_path", "one_way"]
+            },
+            "reversibility_badge_color": {
+              "enum": ["green", "yellow", "red"]
+            },
+            "cynefin_domain": {
+              "enum": ["clear", "complicated", "complex", "chaotic", "confused"]
+            },
+            "rapid_decider": {
+              "type": "string",
+              "description": "Who holds formal authority for this decision. The full RAPID quintet is a FullBrief field; a summary carries the Decider alone, because that is the part the reader needs to know whether the question is even theirs to answer."
+            },
+            "deadline": { "type": "string" },
+            "recommended_reading_minutes": { "type": "integer" },
+            "audience_profile": { "$ref": "#/$defs/AudienceProfile" },
+            "audience_profile_fallback": { "$ref": "#/$defs/AudienceProfileFallback" },
+            "surface_profile_estimate": { "$ref": "#/$defs/SurfaceProfileEstimate" }
+          }
+        },
+        "section_6_decision_prompt": { "$ref": "#/$defs/DecisionPrompt" },
+        "summary_core": {
+          "type": "object",
+          "required": ["options", "no_action_cost", "meta_branch", "key_unknowns"],
+          "properties": {
+            "options": {
+              "type": "array",
+              "minItems": 2,
+              "description": "minItems is 2 rather than 1 on purpose: a one-option list is a recommendation wearing an option list, and the compressed tier is exactly where that substitution is easiest to make and hardest to notice.",
+              "items": {
+                "type": "object",
+                "required": ["label", "gain", "loss"],
+                "properties": {
+                  "label": { "type": "string" },
+                  "gain": { "$ref": "#/$defs/tagged_text" },
+                  "loss": { "$ref": "#/$defs/tagged_text" }
+                }
+              }
+            },
+            "no_action_cost": {
+              "$ref": "#/$defs/tagged_text",
+              "description": "What doing nothing costs. Required rather than optional because the most frequently omitted alternative is the null option, and omitting it is the mechanism by which a decision gets manufactured out of a non-decision."
+            },
+            "meta_branch": { "$ref": "#/$defs/MetaBranch" },
+            "key_unknowns": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/tagged_text" },
+              "description": "At least one. A summary in which nothing is unknown is a summary that stopped looking; an all-[verified] compressed surface is the signature of that."
+            }
+          }
+        },
+        "section_8_summary": {
+          "type": "object",
+          "description": "Derived FROM summary_core.options, never before it (§7 pipeline). A recommendation composed ahead of the option set is AF-9 at reduced size, and reduced size does not make it acceptable.",
+          "required": ["recommended", "confidence", "switch_if"],
+          "properties": {
+            "recommended": { "$ref": "#/$defs/tagged_text" },
+            "confidence": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Numeric. Natural-language probability words are forbidden at every tier (MUST-7)."
+            },
+            "switch_if": {
+              "$ref": "#/$defs/tagged_text",
+              "description": "Which option wins if the recommendation's assumption fails. This field is what makes the output a recommendation rather than a request for consent, so it is required even though the assumption list itself is not."
+            },
+            "escalate_note": {
+              "type": "string",
+              "description": "Optional one-liner naming what the full brief would add for THIS decision (e.g. the MCDA table over these options, the pre-mortem). Helps the reader judge whether escalating is worth it instead of guessing."
+            }
+          }
+        },
+        "full_brief_fallback": { "$ref": "#/$defs/FullBriefFallback" },
+        "section_9_decision_capture_stub": { "$ref": "#/$defs/DecisionCaptureStub" }
+      }
+    },
+
+    "BlockedStub": {
+      "type": "object",
+      "description": "The one-line post-notify shape. Emitted when the rubric asks for nothing (escalation_sum < threshold and no MUST-trigger) AND the brief tier floor is `off` (§2.5). Before v0.8.0 the tier condition did not exist and this was the unconditional sub-threshold output, which is what made the rubric two-valued; from v0.8.0 the default floor is `summary`, so a project that sets nothing gets a SummaryBrief here instead. Agent decided autonomously; one-line post-notify required.",
+      "required": ["status", "decision_id", "escalation_header", "autonomous_action_taken"],
+      "properties": {
+        "status": { "const": "blocked_low_escalation" },
+        "decision_id": { "$ref": "#/$defs/decision_id" },
+        "escalation_header": { "$ref": "#/$defs/EscalationHeader" },
+        "autonomous_action_taken": { "$ref": "#/$defs/tagged_text" },
+        "post_notify_message": { "type": "string" }
+      }
+    },
+
+    "FullBrief": {
+      "type": "object",
+      "required": [
+        "status",
+        "decision_id",
+        "section_0_decision_header",
+        "section_1_context_horizon",
+        "section_2_blast_radius_surface",
+        "section_3_incremental_path_check",
+        "section_4_why_block",
+        "section_5_consequences_block",
+        "section_6_decision_prompt",
+        "section_7_decision_tree",
+        "section_8_recommendation",
+        "section_9_decision_capture_stub"
+      ],
+      "properties": {
+        "status": { "const": "active" },
+        "decision_id": { "$ref": "#/$defs/decision_id" },
+
+        "section_0_decision_header": {
+          "type": "object",
+          "required": [
+            "escalation",
+            "reversibility_class",
+            "reversibility_badge_color",
+            "rapid",
+            "cynefin_domain",
+            "decision_lineage",
+            "deadline",
+            "recommended_reading_minutes",
+            "stake",
+            "audience_profile"
+          ],
+          "properties": {
+            "escalation": { "$ref": "#/$defs/EscalationHeader" },
+            "reversibility_class": {
+              "enum": ["two_way", "one_way_with_migration_path", "one_way"]
+            },
+            "reversibility_badge_color": {
+              "enum": ["green", "yellow", "red"]
+            },
+            "rapid": { "$ref": "#/$defs/RAPID" },
+            "cynefin_domain": {
+              "enum": ["clear", "complicated", "complex", "chaotic", "confused"]
+            },
+            "decision_lineage": {
+              "type": "object",
+              "properties": {
+                "parent_decision_ids": { "type": "array", "items": { "type": "string" } },
+                "assumed_invariants": { "type": "array", "items": { "$ref": "#/$defs/tagged_text" } }
+              }
+            },
+            "deadline": {
+              "type": "string",
+              "description": "ISO8601 or 'no rush'"
+            },
+            "recommended_reading_minutes": { "type": "integer", "minimum": 1 },
+            "stake": {
+              "type": "object",
+              "properties": {
+                "financial": { "$ref": "#/$defs/tagged_text" },
+                "reputation": { "$ref": "#/$defs/tagged_text" },
+                "tech_debt": { "$ref": "#/$defs/tagged_text" }
+              }
+            },
+            "audience_profile": { "$ref": "#/$defs/AudienceProfile" },
+            "audience_profile_fallback": { "$ref": "#/$defs/AudienceProfileFallback" },
+            "surface_profile_estimate": {
+              "$ref": "#/$defs/SurfaceProfileEstimate",
+              "description": "v0.5 — auto-computed by renderer; not part of LLM-emitted IR. Populated post-render and persisted into the archived IR for audit."
+            },
+            "evaluation_lenses": {
+              "type": "array",
+              "description": "v0.6 — multi-lens evaluation carrier. Same decision subject scored through different perspectives (e.g., module-GA lens vs host-marketplace lens). Each lens declares its dimensions + thresholds + current scores + verdict; renderer surfaces all lenses side-by-side so the reader sees which lens passes and which fails. Optional; absent ⇒ single-lens (implicit) decision.",
+              "items": {
+                "type": "object",
+                "required": ["id", "name", "dimensions", "current_simple", "current_weighted", "verdict"],
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9_-]*$",
+                    "description": "Lens identifier; lowercase alphanum + hyphen / underscore."
+                  },
+                  "name": {
+                    "type": "string",
+                    "description": "Human-readable lens name (e.g., 'Lens A: Module GA Readiness')."
+                  },
+                  "dimensions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "string" },
+                    "description": "Dimensions / criteria the lens scores across (e.g., ['stability', 'docs-coverage', 'dogfood-evidence'])."
+                  },
+                  "threshold_simple_mean": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Pass threshold for the unweighted simple mean across dimensions."
+                  },
+                  "threshold_weighted_mean": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Pass threshold for the weighted mean across dimensions."
+                  },
+                  "current_simple": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Current observed simple mean."
+                  },
+                  "current_weighted": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Current observed weighted mean."
+                  },
+                  "verdict": {
+                    "enum": ["below", "at", "above"],
+                    "description": "Aggregate verdict relative to thresholds. 'at' = within rounding-tolerance of threshold."
+                  },
+                  "methodology_ref": {
+                    "type": "string",
+                    "description": "Optional reference to a methodology id under section_8_recommendation.recommended_methodology[] or an anchor_path; documents what produced the scores."
+                  },
+                  "rationale_one_line": { "$ref": "#/$defs/tagged_text" }
+                }
+              }
+            }
+          }
+        },
+
+        "section_1_context_horizon": {
+          "type": "object",
+          "required": ["preconditions", "continuity_from_prior", "scope_of_impact", "forcing_function"],
+          "properties": {
+            "preconditions": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/tagged_text" }
+            },
+            "continuity_from_prior": { "$ref": "#/$defs/tagged_text" },
+            "scope_of_impact": { "$ref": "#/$defs/tagged_text" },
+            "forcing_function": { "$ref": "#/$defs/tagged_text" },
+            "prior_decision_links": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+
+        "section_2_blast_radius_surface": {
+          "type": "object",
+          "required": [
+            "touched_modules",
+            "touched_contracts",
+            "touched_data_at_rest",
+            "touched_external_consumers",
+            "touched_operational_runbooks",
+            "coupling_delta"
+          ],
+          "properties": {
+            "touched_modules": { "type": "array", "items": { "$ref": "#/$defs/tagged_text" } },
+            "touched_contracts": { "type": "array", "items": { "$ref": "#/$defs/tagged_text" } },
+            "touched_data_at_rest": { "type": "array", "items": { "$ref": "#/$defs/tagged_text" } },
+            "touched_external_consumers": { "type": "array", "items": { "$ref": "#/$defs/tagged_text" } },
+            "touched_operational_runbooks": { "type": "array", "items": { "$ref": "#/$defs/tagged_text" } },
+            "coupling_delta": {
+              "type": "object",
+              "properties": {
+                "new_dependencies": { "type": "integer" },
+                "new_consumers": { "type": "integer" },
+                "interface_surface_delta": { "type": "string" },
+                "depth_to_interface_ratio_change": { "type": "string" }
+              }
+            },
+            "observability_increment": { "$ref": "#/$defs/tagged_text" },
+            "hyrum_exposure_flag": { "type": "boolean" }
+          }
+        },
+
+        "section_3_incremental_path_check": {
+          "type": "object",
+          "required": [
+            "chosen_path",
+            "strangler_fig_check",
+            "branch_by_abstraction_check",
+            "feature_flag_check",
+            "milestones"
+          ],
+          "properties": {
+            "chosen_path": {
+              "enum": ["big_bang", "incremental_strangler", "branch_by_abstraction", "feature_flag_gated"]
+            },
+            "strangler_fig_check": { "$ref": "#/$defs/tagged_text" },
+            "branch_by_abstraction_check": { "$ref": "#/$defs/tagged_text" },
+            "feature_flag_check": { "$ref": "#/$defs/tagged_text" },
+            "milestones": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": ["label", "rollback_possible", "blast_radius_at_step"],
+                "properties": {
+                  "label": { "type": "string" },
+                  "rollback_possible": { "enum": ["yes", "partial", "no"] },
+                  "blast_radius_at_step": { "$ref": "#/$defs/tagged_text" }
+                }
+              }
+            },
+            "tentative_flag_if_big_bang": { "type": "boolean" }
+          }
+        },
+
+        "section_4_why_block": {
+          "type": "object",
+          "required": ["decision_driver", "boundary_conditions", "hidden_assumptions", "rejected_alternatives"],
+          "properties": {
+            "decision_driver": { "$ref": "#/$defs/tagged_text" },
+            "boundary_conditions": {
+              "type": "object",
+              "required": ["must_have", "should_have", "nice_to_have"],
+              "properties": {
+                "must_have": {
+                  "type": "array",
+                  "minItems": 2,
+                  "items": { "$ref": "#/$defs/tagged_text" }
+                },
+                "should_have": { "type": "array", "items": { "$ref": "#/$defs/tagged_text" } },
+                "nice_to_have": { "type": "array", "items": { "$ref": "#/$defs/tagged_text" } }
+              }
+            },
+            "hidden_assumptions": {
+              "type": "array",
+              "minItems": 3,
+              "items": {
+                "type": "object",
+                "required": ["assumption", "if_violated"],
+                "properties": {
+                  "assumption": { "$ref": "#/$defs/tagged_text" },
+                  "if_violated": { "$ref": "#/$defs/tagged_text" }
+                }
+              }
+            },
+            "rejected_alternatives": {
+              "type": "array",
+              "minItems": 2,
+              "items": {
+                "type": "object",
+                "required": ["alternative", "rejection_reason"],
+                "properties": {
+                  "alternative": { "type": "string" },
+                  "rejection_reason": { "$ref": "#/$defs/tagged_text" }
+                }
+              }
+            },
+            "forcing_function_closes_option_space_justification": { "$ref": "#/$defs/tagged_text" }
+          }
+        },
+
+        "section_5_consequences_block": {
+          "type": "object",
+          "required": [
+            "framing_matrix_2x2_plus_no_action",
+            "reversibility_panel",
+            "mcda_table",
+            "pre_mortem_scenarios",
+            "most_affected_stakeholder",
+            "null_option_cost",
+            "toulmin_predictions"
+          ],
+          "properties": {
+            "framing_matrix_2x2_plus_no_action": {
+              "type": "object",
+              "required": ["accept_gain", "accept_loss", "reject_gain", "reject_loss", "no_action"],
+              "properties": {
+                "accept_gain": { "$ref": "#/$defs/tagged_text" },
+                "accept_loss": { "$ref": "#/$defs/tagged_text" },
+                "reject_gain": { "$ref": "#/$defs/tagged_text" },
+                "reject_loss": { "$ref": "#/$defs/tagged_text" },
+                "no_action": { "$ref": "#/$defs/tagged_text" }
+              }
+            },
+            "reversibility_panel": {
+              "type": "object",
+              "required": ["rollback_cost", "reversal_window", "trigger_to_revisit"],
+              "properties": {
+                "rollback_cost": {
+                  "type": "object",
+                  "properties": {
+                    "time": { "type": "string" },
+                    "money": { "type": "string" },
+                    "relational_capital": { "type": "string" }
+                  }
+                },
+                "reversal_window": { "type": "string" },
+                "trigger_to_revisit": { "$ref": "#/$defs/tagged_text" }
+              }
+            },
+            "mcda_table": {
+              "type": "object",
+              "required": ["alternatives", "criteria", "cells"],
+              "properties": {
+                "alternatives": {
+                  "type": "array",
+                  "minItems": 2,
+                  "items": { "type": "string" },
+                  "description": "MUST include 'do_nothing'."
+                },
+                "criteria": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": { "type": "string" }
+                },
+                "cells": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["alternative", "criterion", "value", "rationale"],
+                    "properties": {
+                      "alternative": { "type": "string" },
+                      "criterion": { "type": "string" },
+                      "value": {
+                        "type": "string",
+                        "description": "Score 1-5 or quantitative; 'UNKNOWN+investigation_cost:<estimate>' if missing. Empty forbidden."
+                      },
+                      "rationale": { "$ref": "#/$defs/tagged_text" }
+                    }
+                  }
+                }
+              }
+            },
+            "pre_mortem_scenarios": {
+              "type": "array",
+              "minItems": 2,
+              "items": {
+                "type": "object",
+                "required": ["failure_path", "early_warning_signal"],
+                "properties": {
+                  "failure_path": { "$ref": "#/$defs/tagged_text" },
+                  "early_warning_signal": { "$ref": "#/$defs/tagged_text" }
+                }
+              }
+            },
+            "most_affected_stakeholder": {
+              "type": "object",
+              "required": ["stakeholder_id", "first_person_restatement"],
+              "properties": {
+                "stakeholder_id": { "type": "string" },
+                "first_person_restatement": { "$ref": "#/$defs/tagged_text" }
+              }
+            },
+            "null_option_cost": {
+              "type": "object",
+              "required": ["d30", "d90", "y1"],
+              "properties": {
+                "d30": { "$ref": "#/$defs/tagged_text" },
+                "d90": { "$ref": "#/$defs/tagged_text" },
+                "y1": { "$ref": "#/$defs/tagged_text" },
+                "lehman_violation_flag": { "type": "boolean" }
+              }
+            },
+            "toulmin_predictions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["claim", "grounds", "warrant", "qualifier", "rebuttal"],
+                "properties": {
+                  "claim": { "type": "string" },
+                  "grounds": { "$ref": "#/$defs/tagged_text" },
+                  "warrant": { "$ref": "#/$defs/tagged_text" },
+                  "qualifier": {
+                    "type": "object",
+                    "required": ["point_estimate", "ci_90_low", "ci_90_high", "most_likely_to_miss_scenario"],
+                    "properties": {
+                      "point_estimate": { "type": "number", "minimum": 0, "maximum": 1 },
+                      "ci_90_low": { "type": "number", "minimum": 0, "maximum": 1 },
+                      "ci_90_high": { "type": "number", "minimum": 0, "maximum": 1 },
+                      "most_likely_to_miss_scenario": { "$ref": "#/$defs/tagged_text" }
+                    }
+                  },
+                  "rebuttal": {
+                    "$ref": "#/$defs/tagged_text",
+                    "description": "MUST NOT be 'none' / '없음' — Toulmin plausibility violation."
+                  }
+                }
+              }
+            }
+          }
+        },
+
+        "section_6_decision_prompt": { "$ref": "#/$defs/DecisionPrompt" },
+
+        "section_7_decision_tree": {
+          "type": "object",
+          "required": ["meta_branch", "root_nodes", "domain_format", "nodes", "pruned_options"],
+          "properties": {
+            "meta_branch": { "$ref": "#/$defs/MetaBranch" },
+            "root_nodes": {
+              "type": "object",
+              "required": ["reversibility", "blast_radius", "time_pressure"],
+              "properties": {
+                "reversibility": { "type": "object" },
+                "blast_radius": { "type": "object" },
+                "time_pressure": { "type": "object" }
+              }
+            },
+            "domain_format": {
+              "enum": ["tree_mermaid", "probe_safe_to_fail", "single_action_card"]
+            },
+            "nodes": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["node_id", "question", "decision_relevance"],
+                "properties": {
+                  "node_id": { "$ref": "#/$defs/node_id" },
+                  "question": { "type": "string" },
+                  "decision_relevance": { "$ref": "#/$defs/tagged_text" },
+                  "children_ids": { "type": "array", "items": { "type": "string" } }
+                }
+              }
+            },
+            "pruned_options": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["option", "exclusion_reason"],
+                "properties": {
+                  "option": { "type": "string" },
+                  "exclusion_reason": { "$ref": "#/$defs/tagged_text" }
+                }
+              }
+            },
+            "depth_warning": { "type": "boolean" }
+          }
+        },
+
+        "section_8_recommendation": {
+          "type": "object",
+          "required": [
+            "recommendation_conditional",
+            "confidence",
+            "cited_tree_node_ids",
+            "defeaters",
+            "pre_mortem_inline",
+            "reversible_fallback",
+            "falsification_trigger"
+          ],
+          "properties": {
+            "recommendation_conditional": {
+              "type": "object",
+              "required": ["recommended", "assumptions", "fallback_if_assumption_violated", "switch_if"],
+              "properties": {
+                "recommended": { "$ref": "#/$defs/tagged_text" },
+                "recommended_artifacts": {
+                  "type": "array",
+                  "items": { "$ref": "#/$defs/RecommendedArtifact" },
+                  "description": "Artifact bodies the reader is voting on. Required when `recommended` references an applyable change (patch/spec/code/design). Closes AF-20."
+                },
+                "assumptions": { "type": "array", "items": { "$ref": "#/$defs/tagged_text" } },
+                "fallback_if_assumption_violated": { "$ref": "#/$defs/tagged_text" },
+                "switch_if": { "$ref": "#/$defs/tagged_text" }
+              }
+            },
+            "confidence": {
+              "type": "object",
+              "required": ["point_estimate", "brittleness"],
+              "properties": {
+                "point_estimate": { "type": "number", "minimum": 0, "maximum": 1 },
+                "ci_90_low": { "type": "number", "minimum": 0, "maximum": 1 },
+                "ci_90_high": { "type": "number", "minimum": 0, "maximum": 1 },
+                "brittleness": { "$ref": "#/$defs/tagged_text" }
+              }
+            },
+            "downgraded_to_proposal_if_low_confidence": { "type": "boolean" },
+            "cited_tree_node_ids": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/node_id" }
+            },
+            "defeaters": {
+              "type": "array",
+              "minItems": 3,
+              "items": { "$ref": "#/$defs/tagged_text" }
+            },
+            "pre_mortem_inline": { "$ref": "#/$defs/tagged_text" },
+            "reversible_fallback": {
+              "type": "object",
+              "required": ["fallback_path", "rollback_cost", "trigger_conditions"],
+              "properties": {
+                "fallback_path": { "$ref": "#/$defs/tagged_text" },
+                "rollback_cost": { "$ref": "#/$defs/tagged_text" },
+                "trigger_conditions": { "$ref": "#/$defs/tagged_text" }
+              }
+            },
+            "i_accept_irreversibility_required": { "type": "boolean" },
+            "falsification_trigger": {
+              "type": "object",
+              "required": ["what_to_observe", "when", "threshold"],
+              "properties": {
+                "what_to_observe": { "type": "string" },
+                "when": { "type": "string" },
+                "threshold": { "type": "string" }
+              }
+            },
+            "recommended_methodology": {
+              "type": "array",
+              "description": "v0.6 — meta-decision methodology carrier. Captures the evaluation methodologies / rubrics / frameworks used to PRODUCE this recommendation (not the recommendation itself). Enables downstream readers / future revisits to reapply the same lens. First-class slot eliminates the prior gap where methodologies like the §11.5 readiness rubric had no explicit IR placement.",
+              "items": {
+                "type": "object",
+                "required": ["id", "name", "anchor_path", "rationale_one_line"],
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9_.-]*$",
+                    "description": "Methodology identifier (e.g., 'hyperbrief-v1-readiness-rubric'). Lowercase alphanum + hyphen / underscore / dot."
+                  },
+                  "name": {
+                    "type": "string",
+                    "description": "Human-readable methodology name."
+                  },
+                  "version": {
+                    "type": "string",
+                    "description": "Methodology version (semver or freeform). Optional but recommended for reproducibility."
+                  },
+                  "anchor_path": {
+                    "type": "string",
+                    "description": "Body location pointer (e.g., 'Hyperbrief.md §11.5'). MUST resolve to a stable anchor where the methodology is defined."
+                  },
+                  "applicability": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Where the methodology is applicable (e.g., ['module-GA', 'host-marketplace-listing'])."
+                  },
+                  "rationale_one_line": {
+                    "$ref": "#/$defs/tagged_text",
+                    "description": "Why this methodology was selected for this decision."
+                  }
+                }
+              }
+            }
+          }
+        },
+
+        "section_9_decision_capture_stub": { "$ref": "#/$defs/DecisionCaptureStub" },
+
+        "escalated_from_tier": {
+          "type": "string",
+          "enum": ["summary"],
+          "description": "v0.8.0 — present when this FullBrief was produced by escalating a SummaryBrief (§5.6.10). The decision_id is REUSED, not regenerated, and the two MUST NOT be linked through decision_lineage.parent_decision_ids: that field means supersession, and a tier escalation supersedes nothing (MUST-25). The reader asked one question once."
+        },
+
+        "epistemic_distribution": {
+          "type": "object",
+          "description": "Auto-computed; source for HTML doughnut chart.",
+          "properties": {
+            "verified": { "type": "integer" },
+            "inferred": { "type": "integer" },
+            "assumed": { "type": "integer" },
+            "unknown": { "type": "integer" },
+            "low_confidence_banner": {
+              "type": "boolean",
+              "description": "true if (inferred + unknown) / total > 0.4"
+            }
+          }
+        },
+
+        "maturity_anchor": {
+          "type": "object",
+          "description": "v0.6 — maturity-label anchoring. When the recommendation claims a self-asserted maturity label (e.g., 'v1.0', 'GA', 'production-ready', 'stable'), this slot enforces an anchored measurable criterion: the label MUST cite a methodology id (from section_8_recommendation.recommended_methodology[]) and report current scores vs threshold, with explicit gap_analysis. Eliminates label inflation where 'GA' is asserted without measurable basis. Optional; absent ⇒ no maturity claim being made.",
+          "required": ["claimed_label", "anchor_methodology", "current_score", "threshold", "gap_analysis"],
+          "properties": {
+            "claimed_label": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The self-asserted maturity label being made (e.g., 'v1.0', 'GA', 'production-ready', 'stable', 'beta', 'rc1')."
+            },
+            "anchor_methodology": {
+              "type": "string",
+              "description": "Reference to a methodology id under section_8_recommendation.recommended_methodology[] (.id). MUST resolve so the label has measurable backing."
+            },
+            "current_score": {
+              "type": "object",
+              "required": ["simple_mean", "weighted_mean"],
+              "properties": {
+                "simple_mean": { "type": "number", "minimum": 0 },
+                "weighted_mean": { "type": "number", "minimum": 0 }
+              }
+            },
+            "threshold": {
+              "type": "object",
+              "required": ["simple_mean", "weighted_mean"],
+              "properties": {
+                "simple_mean": { "type": "number", "minimum": 0 },
+                "weighted_mean": { "type": "number", "minimum": 0 }
+              }
+            },
+            "gap_analysis": {
+              "$ref": "#/$defs/tagged_text",
+              "description": "Explicit narrative of where current vs threshold sit; if below, what closes the gap; if above, justification for label fit."
+            },
+            "verdict": {
+              "enum": ["meets", "near", "short"],
+              "description": "Aggregate label-fit verdict. 'meets' = at/above both thresholds, 'near' = within rounding-tolerance on at least one, 'short' = below on both. Optional convenience field; renderer may compute from scores."
+            }
+          }
+        }
+      }
+    }
+  }
+}

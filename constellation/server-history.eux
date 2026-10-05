@@ -1,0 +1,103 @@
+@component server-history
+@intent Per-channel persistent history sub-module of the Constellation live-board `server` family (v1.1 split per phase_2 2026-06-04). Owns: (a) per-channel event ring (`wsHistByChan` Map<chanKey, events[]> capped at 200 — channel key = `agentId`), (b) streaming compression (`wsBuf` Map — TEXT_*/TOOL_* `_START` opens buffer, `_CONTENT`/`_ARGS` accumulate, `_END`/`_RESULT` compresses to 1 stored event with truncation: result/content cap 2000, text cap 8000), (c) history lifecycle state machine (active in-memory ↔ cold stub `{key, count, lastTs}` ↔ archived `archived/<key>.jsonl`), (d) boot reload via `wsLoadAll` (per-channel `.jsonl` parse + re-key by event content via `wsMsgChan` + normalize + time-sort + cap + drop orphan files) or `wsMigrate` (legacy `ws-history.json` → per-channel split + `.bak`), (e) DB P2 thin shim — `createHistoryStore` + store delegation + `historyStore.boot` (dormant by default, mode A jsonl; mode B/C operator opt-in delegates to `history-store.eux` SqliteStore + HistoryStoreMux). **Timestamp source-stamp invariant** — `wscore.event(...)` stamps `timestamp` at emit; record/push MUST NOT clobber on store or replay (dashboards reconstruct real wall-clock timeline). The grouped-by-channel storage layout is internal only; wire `History.value.events` is a flat per-event array (each event carries own `agentId`).
+@expansion temperature=0.2 model=agent/claude template=estreux/v0.1
+@targets vanilla
+@profile backend-service
+@source constellation/reference/runtime/server.cjs(L368-381 · L386 DB P2 thin shim — createHistoryStore + store delegation + historyStore.boot) · constellation/reference/runtime/server.cjs(history record + wsLoadAll + wsMigrate + wsBuf compression) · WS-PROTOCOL §13 channel persistence + Constellation.md DB-P2-Guide.md (mode A/B/C chain)
+@state
+  HIST_CAP        : number = 200                # per-channel ring cap
+  wsHistByChan    : Map<chanKey, events[]>      # per-channel ring; channel = agentId
+  wsBuf           : Map<chanKey, {msg, tool}>   # streaming delta/fragment accumulators (compress to 1 stored event)
+  historyStore    : HistoryStore|null            # DB P2 shim — dormant by default (mode A jsonl); operator opt-in → SqliteStore via -history-store
+@deps
+  fs              : per-channel .jsonl IO (debounced 1s per-channel write) + archived/ moves
+  -relay          : relay path calls record() on every relayed/broadcast message; boardInbound delegates CloseChannel/RequestChannelHistory/ArchiveChannel here
+  -core           : invokes wsLoadAll at upgrade-time History frame (only if non-empty); calls wsMigrate on boot if legacy ws-history.json detected
+  history-store   : constellation/history-store.eux (DB P2 abstraction — mode A jsonl floor + mode B/C SqliteStore opt-in chain via HistoryStoreMux)
+@ports
+  cmd  record(msg)                              : skip non-storable names; compress streaming; ring cap; debounce write
+  cmd  wsLoadAll()                              : boot → per-channel .jsonl parse + re-key by content + normalize + time-sort + cap
+  cmd  wsMigrate()                              : legacy ws-history.json → per-channel split + .bak
+  cmd  wsLoadChannel(chanKey)                   : cold → active reload (for RequestChannelHistory); archived → reload + delete from archived/
+  cmd  wsCloseChannelHist(chanKey)              : remove from active scan (cold stub retained)
+  cmd  wsArchiveChannel(chanKey)                : move to archived/ + exclude from active scan/cap
+  out  ChannelHistory(chanKey, events[])         # reply to RequestChannelHistory
+  out  HistoryFrameForUpgrade(events, cold, archived)   # 3rd frame of -core upgrade sequence (when non-empty)
+@behavior
+  record           : skip [HELLO, SERVER_HELLO, AgentList, Heartbeat, PersistentAdapterSmoke, Typing]; channel=agentId (channelId is source-badge only); compress streaming (TEXT/TOOL _START→buffer, _CONTENT/_ARGS→accumulate, _END/_RESULT→store 1 event); truncate large result/content(2000)/text(8000) on store (full at relay-time); ring cap 200/channel; debounce 1s per-channel .jsonl write
+  storage_event_shape:
+    rule: each stored event is the full envelope — type, name, value, agentId, targetAgentId, contextId, timestamp, source, channelId, threadId — whatever it carried on the wire
+    timestamp_invariant: timestamp is source-stamped at emit (wscore.event(...)); record/push MUST NOT clobber `timestamp` or `at` on store or replay (replay must restore original wall-clock so dashboards reconstruct real timeline, not reload moment)
+    filename_layout_only: per-channel filename is storage layout only; on boot wsLoadAll rebuilds channel key from event content via wsMsgChan(ev) → path recoverable but never authoritative
+  historyLifecycle :
+    active: in-memory, scanned, sent full on connect when main or a present agent is involved
+    cold: no present agent → stub {key, count, lastTs}, loaded on RequestChannelHistory
+    archived: ✕ close → moved to archived/, excluded from active scan/cap; on RequestChannelHistory the archived file is loaded back to active and deleted from archived/
+    transitions: active ↔ cold (presence change) · active → archived (explicit close) · archived → active (RequestChannelHistory)
+  boot             : ws-history/ exists → wsLoadAll; else wsMigrate (legacy ws-history.json → per-channel compressed split + .bak)
+  db_p2_shim:
+    default_mode: A (jsonl floor) — historyStore = createHistoryStore({mode:'jsonl'}); SqliteStore + HistoryStoreMux dormant
+    operator_opt_in: state.json.modes.historyBackend flip → 'dual' (mode B with backfill) or 'sqlite' (mode C terminal); see -history-store + DB-P2-Guide.md
+    rollback_floor: JSONL stays canonical for reads in mode B; regenerable byte-identically from SQLite via exportJsonl() in mode C
+@machine history_lifecycle
+  # reducer: (channelState, event) → channelState
+  initial: active
+  states:
+    active:
+      on:
+        agent_present_lost → cold              # entry: write final state to .jsonl; in-memory → stub
+        explicit_close → archived               # entry: mv ws-history/<key>.jsonl archived/
+    cold:
+      on:
+        RequestChannelHistory → active          # entry: wsLoadChannel — reload .jsonl to in-memory
+        agent_present_returns → active
+    archived:
+      on:
+        RequestChannelHistory → active          # entry: reload archived file + delete from archived/
+@invariants
+  # P3 AST 계약스키마 — phase_3 2nd cut per eux-format v1.2 §2.6 (EstreUX edd2fb7 — 4 sub-section state/temporal/transaction/causality + 17 vocabulary keyword).
+  state:
+    - wsHistByChan: 채널별 events 는 HIST_CAP=200 으로 bounded (ring cap per channel)
+    - 각 stored event 의 channelId 는 wsMsgChan(ev) content-derived key (member-of unique-channel; filename != authoritative)
+    - history_lifecycle state: active/cold/archived 중 정확히 하나 member-of (mutually exclusive)
+    - stored events: timestamp ASC ordered + id monotonic 증가 (boot reload preserves order)
+    - chan key derivation: filename != authoritative; content-derived via wsMsgChan (state bounded membership 보장)
+  temporal:
+    - debounce write: 1s after last update per channel (debounce_safety; crash mid-debounce 시 in-memory loss but disk state intact)
+    - compression: TEXT_/TOOL_ streaming _START → _END 시퀀스 within single message lifetime (temporal grouping; multiple parallel streams permitted)
+    - cold transition: agent_present_lost 시점 after presence change (lifecycle trigger)
+    - boot wsLoadAll: at-most-once per process startup (idempotent reload — disk state authoritative)
+    - active scan: per-channel state 유지 within process lifetime (cold/archived 제외 — expires-after explicit close)
+  transaction:
+    - record(ev): skip set check → channel key derive → compress → ring push → debounced write atomic (all-or-nothing per event)
+    - compression: _START → buffer → _END → store 1 event commit-then (streaming intermediate persist-before final 미저장 — 본문 wire 는 full bytes)
+    - timestamp_invariant: source-stamped at emit (wscore.event), record/replay never clobber persist-before (replay 시 original 보존, rollback-safe)
+    - boot wsLoadAll: per-channel .jsonl parse → re-key by content (wsMsgChan) → time-sort → cap → in-memory load atomic (rollback-safe on disk corruption)
+    - wsArchiveChannel: move .jsonl → archived/ + exclude from active scan dual-write atomic (filesystem rename + memory state 같이 commit)
+  causality:
+    - record: ev.name ∉ skip_set iff record stores event (skip list 우선)
+    - active → cold transition: agent_present_lost implies channel state stub (in-memory ring 제거, cold stub {key,count,lastTs} 보존)
+    - active → archived: explicit_close implies mv ws-history/<key>.jsonl archived/ (filesystem 이동)
+    - archived → active: RequestChannelHistory implies archived file → active 로 reload + delete from archived/
+    - wsMsgChan(ev) content derivation precedes channel key assignment (boot rebuild safety; filename layout 변경 시 자동 복원)
+@metamorphic
+  # P4 property/metamorphic 후보 — phase_3 2nd cut per eux-format v1.2 §2.7 (EstreUX edd2fb7).
+  round_trip:
+    - record(ev) 후 query(_) 결과에 ev 포함 (compress 후에도 동일 — store↔read 정합)
+    - active → cold (agent_present_lost) → active (RequestChannelHistory): events 동일 (lifecycle round-trip preservation)
+    - active → archived (explicit close) → active (RequestChannelHistory): events 동일 (archive round-trip)
+    - boot wsLoadAll 후 in-memory state == disk state (boot recovery roundtrip)
+    - record(ev) → write disk → boot wsLoadAll → query(_): 동일 ev 포함 (full persistence cycle)
+  idempotency:
+    - record(skip_set 내 event 예: HELLO/Heartbeat) 호출 N회: ring 변경 0회 (skip idempotency)
+    - debounced write: 동일 channel 의 N회 record → 1회 disk write (debounce idempotency, batching)
+    - wsLoadAll 재호출: 동일 disk state 의 in-memory representation 동일 (boot idempotent)
+  determinism:
+    - 동일 ev 입력 시 wsMsgChan(ev) 결과 deterministic (content-derived key)
+    - 동일 ring snapshot 의 historyPayload() 결과 deterministic (active/cold/archived enumeration)
+    - compression: 동일 _START → _CONTENT → _END 시퀀스 → 동일 compressed event (deterministic compression)
+@operation_discipline
+  derive:
+    board_ssot: server only relays + records; state.json authored by main (workers never write board → no multi-session collision)
+    debounce_safety: 1s per-channel write debounce; on crash mid-debounce the in-memory ring is lost but boot reload re-reads disk state
+    compression_invariant: streaming TEXT_/TOOL_ stored as 1 compressed event; truncation at storage only — wire relay carries full bytes
