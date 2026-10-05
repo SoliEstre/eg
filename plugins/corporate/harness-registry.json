@@ -1,0 +1,351 @@
+{
+  "$comment": "Corporate.md §9 — the perishable half of the module, deliberately a data file rather than spec prose so the spec does not rot on harness release cadence. THREE RULES govern this file: (1) a row requires a source — any flag, key, or path not confirmed verbatim against vendor documentation belongs in `caveats`, never in `harnesses`, because a plausible-looking flag is worse than a gap: it will be pasted into a launcher; (2) bind per invocation, never by a global pin — a pin can silently override an explicit per-seat choice, so the resolved value must travel with the invocation and actual application must be observed rather than assumed; (3) this file states its own expiry — `revisit` makes re-survey scheduled rather than reactive, and the `watch` seat (§3.2) is its executor.",
+  "asOf": "2026-07-26",
+  "revisit": {
+    "date": "2026-09-01",
+    "graceDays": 45,
+    "reason": "Agent CLIs ship flag changes on a weeks-to-months cadence. Past the date a verify axis reports a reminder; past the grace it fails. Re-survey updates asOf, revisit, and watchlist together."
+  },
+  "fields": {
+    "$comment": "The field contract every confirmed row must satisfy. A row missing a required field is not a partial row — it is a caveat.",
+    "harness": "stable identifier used by roster `harness` values",
+    "label": "human-facing name",
+    "instructionFile": "the per-directory instruction filename this harness discovers (Corporate.md §2.2)",
+    "instructionOrder": "the discovery/merge order, stated as observed — Corporate.md §2.2 depends on knowing this rather than assuming it",
+    "instructionImport": "the syntax, if any, by which an instruction file includes another — null when the harness has none, in which case the charter must instruct the agent to read the project SSoT",
+    "nonInteractive": "how to run one turn without a TTY",
+    "sessionContinue": "how to continue the same conversation across invocations (§7.1 residency depends on this)",
+    "sessionStore": "where session transcripts live — needed to reason about desk locality and cleanup",
+    "pathGrant": "how to grant read/write beyond the working directory (§2.3) — enumerated, never blanket",
+    "modelBind": "per-invocation model selection (rule 2)",
+    "effortBind": "per-invocation reasoning-effort selection, where the harness exposes one; null when it does not",
+    "budgetBind": "per-invocation turn/spend ceilings, where the harness exposes them (§7.4b prefers these over module-side accounting)",
+    "selfConfigProtection": "whether the harness itself prevents an agent from editing its own configuration (§9.2)",
+    "customEndpoint": "how to point the harness at a non-default endpoint (§9.1) — mechanism only; permission is the deployment's responsibility",
+    "gotchas": "behaviours that break a naive desk/residency implementation",
+    "confirmedBy": "REQUIRED — source URL(s) where the strings above were read verbatim",
+    "confirmedOn": "REQUIRED — date the source was read",
+    "providerBind": "How (and whether) the harness can be pointed at a model endpoint other than its vendor default. Decides which seats an external or local API can staff at all, and at what config scope the choice lives — a scope narrower than the seat means the seat cannot carry its own provider."
+  },
+  "harnesses": [
+    {
+      "harness": "claude-code",
+      "label": "Claude Code CLI",
+      "instructionFile": "CLAUDE.md (also ./.claude/CLAUDE.md, ./CLAUDE.local.md)",
+      "instructionOrder": "Collected by walking upward from cwd, then concatenated filesystem-root → cwd (append, not overwrite). A subdirectory CLAUDE.md is loaded on demand when a file in that directory is read, not at launch. Scope order: managed policy → user ~/.claude/CLAUDE.md → project → local.",
+      "instructionImport": "@path/to/file — up to 4 recursive hops; relative paths resolve against the importing file; a path inside backticks is literal. AGENTS.md is NOT read natively; the documented bridge is an `@AGENTS.md` import from CLAUDE.md.",
+      "pathScopedRules": ".claude/rules/*.md with optional `paths` glob frontmatter (recursive discovery; user-level ~/.claude/rules/ loads before project rules so project wins).",
+      "nonInteractive": "-p / --print (every CLI option works alongside it); stdin may be piped in",
+      "sessionContinue": "--continue (-c) resumes the newest conversation in the current directory; or capture the id from `--output-format json` and pass `--resume <session-id>`. Both invocations MUST run in the same directory — session lookup is scoped to the project directory and its git worktrees.",
+      "sessionIdFlags": "--session-id <UUID> · --fork-session (new id on resume) · -n/--name <string> · -r/--resume <id|name>",
+      "sessionStore": "~/.claude/projects/<project>/<session-id>.jsonl, where <project> is the working-directory path with non-alphanumerics replaced by '-'. Relocate with CLAUDE_CONFIG_DIR; retention via cleanupPeriodDays; suppress a one-shot with --no-session-persistence. The entry format is documented as internal and version-unstable — do not parse it.",
+      "memoryStore": "~/.claude/projects/<project>/memory/ with MEMORY.md as the index. Only the first 200 lines or 25 KB of MEMORY.md (whichever comes first) is loaded at session start. <project> derives from the git repository, so all worktrees and subdirectories share one memory directory.",
+      "ioFormat": "--output-format text|json|stream-json · --input-format text|stream-json · stream extras --include-partial-messages, --include-hook-events, --replay-user-messages, --forward-subagent-text",
+      "pathGrant": "--add-dir <path> (repeatable) or /add-dir in session; permanently via settings permissions.additionalDirectories",
+      "modelBind": "--model sonnet|opus|haiku|fable|<full model name>",
+      "effortBind": "--effort low|medium|high|xhigh|max|ultracode",
+      "budgetBind": "--max-budget-usd <amount>. NOTE: --max-turns is NOT present in the binary measured on this deployment (2026-07-25) although it appears in some documentation — a CORRECTED row, and exactly the class of drift rule 1 exists to keep out of a launcher. Bind spend, not turns, until a build is measured that carries it.",
+      "permissionMode": "--permission-mode default|acceptEdits|plan|auto|dontAsk|bypassPermissions|manual — blockable via permissions.disableBypassPermissionsMode / disableAutoMode",
+      "selfConfigProtection": "none at the harness level — Corporate.md §9.2's no-self-configuration invariant must be carried by the charter and the path grant here",
+      "gotchas": [
+        "PATH-GRANT ASYMMETRY (affects desks directly): directories added with --add-dir / /add-dir also load that directory's .claude/skills/, .claude/agents/ and the enabledPlugins + extraKnownMarketplaces settings keys. Directories listed in permissions.additionalDirectories grant FILE ACCESS ONLY and load no configuration. Choose deliberately: a desk that needs the project's skills must use --add-dir, not the settings key.",
+        "RESUME DOES NOT RESTORE: --mcp-config, --settings, --plugin-dir, --fallback-model, and --add-dir must be passed again on every resume. The plan and bypassPermissions permission modes are never restored. settings.json / settings.local.json ARE re-read each launch. A resident seat's launcher must therefore keep its full flag set, not just the session id.",
+        "A session created by -p does not appear in the interactive --resume picker; it is resumable only by explicit session id.",
+        "CLAUDE_CODE_CHILD_SESSION=1 is set in subprocesses the harness spawns, and such nested sessions are excluded from --resume/--continue/history; CLAUDE_CODE_FORCE_SESSION_PERSISTENCE overrides that exclusion. A supervisor spawning seats from inside a session must know which behaviour it wants.",
+        "--bare skips auto-discovery of hooks, skills, plugins, MCP servers, auto memory and CLAUDE.md, restricts tools to Bash/read/edit, and skips OAuth/keychain (so it needs an API key or an apiKeyHelper). Documented as the recommended mode for scripted calls — but it defeats the charter-discovery mechanism §2.2 relies on, so a Corporate desk using --bare must inject its charter explicitly.",
+        "A background-agent supervisor exists in-product (--bg plus `claude agents`), so a residency implementation should evaluate it before building a bespoke supervisor — §13 already names the bespoke supervisor a prunable unit for exactly this reason."
+      ],
+      "confirmedBy": [
+        "https://code.claude.com/docs/en/headless",
+        "https://code.claude.com/docs/en/cli-reference",
+        "https://code.claude.com/docs/en/sessions",
+        "https://code.claude.com/docs/en/permissions",
+        "https://code.claude.com/docs/en/memory",
+        "https://code.claude.com/docs/en/settings",
+        "https://code.claude.com/docs/en/env-vars",
+        "local measurement: claude.exe --help and claude.exe agents --help on the deployment host, 2026-07-25"
+      ],
+      "confirmedOn": "2026-07-25",
+      "backgroundMode": "--bg / --background starts the session as a background agent and returns immediately; `claude agents` manages the resulting sessions (its own flag set includes --add-dir, --agent, --effort, --cwd, --all, --json). The OS-service installation path around this remains undocumented — that gap is a Corporate contribution target, not a registry fact.",
+      "providerBind": "Anthropic auth is strictly ANTHROPIC_API_KEY or apiKeyHelper via --settings (OAuth and keychain are never read in print mode); third-party providers are Bedrock / Vertex / Foundry, each with their own credentials. There is NO arbitrary OpenAI-compatible base_url: reaching one needs a shim that speaks the Anthropic wire, which puts the shim host inside the credential blast radius (Corporate §9.2) — so an arbitrary external endpoint is not a way to staff a claude-code seat, and the honest options are the operator subscription, an Anthropic key, or one of the three named clouds. MEASURED here 2026-07-26 (--help on the installed binary)."
+    },
+    {
+      "harness": "codex-cli",
+      "label": "OpenAI Codex CLI",
+      "instructionFile": "AGENTS.override.md, else AGENTS.md, else project_doc_fallback_filenames — at most ONE file per directory",
+      "instructionOrder": "Global scope first (CODEX_HOME, default ~/.codex: AGENTS.override.md then AGENTS.md — one file), then project scope walking project root → cwd, concatenated root-first with blank-line separators. The file nearest cwd therefore lands LAST and wins. Empty files are skipped; accumulation stops at project_doc_max_bytes (default 32 KiB). The chain is built once per run.",
+      "instructionImport": null,
+      "nonInteractive": "codex exec (alias codex e); `cat prompt.txt | codex exec -` uses stdin as the prompt",
+      "sessionContinue": "codex exec resume --last \"<prompt>\" or codex exec resume <SESSION_ID> (--all searches all directories); interactive: codex resume [--last]",
+      "sessionStore": "~/.codex/sessions/YYYY/MM/DD/rollout-YYYY-MM-DDThh-mm-ss-<uuid>.jsonl (a .jsonl.zst variant is recognised); --ephemeral skips persisting rollout files",
+      "configFiles": "Precedence: CLI flags and -c/--config overrides → project .codex/config.toml (nearest wins, trusted projects only) → profile ~/.codex/<name>.config.toml (--profile) → user ~/.codex/config.toml → system /etc/codex/config.toml → built-in defaults. Local state root is CODEX_HOME (default ~/.codex). TOML constraint: root keys must precede tables.",
+      "pathGrant": "sandbox_mode = \"workspace-write\" plus [sandbox_workspace_write].writable_roots (array); companions network_access, exclude_tmpdir_env_var, exclude_slash_tmp. Full release is sandbox_mode = \"danger-full-access\" or --dangerously-bypass-approvals-and-sandbox.",
+      "sandboxFlags": "--sandbox|-s read-only|workspace-write|danger-full-access · --ask-for-approval|-a untrusted|on-request|never · --dangerously-bypass-approvals-and-sandbox (alias --yolo). codex exec defaults to the read-only sandbox. --full-auto is deprecated in favour of --sandbox workspace-write.",
+      "modelBind": "--model|-m <string>, or config key model",
+      "effortBind": "config key model_reasoning_effort = minimal|low|medium|high|xhigh|max — **`max` measured accepted 2026-08-10** (`codex exec -m gpt-5.6-terra -c model_reasoning_effort=\"max\"` banner printed `reasoning effort: max`, codex v0.147.0). The earlier survey recorded xhigh as the ceiling; the vendor publishes no per-model enumeration, so this axis is confirmed by local measurement only and is expected to keep moving.",
+      "budgetBind": null,
+      "budgetBindNote": "Still null as of 2026-08-10: `codex features list` shows `token_budget` and `rollout_budget` both **under development / false**. A supervisor that relies on a per-turn spend ceiling (Claude Code's `--max-budget-usd`) has no codex equivalent — the ceiling must be enforced outside the harness or given up. This matters for a resident seat, where the natural unit is a session budget rather than a turn budget.",
+      "residency": {
+        "_what": "Pantty.md §1's five operations for a resident seat. §1 says per-harness support belongs in this registry rather than in the specification, and §3 says the compaction cycle is the hardest gate and the first to check. Measured on the deployment host, codex v0.147.0.",
+        "_surface": "MEASURED VIA `codex app-server` (JSON-RPC over stdio), not `codex exec`. The first pass of this block answered every operation from the exec surface and recorded four of them as unconfirmed; the app-server surface answers all four as first-class protocol operations. The correction worth keeping is the method: the protocol is self-describing — `codex app-server generate-json-schema --out <DIR>` emits the full request/notification schema **generated from the binary**, which is stronger evidence than `--help` and cheaper than reading strings out of the executable. 95 client requests, 70 server notifications (2026-08-10). Schema-from-the-binary still does not prove the host accepts the calls, so every claim below was additionally exercised against a live server on win32.",
+        "submit": "`thread/start {cwd}` → threadId, then `turn/start {threadId, input:[{type:'text',text}]}`. The turn-end signal is the `turn/completed` notification on a long-lived connection, which is **structurally distinct** from both «still alive» and «process exited» — §1's distinguishability requirement is satisfied by the transport rather than reconstructed by the driver, which is the substantive gain over the exec surface. Progress is observable while the turn runs: `item/started`, `item/agentMessage/delta`, `item/completed`, `turn/plan/updated`, `command/exec/outputDelta`. `turn/steer` accepts input into an in-flight turn (the `steer` feature flag is stage `removed` with value true, i.e. permanently on).",
+        "cancel": "CONFIRMED — `turn/interrupt {threadId, turnId}`. Measured: returns `{}`, the turn ends with status `interrupted` (a distinct status, not an error), and the **next `turn/start` on the same thread succeeds**. The original question («does the session survive a mid-turn kill?») was mis-framed by the exec surface: no process is killed, so thread survival is by construction rather than by luck.",
+        "contextSignal": "PRESENT but **does NOT satisfy §1's decomposition requirement**, and the obvious reading of it is actively wrong. `thread/tokenUsage/updated` carries `{last, total}`, each `{inputTokens, cachedInputTokens, cacheWriteInputTokens, outputTokens, reasoningOutputTokens, totalTokens}`, plus `modelContextWindow`. The decomposition axis is **token class, not reclaimable-vs-floor**. Worse: `total` is cumulative across turns — measured 45457 → 68361 → 91385 → 114652 on one thread, and it did **not** drop across a successful compaction. A policy keyed to `total` vs `modelContextWindow` therefore crosses its threshold on schedule regardless of occupancy and never uncrosses it, which is §1's thrash warning arriving through a different door than §1 describes. What IS derivable: the fixed floor is `last.inputTokens` on the first turn of a fresh thread (measured 22762 and 22938 on two independent threads, model context window 258400), so reclaimable ≈ current `last.inputTokens` − floor. A driver MUST derive it that way and MUST NOT read `total` as occupancy.",
+        "compaction": "CONFIRMED end to end. `thread/compact/start {threadId}` returns `{}` and runs as its own turn, emitting `item/started` + `item/completed` with item type `contextCompaction`. The `thread/compacted` notification still exists but is marked **deprecated in the schema itself** in favour of that item type — a driver written against the notification is written against a surface already on its way out. Re-injection after compaction has a first-class carrier too: `thread/inject_items`. Auto-compaction is controllable rather than merely feared: config keys `model_auto_compact_token_limit` and `model_auto_compact_token_limit_scope` (per-model `auto_compact_token_limit` in the model catalog), so a driver can hold the boundary itself; `compact_prompt` / `experimental_compact_prompt_file` additionally let the adapter author the summarization instruction, which is a second place to protect what §3 wants materialized.",
+        "hooks": "EVENT NAMES CONFIRMED (11, from the generated schema and echoed by the live `hooks/list` method): `preToolUse`, `permissionRequest`, `postToolUse`, `preCompact`, `postCompact`, `sessionStart`, `sessionEnd`, `userPromptSubmit`, `subagentStart`, `subagentStop`, `stop`. Each run carries `handlerType` (command | prompt | agent), `executionMode` (sync | async), `scope` (thread | turn), `source` (system | user | project | mdm | sessionFlags) and `entries[].kind` (warning | stop | feedback | context | error) — note `context`, which is how a hook returns text into the session, and `stop`, which is how it blocks. Hook files use the Claude-Code-shaped `hooks.json` (`{hooks:{PreCompact:[{matcher,hooks:[{type,command}]}]}}`) and codex normalizes the event key to the camelCase names above. **Whether `preCompact` actually fires was NOT measured** — the attempt measured the trust gate instead: project-local hooks stay disabled until the project is trusted, and `--dangerously-bypass-hook-trust` lifts *hook* trust, not *project* trust, so an untrusted cwd silently runs with no project hook layer at all. Plugin-scope hooks were observed live in the same probe, so the layer itself works.",
+        "liveness": "`codex doctor` for install/config/auth/runtime health. Pantty §5 wants a probe that exercises the model, and app-server makes that cheap without a process spawn: a one-line `turn/start` on a throwaway thread is a genuine end-to-end probe. Note the floor cost — every turn re-sends ~22.8k input tokens on this build, so a model-exercising probe is not free and §5's «treat the next real submission as the probe» remains the honest default.",
+        "remoteControl": "`codex remote-control start|stop|pair` + `codex --remote ws://|wss://|unix://` + `--remote-auth-token-env` appear in `--help` but are dead here twice over: on win32 `remote-control start` returns `daemon lifecycle is only supported on Unix platforms`, and `codex features list` reports the `remote_control` flag at stage `removed` with value false. The residency path on this host is app-server over stdio, which needs none of it.",
+        "budgetBind": "Still null. `token_budget` and `rollout_budget` are both stage `under development`. There is no per-turn spend ceiling to bind, which is exactly where residency hurts most, since the natural unit here is a session budget rather than a turn budget.",
+        "openQuestions": [
+          "does `preCompact` actually fire (the name exists and the hook layer runs; the firing was not observed — the probe hit the project-trust gate first)",
+          "what value of `model_auto_compact_token_limit` disables auto-compaction outright, versus merely raising it out of reach",
+          "is the auto-compact limit compared against the cumulative `total` or against per-turn occupancy (this decides whether a raised limit is eventually reached anyway in a long-lived resident session)"
+        ]
+      },
+      "trust": "projects.<path>.trust_level = \"trusted\"|\"untrusted\". An untrusted project skips the entire project-scoped .codex/ layer (project config, hooks, rules) and loads only user/system config.",
+      "selfConfigProtection": "ENFORCED BY THE HARNESS: inside writable roots, .git (including the real path behind a gitdir pointer), .agents (when present as a directory) and .codex (when present as a directory) remain read-only. This is the vendor-level precedent Corporate.md §9.2 generalizes into a cross-harness invariant.",
+      "customEndpoint": "config.toml model_providers table (see caveats — the exact key set was not confirmed verbatim in this survey)",
+      "outputFlags": "-o/--output-last-message <path> · --json (alias --experimental-json) · --output-schema <path> (final response conforms to a JSON Schema) · --ignore-user-config · --ignore-rules · --cd/-C <path> · --skip-git-repo-check",
+      "gotchas": [
+        "A project must be trusted for its .codex/ layer to load at all — so a desk relying on project-local config silently loses it when the trust entry is missing. The scriptable path for granting trust in a non-interactive run was NOT confirmed (see caveats).",
+        "Auth injection is documented inline (CODEX_API_KEY=<key> codex exec ...) rather than as job-level environment, which matters for a supervisor spawning many seats.",
+        "`codex doctor` diagnoses install, config, auth and runtime health — the natural liveness probe for a supervisor to run before declaring a seat available, instead of inferring health from a failed turn."
+      ],
+      "confirmedBy": [
+        "https://learn.chatgpt.com/docs/non-interactive-mode",
+        "https://learn.chatgpt.com/docs/developer-commands?surface=cli",
+        "https://learn.chatgpt.com/docs/config-file/config-basic",
+        "https://learn.chatgpt.com/docs/config-file/config-reference",
+        "https://learn.chatgpt.com/docs/sandboxing",
+        "https://learn.chatgpt.com/docs/agent-configuration/agents-md",
+        "https://github.com/openai/codex/blob/main/codex-rs/rollout/src/list.rs",
+        "local measurement: codex.exe --help and codex.exe exec --help on the deployment host, 2026-07-25"
+      ],
+      "confirmedOn": "2026-07-25",
+      "subcommands": "exec (alias e) · review · resume / archive / delete / unarchive (session lifecycle) · login / logout · mcp / mcp-server · plugin · app-server · remote-control · app · sandbox (run a command inside the Codex sandbox) · doctor (diagnose install, config, auth, runtime health) · update · completion · debug · apply (alias a)",
+      "configOverride": "-c / --config key=value with dotted paths for nested values; the value is parsed as TOML and falls back to a literal string if it does not parse. Confirmed: `-c model=\"o3\"`, `-c 'sandbox_permissions=[\"disk-full-read-access\"]'`, `-c shell_environment_policy.inherit=all`.",
+      "stdinContract": "A bare PROMPT argument, or `-` to read from stdin. If stdin is piped AND a prompt argument is given, stdin is appended as a <stdin> block — so a supervisor can pass a charter as the argument and the inbound as the pipe without them colliding.",
+      "providerBind": "Custom providers are declared as [model_providers.<id>] with name / base_url / env_key / wire_api, and the model_provider key selects one. Three constraints decide whether a seat can use this: (1) wire_api MUST be \"responses\" — chat/completions was deprecated 2026-02 and a custom provider with wire_api=\"chat\" or with the field absent fails at startup, so an endpoint that only speaks chat/completions cannot back a codex seat at all; (2) the built-in ids openai / ollama / lmstudio are reserved and the openai base_url cannot be overridden, so an alternative vendor must be a new provider id; (3) model_provider and model_providers are honored only in the USER-level ~/.codex/config.toml and are ignored in a project-local .codex/config.toml with a startup warning — therefore a Corporate desk cannot carry its seat provider, and per-seat variation goes through profiles (-p <name>, layering $CODEX_HOME/<name>.config.toml) instead. Local models are first-class and need none of this: --oss with --local-provider lmstudio|ollama. Flags MEASURED here 2026-07-26 (--oss / --local-provider / -c / --profile / --strict-config present); the config-key semantics are WEB-SOURCED 2026-07-26 and not verified against a live custom provider on this deployment."
+    },
+    {
+      "harness": "agy",
+      "label": "Google Antigravity CLI",
+      "identity": "Antigravity CLI, invoked as `agy`. Official docs at antigravity.google/docs/cli/*; official repo google-antigravity/antigravity-cli carries README/CHANGELOG/examples only — the binary is distributed, not the source. Shares the core agent engine and bidirectional settings sync with the Antigravity GUI.",
+      "instructionFile": "GEMINI.md and AGENTS.md in the active directory; global constraints from ~/.gemini/GEMINI.md",
+      "instructionOrder": "Global then active-directory, per the Gemini CLI lineage it inherits (see gotchas — a full per-directory merge order was not confirmed for this CLI specifically).",
+      "instructionImport": null,
+      "nonInteractive": "-p / --print (--prompt is an ALIAS for --print, not a separate flag); -i / --prompt-interactive runs a prompt then stays interactive",
+      "sessionContinue": "-c / --continue (confirmed: -c is the alias of --continue) resumes the most recent conversation; --conversation <id> resumes a specific one. There is no fork/new-session-id flag.",
+      "sessionStore": "~/.gemini/antigravity-cli/cache/last_conversations.json maps absolute workspace paths to their most recently active conversation id; workspace↔project mapping in cache/projects.json. Conversation history is scoped to the current working directory.",
+      "configFiles": "~/.gemini/antigravity-cli/settings.json (keybindings in the sibling keybindings.json). Extension paths moved from the Gemini CLI layout: global skills ~/.gemini/antigravity-cli/skills/, workspace skills .agents/skills/, global MCP ~/.gemini/config/mcp_config.json, workspace MCP .agents/mcp_config.json (schema key url/httpUrl → serverUrl), workspace hooks <workspace>/.agents/hooks.json.",
+      "pathGrant": "settings.json allowNonWorkspaceAccess (DEFAULT off) plus /add-dir <path> in session; permission rules live in the same settings.json under `permissions` as allow/deny/ask lists with precedence Deny > Ask > Allow (rule syntax e.g. \"command(git)\"), managed in session via /permissions",
+      "modelBind": "--model <slug> — in print mode an unresolvable slug is a hard non-zero failure that prints the available model list; interactive warns and falls back",
+      "effortBind": "--effort low|medium|high (three values only — a narrower ladder than the other harnesses)",
+      "budgetBind": null,
+      "modeFlags": "--mode accept-edits|plan · --sandbox · --dangerously-skip-permissions · --add-dir <dir> (repeatable) · --agent <name> · --model <slug> · --project / --new-project · --log-file <path> · --print-timeout <dur> (default 5m0s)",
+      "selfConfigProtection": "not documented as harness-enforced; the .agents/ convention is shared with Codex (which does protect it), so a deployment should assume it must enforce §9.2 itself",
+      "gotchas": [
+        "Print mode has a wall-clock ceiling of its own: --print-timeout, default 5m0s. A seat whose turn can exceed five minutes must raise it explicitly or it is silently cut.",
+        "No structured output. Where the other harnesses can return JSON, agy returns prose — so a seat on agy should be one whose product is judgement for a human or another model to read, not a record to be parsed. This is why the reviewer seat fits it and a scribe seat does not.",
+        "Headless runs honour persisted settings.json policies, and a tool needing confirmation is soft-denied with a stderr notice naming the required allow-rule. Parse that notice; treating silence as success is the failure it was fixed to prevent.",
+        "allowNonWorkspaceAccess defaults to off, so a desk needs an explicit grant before it can read the project root."
+      ],
+      "install": "macOS/Linux: curl -fsSL https://antigravity.google/cli/install.sh | bash · Windows PowerShell: irm https://antigravity.google/cli/install.ps1 | iex",
+      "confirmedBy": [
+        "https://antigravity.google/docs/cli/overview",
+        "https://antigravity.google/docs/cli/modes",
+        "https://antigravity.google/docs/cli/settings",
+        "https://antigravity.google/docs/cli/commands/resume",
+        "https://antigravity.google/docs/cli/gcli-migration",
+        "https://github.com/google-antigravity/antigravity-cli/blob/main/CHANGELOG.md",
+        "local measurement: agy.exe --version (1.1.7) and agy.exe --help on the deployment host, 2026-07-25"
+      ],
+      "confirmedOn": "2026-07-25",
+      "measuredVersion": "1.1.7",
+      "subcommands": "agent/agents (list) · models (list) · plugin/plugins · changelog · update · install (\"Configure environment paths and shell settings\" — this is what writes the PATH entry) · help",
+      "outputFormat": "NONE — print mode emits plain text. There is no --output-format or --json, so a supervisor parses prose or nothing. This is the sharpest constraint on using agy for a machine-consumed seat.",
+      "provenance": "docs + official changelog, then CONFIRMED against the installed binary on the deployment host",
+      "providerBind": "No provider or base-url surface in --help on this deployment (2026-07-26): the only model-facing entries are --model and a models subcommand. Treat as subscription-bound — an external endpoint cannot staff an agy seat until a provider surface is measured, and absence in --help is not proof of absence in the binary, only of absence in its documented surface."
+    },
+    {
+      "harness": "gemini-cli",
+      "label": "Gemini CLI",
+      "status": "SUPERSEDED FOR CONSUMER PLANS — read `entitlementChange` before assigning a seat",
+      "entitlementChange": "As announced 2026-06-18, Gemini CLI and the Gemini Code Assist IDE extensions stopped serving requests for Google AI Pro and Ultra (free tier included); Code Assist Standard/Enterprise licences are stated to be unaffected. A seat backed by a consumer Google subscription therefore belongs on `agy` (Antigravity CLI), not here. Note the documentation/reality mismatch recorded in watchlist.",
+      "instructionFile": "GEMINI.md by default; settings context.fileName accepts an ARRAY, e.g. [\"AGENTS.md\", \"CONTEXT.md\", \"GEMINI.md\"]",
+      "instructionOrder": "Global ~/.gemini/GEMINI.md → configured workspace directories and their ancestors → just-in-time scan when a tool touches a file or directory. /memory show prints the concatenated text actually sent; /memory reload rescans.",
+      "instructionImport": null,
+      "nonInteractive": "-p / --prompt <string> (appended to stdin input if provided; forces non-interactive mode); -i / --prompt-interactive runs a prompt then stays interactive",
+      "sessionContinue": "-r / --resume <\"latest\"|index|UUID> · --list-sessions · --delete-session <index>; in-session /resume [save|list|resume] <name>",
+      "sessionStore": "~/.gemini/tmp/<project_hash>/chats/ (project_hash derives from the project root). Retention keys general.sessionRetention.{enabled,maxAge,maxCount,minRetention}; turn cap model.maxSessionTurns.",
+      "configFiles": "user ~/.gemini/settings.json and workspace <project>/.gemini/settings.json — workspace overrides user",
+      "pathGrant": "--include-directories; folder trust via security.folderTrust.enabled with decisions stored in ~/.gemini/trustedFolders.json",
+      "modelBind": "-m / --model auto (default) | pro | flash | flash-lite | <specific model>",
+      "effortBind": null,
+      "budgetBind": null,
+      "modeFlags": "--approval-mode default|auto_edit|yolo|plan (-y/--yolo deprecated) · -s/--sandbox · -o/--output-format text|json|stream-json · -e/--extensions · -w/--worktree · --allowed-mcp-server-names",
+      "selfConfigProtection": "none documented",
+      "gotchas": [
+        "An untrusted folder's safe mode disables far more than file access: workspace settings are ignored, environment variables are ignored, extension management is limited, tool auto-acceptance is off, automatic memory loading is off, MCP servers do not connect, and custom commands do not load. A desk in an untrusted folder is not a degraded desk — it is a different environment.",
+        "Whether -p composes with -r/--resume for headless multi-turn is NOT documented; every official resume example is interactive."
+      ],
+      "confirmedBy": [
+        "https://raw.githubusercontent.com/google-gemini/gemini-cli/main/docs/cli/cli-reference.md",
+        "https://raw.githubusercontent.com/google-gemini/gemini-cli/main/docs/cli/session-management.md",
+        "https://raw.githubusercontent.com/google-gemini/gemini-cli/main/docs/cli/gemini-md.md",
+        "https://raw.githubusercontent.com/google-gemini/gemini-cli/main/docs/cli/settings.md",
+        "https://developers.googleblog.com/an-important-update-transitioning-gemini-cli-to-antigravity-cli/"
+      ],
+      "confirmedOn": "2026-07-25",
+      "providerBind": "Not surveyed. This row remains the deliberate warning row (see its other fields) rather than a recommendation."
+    }
+  ],
+  "caveats": [
+    {
+      "harness": "agy",
+      "item": "project-level settings file",
+      "why": "Only ~/.gemini/antigravity-cli/settings.json is documented; whether a project-level settings file exists, and whether allowNonWorkspaceAccess can be overridden per project or by flag, is unconfirmed — while extensions ARE workspace-local under .agents/."
+    },
+    {
+      "harness": "codex-cli",
+      "item": "scriptable project trust",
+      "why": "Documentation names an onboarding prompt or /permissions; the config reference gives the projects.<path>.trust_level key. The non-interactive path for granting trust before a `codex exec` run is unclear, and an untrusted project silently drops the whole project-scoped layer."
+    },
+    {
+      "harness": "codex-cli",
+      "item": "model_providers block schema",
+      "why": "A custom-provider mechanism exists, but the exact key set (base_url / env_key / wire_api and their spellings) was not read verbatim in this survey. Rule 1 keeps it out of the row."
+    },
+    {
+      "harness": "claude-code",
+      "item": "--input-format stream-json stdin envelope",
+      "why": "The CLI-level newline-delimited JSON envelope is not specified; documentation gives only the SDK message shape, without stating that the CLI stdin contract is identical."
+    },
+    {
+      "harness": "gemini-cli",
+      "item": "system-wide settings path",
+      "why": "Only user and workspace scopes were confirmed; an OS-level system settings path was not found."
+    },
+    {
+      "harness": "agy",
+      "item": "structured output",
+      "why": "Confirmed absent rather than unconfirmed: print mode has no JSON or output-format option. Recorded as a caveat because it constrains which seats may run here, not because the fact is uncertain."
+    }
+  ],
+  "crossHarnessFacts": [
+    {
+      "fact": "Instruction-file discovery runs repository-root down to the working directory on every harness surveyed, and none exposes a setting, flag, or frontmatter field that reverses that order. The nearest-to-cwd file is merged LAST and therefore wins.",
+      "consequence": "Charter specificity is obtained by PRECEDENCE (run the harness in the desk so the charter merges last), never by claiming a reversed load order. Corporate.md §2.2 is written against this fact.",
+      "status": "confirmed-mechanism",
+      "confirmedBy": [
+        "https://code.claude.com/docs/en/memory",
+        "https://learn.chatgpt.com/docs/agent-configuration/agents-md",
+        "https://raw.githubusercontent.com/google-gemini/gemini-cli/main/docs/cli/gemini-md.md"
+      ]
+    },
+    {
+      "fact": "Instruction budgets are capped per harness, and the caps are small: one harness loads only the first 200 lines or 25 KB of its memory index, another stops accumulating instruction files at 32 KiB.",
+      "consequence": "A charter competes with the project SSoT for a bounded budget. Charters stay short and point at paths (Corporate.md §6.3); a long charter silently truncates the thing it was supposed to override.",
+      "status": "confirmed-mechanism",
+      "confirmedBy": [
+        "https://code.claude.com/docs/en/memory",
+        "https://learn.chatgpt.com/docs/agent-configuration/agents-md"
+      ]
+    },
+    {
+      "fact": "At least one harness protects an agent's own configuration directories as read-only even inside otherwise-writable roots.",
+      "consequence": "Corporate.md §9.2's no-self-configuration invariant has vendor precedent rather than being a house rule; harnesses without the protection need it enforced through the path grant and the charter.",
+      "status": "confirmed-mechanism",
+      "confirmedBy": [
+        "https://learn.chatgpt.com/docs/sandboxing"
+      ]
+    },
+    {
+      "fact": "Pointing a harness at a non-first-party endpoint disables several of its own capabilities, some recoverable only via additional environment flags.",
+      "consequence": "A custom endpoint is a capability trade, not a transparent substitution. A seat whose duty depends on a disabled capability must not be routed there — record the disabled set alongside any endpoint row.",
+      "status": "confirmed-mechanism",
+      "confirmedBy": [
+        "https://code.claude.com/docs/en/env-vars"
+      ]
+    },
+    {
+      "fact": "Turn and spend ceilings exist as per-invocation flags on at least one harness, and subagent spend aggregates into the parent's total.",
+      "consequence": "Corporate.md §7.4b prefers binding the harness's own ceilings at spawn over implementing budget accounting in the module — a harness that can fail a spawn on breach is a stronger guarantee than module-side bookkeeping.",
+      "status": "confirmed-mechanism",
+      "confirmedBy": [
+        "https://code.claude.com/docs/en/cli-reference"
+      ]
+    },
+    {
+      "fact": "A long-lived process holds the PATH snapshot it inherited at start. A harness installed — or self-updated into a new directory — after that moment is invisible to the process even though the user PATH in the registry carries it. Measured on the deployment host: three entries present in the user PATH and absent from the live IDE process, one of them the CLI that had just self-updated.",
+      "consequence": "A desk launcher MUST resolve harness binaries by ABSOLUTE PATH (recorded per host in the roster) rather than relying on inherited PATH. A supervisor that shells out by bare command name will report a harness as missing that is in fact installed — and the failure looks like a configuration error rather than a stale environment.",
+      "status": "confirmed-mechanism",
+      "confirmedBy": [
+        "local measurement: HKCU:\\Environment Path vs the live process PATH on the deployment host, 2026-07-25"
+      ]
+    },
+    {
+      "id": "custom-endpoint-reach-is-not-uniform",
+      "fact": "Whether an external API can staff a seat is decided by the harness, not by the API. Of the three harnesses measured here, one accepts arbitrary OpenAI-compatible endpoints through a declared provider (codex-cli, and only over the Responses wire), one accepts only its vendor plus three named clouds (claude-code), and one exposes no provider surface at all (agy). So \"we have an API key\" is never by itself an assignment: the question is which seats the key can reach, and the answer can be none.",
+      "why": "A roster that assigns a model to a seat without checking the harness provider surface produces a seat that silently runs on the vendor default — the assignment appears in the chart and never happens in the process.",
+      "confirmedBy": "local --help measurement (claude-code, codex-cli, agy) + web-sourced config semantics (codex-cli)",
+      "confirmedOn": "2026-07-26"
+    },
+    {
+      "id": "provider-scope-can-be-narrower-than-the-seat",
+      "fact": "A per-seat provider choice is only expressible if the harness honors provider config at a scope the seat controls. Codex honors model_provider / model_providers exclusively in the user-level config and ignores them in a project-local one (with a startup warning), so a Corporate desk — which is a directory, i.e. project-local — cannot carry its own provider. The per-seat mechanism there is a named profile layered per invocation, not a file in the desk.",
+      "why": "Corporate §2 gives each seat a desk and expects desk-scoped configuration to be how a seat differs from its neighbours. Where the harness scopes a setting above the desk, that expectation silently fails to the user default, which is the same class as the §9.2 no-self-configuration invariant seen from the other side: the seat cannot configure itself even when it should.",
+      "confirmedBy": "web-sourced 2026-07-26 (codex config reference + multiple provider-setup writeups); not verified against a live project-local override on this deployment",
+      "confirmedOn": "2026-07-26"
+    }
+  ],
+  "watchlist": [
+    {
+      "item": "Gemini CLI consumer-plan entitlement vs repository activity",
+      "why": "The official announcement states consumer-plan request serving stopped 2026-06-18, yet the repository was still being pushed to in late July and its README still advertises free-tier rate limits. Treat the announcement as authoritative for seat assignment and re-check whether the documentation catches up.",
+      "blocks": [
+        "assigning any seat backed by a consumer Google subscription to gemini-cli rather than agy"
+      ]
+    },
+    {
+      "item": "subscription lane determination",
+      "why": "The prohibitions read from vendor terms are narrow and specific: credential sharing, offering consumer sign-in to third parties, and routing other parties' requests. They do not speak to how intensely a subscriber drives their own subscription through the vendor's own documented non-interactive mode — and every harness row above records such a mode as a published, maintained flag. §9.1 therefore requires the operator to DECLARE the lane and the fan-out ceiling rather than imposing a lane. Watch for terms revisions that would narrow the non-interactive surface itself, and record the clause verbatim if one appears.",
+      "blocks": []
+    },
+    {
+      "item": "local-endpoint capability parity",
+      "why": "A local OpenAI-compatible endpoint removes the entitlement question and the per-wake cost, which makes it the natural host for resident T4 seats — but capability is the trade. Confirm tool-calling, structured-output and context behaviour per serving stack and per model before a local seat is given work whose failure is not obvious.",
+      "blocks": [
+        "assigning a local-lane seat any duty whose silent failure would not be caught"
+      ]
+    },
+    {
+      "item": "local-model tool-calling fitness",
+      "why": "A resident seat on a local model is only viable if the serving stack supports the tool-calling the harness requires. Confirm per serving stack and per model, not per family.",
+      "blocks": [
+        "resident residency class on a local host (§7.1)"
+      ]
+    },
+    {
+      "item": "free-tier data-use policy",
+      "why": "A free API tier that trains on prompts is unusable for a private workspace regardless of its rate limits. Record the policy clause alongside any free-tier row, and keep the productionAllowed=false routing rule of §9.1 absolute.",
+      "blocks": [
+        "routing any seat that reads project content to a free tier"
+      ]
+    },
+    {
+      "item": "agy source availability",
+      "why": "The CLI ships as a distributed binary with no source in its public repository. Version pinning and provenance checking therefore carry more weight here than for an open-source harness (§9.2).",
+      "blocks": []
+    },
+    {
+      "id": "nvidia-build-free-api",
+      "what": "NVIDIA build.nvidia.com (NIM API catalog) free tier as a possible seat backer: 100+ hosted models (Nemotron, DeepSeek, Llama, Qwen, Mistral) behind an OpenAI-compatible endpoint, free through the Developer Program with no card.",
+      "measuredClaims": "Free rate limit reported as ~40 requests/minute (200 RPM by application). Signup grants ~1,000 inference credits, roughly one credit per call, with ~4,000 more attached to a 90-day AI Enterprise evaluation license. Production is priced per GPU-year. Numbers are WEB-SOURCED 2026-07-26 from secondary write-ups, not from an account of ours.",
+      "blocking": "Two unresolved items, either of which is disqualifying on its own. (1) DATA USE: public sources conflict — the NIM catalog terms are reported as not training on prompts and responses, while at least one write-up reads the privacy policy as recording inputs and outputs for training. Corporate §9.1 is deliberately asymmetric here: a free tier that may train on submitted content is never given a resident or production seat, so this must be resolved from the primary terms by the operator, not inferred. (2) WIRE: NIM is OpenAI chat/completions-shaped, and a codex custom provider now requires wire_api=\"responses\" or it fails at startup — so even with the data question settled, the endpoint may not be reachable from the one harness here that accepts custom providers.",
+      "verdict": "Not an assignment candidate for any resident seat as of 2026-07-26. Plausible for burst / on-demand work on non-sensitive content IF the operator resolves the data-use question against the primary terms and a wire-compatible path exists. The credit budget (~5k calls total) is a trial resource, not a seat budget.",
+      "confirmedBy": "web-sourced secondary write-ups 2026-07-26; no account created, nothing measured against the live endpoint",
+      "confirmedOn": "2026-07-26"
+    }
+  ]
+}

@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<!-- Constellation reference dashboard — vanilla DOM master copy (v2.2.0 design draft)
+   Part of EstreGenesis 2.2 (reference master copy).
+   Generalized from a private PM-board dashboard implementation.
+   The §2 A2A bridge interface (Constellation.md) is the only invariant; the rest may be re-skinned per stack. -->
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Constellation 라이브 보드</title>
+<script>
+// 테마 플래시 방지 — CSS/앱 로드 전에 즉시 적용
+(function () {
+  try {
+    var pref = localStorage.getItem('constellation-theme-pref') || 'auto';
+    var dark = pref === 'dark' || (pref === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
+    document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  } catch (e) { document.documentElement.setAttribute('data-theme', 'dark'); }
+})();
+</script>
+<link rel="stylesheet" href="/style.css" />
+<link rel="stylesheet" href="/vendor/xterm.css" /><!-- Pantty §9 터미널 위젯 — 로컬 vendor(오프라인·무CDN) -->
+
+<link rel="manifest" href="/manifest.webmanifest" />
+<link rel="icon" type="image/png" href="/icon-192.png" />
+<link rel="apple-touch-icon" href="/icon-192.png" />
+<meta name="theme-color" content="#0f1115" />
+<style>
+/* ---- Compendium wiki tab (v0.2-d) ---- */
+#tab-wiki { overflow: auto; padding: 18px 20px; }
+.wiki-head { max-width: 820px; margin: 0 auto 14px; }
+.wiki-title { font-size: 1.3rem; margin: 0 0 4px; color: var(--ink); display: flex; align-items: center; gap: 8px; }
+.wiki-badge { font-size: .72rem; font-weight: 600; color: var(--muted); }
+.wiki-sub { margin: 0 0 10px; font-size: .82rem; color: var(--muted); line-height: 1.5; }
+.wiki-sub a { color: var(--accent); }
+.wiki-tools { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.wiki-search { flex: 1 1 200px; min-width: 140px; background: var(--panel2); color: var(--ink); border: 1px solid var(--line); border-radius: 9px; padding: 7px 11px; font: inherit; font-size: .85rem; }
+.wiki-search:focus { outline: none; border-color: var(--accent); }
+.wiki-reg { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+.wiki-reg-btn { background: var(--panel2); color: var(--muted); border: 0; padding: 7px 12px; font: inherit; font-size: .8rem; cursor: pointer; }
+.wiki-reg-btn.active { background: var(--accent); color: #fff; }
+.wiki-body { max-width: 820px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
+.wiki-entry { background: var(--panel); border: 1px solid var(--line); border-radius: 11px; padding: 13px 15px; box-shadow: var(--shadow); scroll-margin-top: 70px; }
+.wiki-e-title { font-size: 1rem; margin: 0 0 6px; color: var(--ink); display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.wiki-tag { font-size: .68rem; font-weight: 700; border-radius: 6px; padding: 1px 7px; }
+.wiki-tag.int { background: color-mix(in srgb, var(--ws-role-main) 22%, transparent); color: var(--ws-role-main); }
+.wiki-tag.gen { background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--accent); }
+.wiki-tag.sup { background: color-mix(in srgb, var(--blocked) 20%, transparent); color: var(--blocked); }
+.wiki-def { margin: 0 0 8px; font-size: .9rem; line-height: 1.6; color: var(--ink); }
+.wiki-meta { display: flex; flex-direction: column; gap: 4px; font-size: .78rem; }
+.wiki-ptr { color: var(--accent); text-decoration: none; }
+.wiki-ptr:hover { text-decoration: underline; }
+.wiki-ptr.gen { color: var(--muted); }
+.wiki-rel { color: var(--muted); }
+.wiki-xlink { color: var(--accent); text-decoration: none; margin-right: 8px; }
+.wiki-xlink:hover { text-decoration: underline; }
+.wiki-flash { animation: wikiFlash 1.2s ease; }
+@keyframes wikiFlash { 0%, 100% { box-shadow: var(--shadow); } 30% { box-shadow: 0 0 0 2px var(--accent); } }
+/* §8/§11 cross-link side panel (click-to-define) — non-modal complementary landmark; bottom-sheet on mobile */
+.wiki-xlink { cursor: pointer; border-bottom: 1px dotted color-mix(in srgb, var(--accent) 45%, transparent); }
+.wiki-aside { position: fixed; top: calc(var(--topbar-h, 56px) + 16px); right: 18px; width: min(340px, 92vw); max-height: 72vh; overflow: auto; background: var(--panel); border: 1px solid var(--accent); border-radius: 13px; box-shadow: 0 12px 34px rgba(0,0,0,.45); z-index: 60; opacity: 0; transform: translateY(6px); transition: opacity .15s ease, transform .15s ease; }
+.wiki-aside.open { opacity: 1; transform: translateY(0); }
+.wiki-aside[hidden] { display: none; }
+.wiki-aside-bar { position: sticky; top: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 9px 13px; background: var(--panel); border-bottom: 1px solid var(--line); border-radius: 13px 13px 0 0; }
+.wiki-aside-eyebrow { font-size: .72rem; font-weight: 700; color: var(--muted); }
+.wiki-aside-close { background: var(--panel2); color: var(--ink); border: 1px solid var(--line); border-radius: 7px; width: 27px; height: 27px; cursor: pointer; font-size: .82rem; line-height: 1; }
+.wiki-aside-close:hover { border-color: var(--accent); }
+.wiki-aside-body { padding: 12px 14px 15px; }
+.wiki-aside-title { font-size: 1rem; margin: 0 0 7px; color: var(--ink); display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.wiki-aside-jump { display: inline-block; margin-top: 10px; font-size: .77rem; color: var(--accent); text-decoration: none; }
+.wiki-aside-jump:hover { text-decoration: underline; }
+@media (max-width: 560px) {
+  .wiki-aside { top: auto; right: 0; bottom: calc(54px + env(safe-area-inset-bottom, 0px)); left: 0; width: auto; max-height: 58vh; border: 1px solid var(--line); border-bottom: 0; border-radius: 16px 16px 0 0; box-shadow: 0 -8px 28px rgba(0,0,0,.42); transform: translateY(120%); }
+  .wiki-aside.open { transform: translateY(0); }
+  .wiki-aside-bar { border-radius: 16px 16px 0 0; }
+}
+</style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="dot"></span> <span id="board-name">Constellation</span><span class="brand-sub"> 라이브 보드</span></div>
+    <nav class="tabs">
+      <button class="tab active" data-tab="dashboard">대시보드</button>
+      <button class="tab" data-tab="decisions">검토 사안 <span id="decisions-badge" class="pill">0</span></button>
+      <button class="tab" data-tab="org" title="Corporate — 역할 기반 조직">🏢 조직도 <span id="org-badge" class="pill">0</span></button>
+      <button class="tab" data-tab="wiki" title="Compendium — 개념 용어집">📖 위키</button>
+    </nav>
+    <div class="filters-wrap">
+      <button class="fnav fnav-l" type="button" aria-label="필터 이전" hidden>‹</button>
+      <div class="filters" id="filters" title="Ctrl+클릭으로 다중 선택"></div>
+      <button class="fnav fnav-r" type="button" aria-label="필터 다음" hidden>›</button>
+    </div>
+    <div class="status">
+      <div class="status-line"><button id="standby-toggle" class="standby-btn" type="button" hidden></button><span id="conn" class="conn">연결 중…</span></div>
+      <span id="updated" class="updated"></span>
+    </div>
+    <button id="theme-btn" class="theme-btn" type="button" aria-label="테마 전환"></button>
+  </header>
+
+  <main>
+    <!-- 대시보드 탭 — 3구역 미션 컨트롤 (위 완료 / 중앙 고정 현재 / 아래 예정) -->
+    <section id="tab-dashboard" class="tabpane active">
+      <div class="flow">
+        <div class="zone zone-done">
+          <h2 class="zone-h">완료 내역 <span class="muted">최신 ↓ (현재 작업에 인접)</span></h2>
+          <div id="done" class="cards"></div>
+        </div>
+
+        <div id="home-marker" aria-hidden="true"></div>
+        <div class="zone zone-current" id="current-anchor">
+          <div class="zone-label cur">현재 작업 <span class="muted">스크롤해도 상/하단에 고정</span><button id="cur-fold-all" class="cur-fold all open" type="button" hidden title="현재 작업 전체 접기" aria-expanded="true" aria-controls="current"><span class="chev"></span></button></div>
+          <div id="current"></div>
+        </div>
+
+        <div class="zone zone-planned">
+          <h2 class="zone-h">예정 작업 <span class="muted">우선순위 ↑ · 드래그/화살표로 조정</span></h2>
+          <div id="planned" class="cards"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 분할 뷰 분리선 (split 모드에서만 표시) -->
+    <div class="pane-divider" id="pane-divider" hidden role="separator" aria-orientation="vertical" title="드래그하여 좌우 비율 조절 · 더블클릭 50:50">
+      <span class="pd-grip"></span>
+    </div>
+
+    <!-- 검토 사안 탭 -->
+    <section id="tab-decisions" class="tabpane">
+      <div class="zone">
+        <h2 class="zone-h">검토·결정 필요 <span class="muted">우선순위순 · 피드백은 검토 시점까지 수정 가능</span></h2>
+        <div class="dcard dfree" id="free-req-card">
+          <div class="row"><span class="q">✍️ 자유 추가 요청</span></div>
+          <div class="ddetail">검토 사안과 무관한 요청도 여기에 — 에이전트가 채팅 프롬프트처럼 처리합니다. <span class="att-hint">📎 붙여넣기·드래그·첨부 버튼으로 이미지·코드·파일 첨부</span></div>
+          <textarea id="free-req" placeholder="무엇이든 요청을 입력… (이미지·파일 붙여넣기/드롭 가능)"></textarea>
+          <div class="att-list" id="free-req-atts" hidden></div>
+          <div class="dsubmit"><button id="free-req-send" type="button">요청 전송</button><button id="free-req-attach" class="attach-btn" type="button">📎 첨부</button><span class="saved" id="free-req-saved"></span></div>
+          <input type="file" id="free-req-file" multiple hidden />
+        </div>
+        <div id="decisions" class="cards"></div>
+      </div>
+    </section>
+    <!-- 조직도 탭 (Corporate §10·§11 · Constellation §13.33) — 좌석 기반 조직 선언(CorporateChart/RoleState) 투영.
+         보드는 조직을 갖고 있지 않고 선언받아 그릴 뿐이에요: 선언 안 된 좌석은 '유휴' 가 아니라 '미선언' 으로 표시돼요. -->
+    <section id="tab-org" class="tabpane">
+      <div class="org-head">
+        <h2 class="org-title">🏢 조직도 <span class="muted">Corporate 선언 투영</span></h2>
+        <p class="org-sub" id="org-sub">조직 선언을 기다리는 중이에요.</p>
+        <div class="org-tools">
+          <div class="org-legend" aria-label="좌석 상태 표시 설명">
+            <span title="지금 무언가 하고 있는 좌석이에요"><span class="org-dot working"></span>작업 중</span>
+            <span title="비어 있고 다음 일을 기다리는 좌석이에요"><span class="org-dot idle"></span>유휴</span>
+            <span title="막혀서 더 못 나가는 좌석이에요"><span class="org-dot blocked"></span>막힘</span>
+            <span title="사람 승인을 기다리는 좌석이에요"><span class="org-dot waiting-gate"></span>승인 대기</span>
+            <span title="지금은 꺼져 있다고 알린 좌석이에요"><span class="org-dot offline"></span>오프라인</span>
+            <span title="상태를 알린 적이 없는 좌석이에요 — 유휴가 아니라 '모름' 이에요"><span class="org-dot unknown"></span>미선언</span>
+          </div>
+          <button class="org-btn" id="org-refresh" type="button" title="받아둔 최신 조직 선언으로 다시 그려요">↻ 다시 그리기</button>
+        </div>
+      </div>
+      <div class="org-body">
+        <div id="org-chart" class="org-chart" aria-live="polite" aria-label="좌석 조직도"></div>
+        <div id="org-rooms" class="org-rooms" aria-label="주제 방"></div>
+      </div>
+      <p id="org-empty" class="org-empty">아직 선언된 조직이 없어요. 메인 에이전트가 조직 구성을 선언하면 좌석과 상태가 여기에 나타나요.</p>
+      <!-- 좌석 상세 레이어 — 제목은 #org-pop-title 에 넣어요 (#org-pop-head 를 textContent 로 덮으면 닫기 버튼까지 지워져요) -->
+      <div id="org-pop" class="org-pop" hidden role="dialog" aria-modal="false" aria-labelledby="org-pop-title" tabindex="-1">
+        <div class="org-pop-head" id="org-pop-head"><b class="org-pop-title" id="org-pop-title">좌석 상세</b><button class="org-pop-x" id="org-pop-x" type="button" aria-label="좌석 상세 닫기">✕</button></div>
+        <div class="org-pop-body" id="org-pop-body"></div>
+      </div>
+    </section>
+    <section id="tab-wiki" class="tabpane">
+      <div class="wiki-head">
+        <h2 class="wiki-title">Compendium <span class="wiki-badge" id="wiki-count"></span></h2>
+        <p class="wiki-sub">개념 용어집 — 한 개념에 정의 하나, 공식 정의는 소유 모듈 스펙으로 연결(베끼지 않음). <a href="https://github.com/SoliEstre/EstreGenesis/blob/main/Compendium.md" target="_blank" rel="noopener">스펙 →</a></p>
+        <div class="wiki-tools">
+          <input type="search" id="wiki-search" class="wiki-search" placeholder="용어 검색…" aria-label="용어 검색" />
+          <div class="wiki-reg" role="group" aria-label="설명 눈높이">
+            <button type="button" class="wiki-reg-btn active" data-reg="plain">쉽게</button>
+            <button type="button" class="wiki-reg-btn" data-reg="expert">전문</button>
+          </div>
+        </div>
+      </div>
+      <div id="wiki-body" class="wiki-body" aria-live="polite"></div>
+      <aside id="wiki-aside" class="wiki-aside" hidden role="complementary" aria-label="용어 풀이" tabindex="-1">
+        <div class="wiki-aside-bar"><span class="wiki-aside-eyebrow">📖 용어 풀이</span><button type="button" class="wiki-aside-close" id="wiki-aside-close" aria-label="용어 풀이 닫기">✕</button></div>
+        <div class="wiki-aside-body" id="wiki-aside-body"></div>
+      </aside>
+    </section>
+  </main>
+
+  <button id="home-btn" class="home-btn" type="button" title="현재 작업으로"></button>
+  <button id="home-btn-dec" class="home-btn home-btn-dec" type="button" title="검토사안 맨 위 · 자유 요청 입력" hidden></button>
+
+  <!-- WS 실시간 채널 (작업 중 프롬프트 주입) — 우하단 플로팅 토글 + 팝업 -->
+  <button id="ws-fab" class="ws-fab" type="button" title="실시간 패널 토글">💬<span id="ws-badge" class="ws-fab-badge" hidden>0</span></button>
+  <div id="ws-pop" class="ws-pop" hidden>
+    <div class="ws-pop-head" id="ws-pop-head">
+      <span class="ws-pop-dot" id="ws-head-dot"></span><b>실시간</b><span class="ws-pop-meta" id="ws-pop-meta"></span>
+      <span class="grow"></span><span class="ws-arch-wrap"><button class="ws-arch-btn" id="ws-arch-btn" type="button" title="닫은 세션 — 클릭해 복원">📂 0</button><div class="ws-arch-menu" id="ws-arch-menu" hidden></div></span><button class="ws-arch-btn" id="ws-tabedit-btn" type="button" title="탭 편집 — 드래그로 그룹·탭 순서 변경">⇄</button><button class="ws-arch-btn" id="ws-tabreset-btn" type="button" title="탭 순서 초기화" hidden>↺</button><span class="ws-notif-wrap"><button class="ws-arch-btn" id="ws-notif-btn" type="button" title="알림 설정">🔔</button><div class="ws-notif-panel" id="ws-notif-panel" hidden><label class="ws-notif-row ws-notif-master"><input type="checkbox" id="notif-master" /> <b>알림 사용</b></label><div class="ws-notif-subs"><label class="ws-notif-row"><input type="checkbox" id="notif-decision" /> 검토요청</label><label class="ws-notif-row"><input type="checkbox" id="notif-a2a" /> A2A 수신</label><label class="ws-notif-row"><input type="checkbox" id="notif-abort" /> 작업 오류·중단</label></div><div class="ws-notif-hint" id="notif-hint"></div><div class="ws-notif-bg"><label class="ws-notif-row"><input type="checkbox" id="notif-background" /> <b>백그라운드 알림</b> <span class="ws-notif-bgtag">탭 닫아도</span></label><div class="ws-notif-hint" id="notif-bg-hint"></div></div></div></span><button class="ws-arch-btn" id="ws-login-btn" type="button" title="운영자 계정 — 계정을 만들면 보드 권한이 접속 주소 대신 계정으로 판정돼요">👤</button><button class="ws-arch-btn" id="ws-settings-btn" type="button" title="실시간 창 설정 (창 배치 등)">⚙</button><span class="ws-pop-close" id="ws-pop-close" title="닫기">✕</span>
+    </div>
+    <div class="ws-tabs" id="ws-tabs" role="tablist"></div>
+    <div class="ws-pop-body">
+      <div class="ws-conn" id="ws-conn"><span class="ws-dot2" id="ws-conn-dot"></span><b id="ws-agent">에이전트</b><span id="ws-conn-text">대기 중</span><span class="ws-meta" id="ws-seq"></span></div>
+      <div class="ws-h">실시간 스트림 <span class="muted">agent → 보드, AG-UI 이벤트</span><span class="grow"></span><button class="ws-dbg-btn" id="ws-dbg-btn" type="button" title="raw 이벤트 (개발자 debug drawer)">🐞 raw</button></div>
+      <div class="ws-chan-filter" id="ws-chan-filter" role="tablist" hidden></div>
+      <div class="ws-stream" id="ws-stream"><div class="ws-empty">아직 수신한 이벤트가 없어요. 에이전트가 연결되면 여기에 표시됩니다.</div></div>
+      <!-- 모바일 그룹 페이저 (#3a B) — ≤560px 에서 #ws-stream 대신 노출. 그룹별 가로 scroll-snap 페이지(JS 생성), swipe=그룹전환 -->
+      <div class="ws-pager" id="ws-pager"></div>
+      <div class="ws-page-dots" id="ws-page-dots" hidden></div>
+      <div class="ws-debug" id="ws-debug" hidden><div class="ws-empty">raw 이벤트 없음</div></div>
+      <div class="ws-input">
+        <div class="ws-h">작업 중 프롬프트 주입 <span class="muted">· Ctrl+Enter · 📎 첨부·드롭·붙여넣기</span><span class="grow"></span><span class="ws-target-wrap" id="ws-target-wrap" title="프롬프트 전달 대상 — 탭/그룹 선택 시 자동 지정, 변경 시 현재 선택에 한해 오버라이드"><span class="ws-target-dot" id="ws-target-dot"></span><select id="ws-target-sel" aria-label="프롬프트 전달 대상"></select></span></div>
+        <div id="ws-text-stack" class="ws-text-stack"></div>
+        <div class="att-list" id="ws-atts" hidden></div>
+        <div class="ws-actions">
+          <button class="send" id="ws-send" type="button">전송</button>
+          <button id="ws-attach" type="button" title="첨부">📎</button>
+          <button id="ws-pause" type="button">⏸ pause</button>
+          <button id="ws-resume" type="button">▶ resume</button>
+          <button class="cancel" id="ws-cancel" type="button">⏹ stop</button>
+          <div class="ws-act-left" id="ws-act-left"><!-- v2.4.80 좌측 그룹 (row-reverse 부모의 DOM 마지막 = 시각 왼쪽 끝): [⚙ ops(JS prepend), 🧵 모니터] -->
+            <button id="ws-wf-inbtn" type="button" title="에이전트 활동 모니터 토글 — W=최근 워크플로 완료/전체 · S=활동 서브에이전트">🧵 W0/0 S0</button>
+            <button id="ws-seat-inbtn" type="button" title="좌석 계측 — 문맥 점유(모르면 —) · ⚙=도구 실행 중. 자세한 값은 이 버튼의 툴팁">🪑 —</button>
+          </div>
+        </div>
+        <input type="file" id="ws-file" multiple hidden />
+      </div>
+    </div>
+    <!-- 8방향 리사이즈 핸들 (모든 면·모서리) -->
+    <div class="ws-rsz n"  data-dir="n"></div><div class="ws-rsz s"  data-dir="s"></div>
+    <div class="ws-rsz e"  data-dir="e"></div><div class="ws-rsz w"  data-dir="w"></div>
+    <div class="ws-rsz ne" data-dir="ne"></div><div class="ws-rsz nw" data-dir="nw"></div>
+    <div class="ws-rsz se" data-dir="se"></div><div class="ws-rsz sw" data-dir="sw"></div>
+  </div>
+
+  <!-- 모바일 하단 고정 탭바 (≤560px) — 최상위 탭전환 (실시간 = 팝업을 풀스크린 pane 으로 합류). 위키 = #4 Compendium 자리 -->
+  <nav id="mobile-tabbar" class="mobile-tabbar" aria-label="모바일 탭">
+    <button class="mtab" data-mtab="dashboard" type="button">📋<span>대시보드</span></button>
+    <button class="mtab" data-mtab="decisions" type="button">📝<span>검토사안</span></button>
+    <button class="mtab" data-mtab="org" type="button" title="Corporate — 역할 기반 조직">🏢<span>조직도</span></button>
+    <button class="mtab" data-mtab="wiki" type="button" title="Compendium — 개념 용어집">📖<span>위키</span></button>
+    <button class="mtab" data-mtab="realtime" type="button">💬<span>실시간</span></button>
+  </nav>
+
+  <dialog id="att-dialog" class="att-dialog">
+    <div class="att-head">
+      <span class="att-title" id="att-title"></span>
+      <span class="att-actions">
+        <button id="att-newtab" type="button" class="att-btn">⤢ 새 탭</button>
+        <button id="att-close" type="button" class="att-btn" aria-label="닫기">✕</button>
+      </span>
+    </div>
+    <div class="att-body" id="att-body"></div>
+  </dialog>
+
+  <script src="/vendor/xterm.js"></script><!-- Pantty §9 터미널 — window.Terminal (app.js 전에 로드) -->
+  <script src="/vendor/addon-fit.js"></script><!-- window.FitAddon -->
+  <script src="/login.js"></script>
+  <script src="/app.js"></script>
+  <script>if ('serviceWorker' in navigator) { addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {})); }</script>
+</body>
+</html>

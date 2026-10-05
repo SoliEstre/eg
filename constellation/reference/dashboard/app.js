@@ -1,0 +1,5447 @@
+'use strict';
+/* Constellation reference dashboard — vanilla DOM master copy (v2.2.0 design draft)
+ * Part of EstreGenesis 2.2 (reference master copy).
+ * Generalized from a private PM-board dashboard implementation.
+ * The §2 A2A bridge interface (Constellation.md) is the only invariant; the rest may be re-skinned per stack.
+ */
+// Live 대시보드 v2 — state.json 을 SSE 로 받아 렌더. 피드백/우선순위조정은 POST /api/feedback (서버 로그 → 에이전트 검토).
+
+const $ = (s, r = document) => r.querySelector(s);
+const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; };
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+// URL 스킴 allowlist (XSS) — javascript:/data:text/html/vbscript: 등 실행 스킴 차단. http(s)/blob/mailto/data:image + 상대경로만 허용, 그 외 '#'. iframe src·window.open URL sink 에 적용.
+const wsSafeUrl = (u) => { if (typeof u !== 'string') return '#'; const s = u.trim(); const m = s.match(/^([a-z][a-z0-9+.-]*):/i); if (m) { const sch = m[1].toLowerCase(); if (sch === 'http' || sch === 'https' || sch === 'blob' || sch === 'mailto') return s; if (sch === 'data' && /^data:image\//i.test(s)) return s; return '#'; } return s; };
+// 인라인 비주얼 강조: [역할]·✓(완료)·→(변화)·커밋해시·버전 을 색/monospace 로.
+const decoDetail = (s) => esc(s)
+  .replace(/\*\*([^*]+)\*\*/g, '<b class="em">$1</b>')
+  .replace(/\[([^\]]{1,14})\]/g, '<span class="role">[$1]</span>')
+  .replace(/✓/g, '<span class="ok">✓</span>')
+  .replace(/→/g, '<span class="arr">→</span>')
+  .replace(/\b([0-9a-f]{7})\b/g, '<code>$1</code>')
+  .replace(/(?<![\w.])(v?\d+\.\d+\.\d+)(?![\w.])/g, '<code>$1</code>');
+// 'label: body' → 라벨 강조 분리
+const dsLabel = (b) => { const m = b.match(/^([^:：]{1,18})[:：]\s+(.+)$/s); return m ? { label: `<span class="lbl">${esc(m[1])}:</span> `, body: m[2] } : { label: '', body: b }; };
+// 3개↑ 나열(·, /)은 칩, 아니면 인라인 비주얼
+const dsBody = (body) => { const parts = body.split(/\s+·\s+|\s+\/\s+/).map(s => s.trim()).filter(Boolean); return parts.length >= 3 ? '<span class="chips">' + parts.map(p => `<span class="chip">${decoDetail(p)}</span>`).join('') + '</span>' : decoDetail(body); };
+// done/planned detail — 문장(마침표/✓ 뒤) 단위 줄바꿈(▸), CSS columns 로 폭 넓으면 자동 2열(반응형).
+function fmtDetail(text) {
+  if (!text) return '';
+  const blocks = String(text).split(/\s*\n\s*|(?<=\.)\s+(?=\S)/).map(s => s.trim()).filter(Boolean);
+  return '<div class="ds ds-cols">' + blocks.map(b => { const { label, body } = dsLabel(b); return `<div class="ds-line">${label}${dsBody(body)}</div>`; }).join('') + '</div>';
+}
+// unblock(해제 단계)·피드백 note — 줄(\n) 단위 유지 + 비주얼(①②③ 자체 마커라 ▸ 없이 1열).
+function fmtLines(text) {
+  if (!text) return '';
+  return '<div class="ds">' + String(text).split(/\s*\n\s*|(?<=\.)\s+(?=\S)/).map(l => l.trim()).filter(Boolean).map(l => { const { label, body } = dsLabel(l); return `<div class="ds-step">${label}${dsBody(body)}</div>`; }).join('') + '</div>';
+}
+
+const ui = {
+  tab: 'dashboard',
+  panes: ['dashboard'],       // 표시 중 탭들 (2개면 분할 뷰). boot 에서 복원
+  splitFrac: 0.5,             // 분할 좌측 비율 (비율 모드)
+  splitFixed: null,           // { side:'left'|'right', px } 고정폭 모드 (2단 전용)
+  paneW: {},                  // v2.4.134 3단 이상 pane 별 가중치 {pane: fr}
+  adhoc: [],                  // 예정작업 즉석 피드백 카드 [{plannedId, title, text, atts}]
+  filter: new Set(),          // 비어있으면 전체. Ctrl+클릭으로 다중 선택
+  open: new Set(),            // 펼친(고정) 카드 ids
+  seenDefaults: new Set(),    // 기본 펼침을 이미 적용한 ids (사용자 토글 보존)
+  prevIds: new Set(),         // 이전 렌더의 ids (신규 항목 진입 애니메이션용)
+  atHome: true,               // 홈(중앙) 위치 유지 중인가 (사용자가 스크롤하면 false)
+  tlCentered: true,           // 타임라인 가로: active stage 중앙 유지 중인가
+  state: null,
+  localOrder: null,           // 낙관적 planned 순서 (ids)
+};
+const DRAFT_KEY = (id) => `constellation-dash-draft:${id}`;
+const NEAR = 3;               // 현재 작업 인접 N개 기본 펼침
+
+// ---- §13.33 조직도 상태 (Corporate 모듈 §10 두 선언 이벤트) ----
+// CommandManifest/OpsState 와 같은 선언 클래스 — 변경-트리거·latest-wins·서버 persist·History 동봉.
+// 보드는 조직을 소유하지 않아요: 선언이 없으면 탭만 비고 나머지는 그대로예요(graceful degradation).
+let orgChart = null;            // 최신 CorporateChart value {version, org, hosts[], roles[], links[], groups[], rooms[]}
+const roleStates = new Map();   // role → 최신 RoleState value {status, task?, taskRef?, since, blockReason?, budgetUsed?}
+let orgPopRole = null;          // 상세 팝업이 열려 있는 좌석 (재선언 수신 시 갱신 대상)
+let orgPayloadSeen = false;     // History 페이로드가 조직 선언을 실어줬나 — 실어줬다면 그게 서버의 latest-wins 정본이라,
+                                // 재생되는 기록 이벤트(회전으로 낡을 수 있어요)가 그 정본을 덮지 않게 막아요.
+
+// ---- data ----
+function applyState(s) {
+  ui.state = s;
+  ui.localOrder = null;       // 새 state 오면 서버 순서 채택
+  renderAll();
+}
+let _es = null;
+function connect() {
+  if (_es) { try { _es.close(); } catch {} }   // 중복 연결 방지
+  const ev = _es = new EventSource('/api/events');
+  ev.addEventListener('state', (e) => { try { applyState(JSON.parse(e.data)); setConn(true); } catch {} });
+  ev.onopen = () => setConn(true);
+  // 끊김 시: CLOSED(영구 끊김 — 서버 재시작 등)면 3초 후 재연결. CONNECTING(0)이면 EventSource 자동 재연결 중이라 둠.
+  ev.onerror = () => { setConn(false); if (ev.readyState === EventSource.CLOSED) setTimeout(() => { if (_es === ev) connect(); }, 3000); };
+}
+// 백그라운드/슬립 후 탭 복귀 시 끊긴 SSE 를 즉시 재연결 (장시간 열어둔 탭 stale 방지)
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && (!_es || _es.readyState === 2)) connect(); });
+let _sseOk = false;
+function setConn(ok) { _sseOk = ok; updateConnDisplay(); }
+// conn 표시 = SSE 연결 + 에이전트 모니터 상태 결합
+function updateConnDisplay() {
+  const c = $('#conn'); if (!c) return;
+  const monitor = (ui.state && ui.state.monitor) || 'idle';
+  if (!_sseOk) { c.textContent = '○ 연결 끊김(재시도)'; c.className = 'conn off'; }
+  else if (monitor === 'active') { c.textContent = '● 작업 중 · 모니터링'; c.className = 'conn active'; }      // 작업 진행 중 (녹색)
+  else if (monitor === 'watching') { c.textContent = '● 피드백 대기 중'; c.className = 'conn watching'; }   // 무한 대기 (노랑)
+  else { c.textContent = '○ 프롬프트 대기 중'; c.className = 'conn idle'; }                                   // 일단락 (회색)
+  updateStandbyToggle();
+}
+function updateStandbyToggle() {
+  const b = $('#standby-toggle'); if (!b) return;
+  b.hidden = false;
+  const standby = !!(ui.state && ui.state.standby);
+  const monitor = (ui.state && ui.state.monitor) || 'idle';
+  b.textContent = standby ? '⏸ 대기 종료' : '▶ 대기 시작';
+  b.classList.toggle('on', standby);
+  b.disabled = (monitor === 'idle');   // 일단락(에이전트 부재) → 비활성, 채팅으로만 재개
+  b.title = monitor === 'idle' ? '대기 종료됨 — 채팅 프롬프트로 재개' : (standby ? '무한 대기 종료 (작업 끝나면 일단락)' : '무한 대기 시작');
+}
+function setupStandbyToggle() {
+  const b = $('#standby-toggle'); if (!b) return;
+  b.onclick = () => {
+    if (b.disabled) return;
+    const cur = !!(ui.state && ui.state.standby);
+    postFeedback({ kind: 'mode', standby: !cur, at: new Date().toISOString() });
+    if (ui.state) ui.state.standby = !cur;   // 낙관적 반영
+    updateStandbyToggle();
+  };
+}
+async function postFeedback(entry) {
+  try { await fetch('/api/feedback', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(entry) }); return true; }
+  catch { return false; }
+}
+
+// ---- project / filter helpers ----
+function projOf(id) { return (ui.state.projects || []).find(p => p.id === id); }
+function projChip(id) { const p = projOf(id); return p ? `<span class="proj-chip" style="background:${esc(p.color)}">${esc(p.name)}</span>` : ''; }
+function isAll() { return ui.filter.size === 0; }
+function dimClass(projectId) { return (!isAll() && !ui.filter.has(projectId)) ? ' dim' : ''; }
+
+// ---- open-state helpers ----
+function applyDefaultOpen(id, shouldOpen) {
+  if (ui.seenDefaults.has(id)) return;
+  ui.seenDefaults.add(id);
+  if (shouldOpen) ui.open.add(id); else ui.open.delete(id);
+}
+function toggleOpen(id, card) {
+  if (ui.open.has(id)) { ui.open.delete(id); card.classList.remove('open'); }
+  else { ui.open.add(id); card.classList.add('open'); }
+}
+// 현재 작업 접기/펼치기 뒤에 **반드시** 불러야 해요.
+// 왜: 예정 섹션 헤더의 sticky 위치가 `--cur-h`(현재 밴드 실측 높이)에 매여 있어서, 높이를 바꾸고
+//   다시 안 재면 화면은 «접혔는데» 아래 섹션이 옛 높이만큼 밀린 채로 있어요 — 렌더는 성공한
+//   것처럼 보이고 레이아웃만 틀려요. 접힘은 높이를 바꾸는 조작이라 이게 짝이에요.
+function afterFold() {
+  setCurHeight();
+  syncCurFoldAllBtn();
+  if (ui.atHome) requestAnimationFrame(() => centerCurrent(false));
+}
+// 전체 토글의 표시는 **실제 상태에서 파생**해요 — 자체 플래그를 들면 개별 토글과 어긋나요.
+function curAllOpen() { const k = ui._curKeys || []; return k.length > 0 && k.every((x) => ui.open.has(x)); }
+function curAnyOpen() { return (ui._curKeys || []).some((x) => ui.open.has(x)); }
+function syncCurFoldAllBtn() {
+  const b = $('#cur-fold-all'); if (!b) return;
+  const any = curAnyOpen();
+  b.classList.toggle('open', any);
+  b.title = any ? '현재 작업 전체 접기' : '현재 작업 전체 펼치기';
+  b.setAttribute('aria-expanded', any ? 'true' : 'false');
+  b.hidden = !(ui._curKeys || []).length;
+}
+function curFoldAll() {
+  const keys = ui._curKeys || []; if (!keys.length) return;
+  const collapse = curAnyOpen();   // 하나라도 펼쳐져 있으면 «전부 접기», 전부 접혔으면 «전부 펼치기»
+  for (const k of keys) { if (collapse) ui.open.delete(k); else ui.open.add(k); }
+  document.querySelectorAll('#current .cur-top').forEach((c) => c.classList.toggle('open', !collapse));
+  afterFold();
+}
+
+// ---- render ----
+function renderAll() {
+  if (!ui.state) return;
+  $('#updated').textContent = '갱신 ' + (ui.state.updatedAt ? new Date(ui.state.updatedAt).toLocaleString('ko-KR') : '');
+  updateConnDisplay();   // monitor/standby 상태 반영
+
+  renderFilters();
+  renderDone();
+  renderCurrent();
+  renderPlanned();
+  renderDecisions();
+  renderFreeRequest();
+  try { renderOrg(); } catch {}   // §13.33 조직도 — 보드 state 와 무관한 선언 소스지만 상세 절(단계·보고·게이트)이 state 를 읽어요
+  setCurHeight();   // 예정 섹션 헤더가 현재 밴드 아래에 고정되도록 높이 노출
+  // 홈 위치 유지·초기 센터링은 setupHomeTracking 의 ResizeObserver 가 콘텐츠 크기 변화에 맞춰 처리
+  ui.prevIds = collectIds();
+}
+function setCurHeight() {
+  const cur = $('#current-anchor');
+  if (cur) document.documentElement.style.setProperty('--cur-h', cur.offsetHeight + 'px');
+}
+window.addEventListener('resize', setCurHeight);
+// 현재 작업 밴드를 화면 중앙으로 두는 scrollTop.
+// 주의: #current-anchor 는 sticky 라 offsetTop 이 stuck 위치를 따라가 불안정 → 그 앞의 비-sticky
+// 마커(#home-marker) offsetTop 으로 현재 밴드의 자연 위치를 안정적으로 측정한다.
+function homeScrollTop() {
+  const pane = $('#tab-dashboard'); const marker = $('#home-marker'); const cur = $('#current-anchor');
+  if (!pane || !marker || !cur) return 0;
+  return Math.max(0, marker.offsetTop - Math.max(0, (pane.clientHeight - cur.offsetHeight) / 2));
+}
+// 홈(중앙) 위치 부근인가
+function isAtHome() {
+  const pane = $('#tab-dashboard');
+  return !pane || Math.abs(pane.scrollTop - homeScrollTop()) <= 6;
+}
+// 프로그램적 홈 스크롤 (lock 동안 scroll 리스너가 atHome 을 끄지 않게)
+let _homeLock = false;
+function applyHome(smooth) {
+  const pane = $('#tab-dashboard'); if (!pane) return;
+  _homeLock = true;
+  pane.scrollTo({ top: homeScrollTop(), behavior: smooth ? 'smooth' : 'auto' });
+  clearTimeout(applyHome._t);
+  applyHome._t = setTimeout(() => { _homeLock = false; }, smooth ? 450 : 90);
+}
+function centerCurrent(smooth = true) { ui.atHome = true; applyHome(smooth); }   // 홈 버튼
+// 콘텐츠 크기 변화(초기 정착·항목 추가 등)마다 홈이었으면 재적용, 사용자가 스크롤했으면 보존
+function setupHomeTracking() {
+  const pane = $('#tab-dashboard'); const flow = $('.flow');
+  if (!pane) return;
+  pane.addEventListener('scroll', () => { if (!_homeLock) ui.atHome = isAtHome(); }, { passive: true });
+  if (flow && 'ResizeObserver' in window) new ResizeObserver(() => { if (ui.atHome) applyHome(false); }).observe(flow);
+  // 현재 밴드(타임라인) 폭 변동 → active 재중앙 (분할 토글·분리선 드래그·창 변동 모두 커버)
+  const cur = $('#current');
+  if (cur && 'ResizeObserver' in window) new ResizeObserver(() => { if (ui.tlCentered && !_tlLock) centerActiveStage(false); }).observe(cur);
+  window.addEventListener('resize', () => { if (ui.atHome) applyHome(false); if (ui.tlCentered) centerActiveStage(false); });
+}
+
+// ---- 타임라인 가로: active stage 중앙 (세로 home 과 같은 패턴) ----
+let _tlLock = false;
+function timelineCenterLeft(tl, act) {
+  return Math.max(0, act.offsetLeft - Math.max(0, (tl.clientWidth - act.offsetWidth) / 2));   // .timeline position:relative → offsetLeft 안정
+}
+function centerActiveStage(smooth) {
+  const tl = $('#current .timeline'); const act = tl && tl.querySelector('.stage.active');
+  if (!tl || !act) return;
+  _tlLock = true;
+  tl.scrollTo({ left: timelineCenterLeft(tl, act), behavior: smooth ? 'smooth' : 'auto' });
+  clearTimeout(centerActiveStage._t);
+  centerActiveStage._t = setTimeout(() => { _tlLock = false; }, smooth ? 450 : 90);
+}
+
+// fixed 상단바 높이 → --topbar-h (메인 스크롤 영역을 그만큼 아래로 → 콘텐츠·스크롤바 안 가림)
+function setupTopbar() {
+  const tb = $('.topbar'); if (!tb) return;
+  const m = () => {
+    document.documentElement.style.setProperty('--topbar-h', tb.offsetHeight + 'px');
+    if (ui.atHome) applyHome(false);   // 상단바 높이 변동(모바일 줄바꿈 등) 시 홈 재정렬
+  };
+  m();
+  if ('ResizeObserver' in window) new ResizeObserver(m).observe(tb);
+}
+function collectIds() {
+  const ids = new Set();
+  (ui.state.done || []).forEach((_, i) => ids.add('done-' + i));
+  (ui.state.planned || []).forEach(p => ids.add(p.id));
+  return ids;
+}
+function isNew(id) { return ui.prevIds.size > 0 && !ui.prevIds.has(id); }
+
+function renderFilters() {
+  const box = $('#filters'); box.innerHTML = '';
+  const allBtn = el('button', 'fbtn' + (isAll() ? ' active' : ''), '전체');
+  allBtn.onclick = () => { ui.filter.clear(); renderAll(); };
+  box.append(allBtn);
+  (ui.state.projects || []).forEach(p => {
+    const on = ui.filter.has(p.id);
+    const b = el('button', 'fbtn' + (on ? ' active' : ''));
+    b.style.color = on && p.color ? p.color : '';
+    b.innerHTML = `<span class="swatch" style="background:${esc(p.color)}"></span>` + esc(p.name);
+    b.onclick = (e) => {
+      if (e.ctrlKey || e.metaKey) {              // 다중 토글
+        if (ui.filter.has(p.id)) ui.filter.delete(p.id); else ui.filter.add(p.id);
+      } else {                                    // 단일 선택 (다시 누르면 전체)
+        if (ui.filter.size === 1 && ui.filter.has(p.id)) ui.filter.clear();
+        else { ui.filter.clear(); ui.filter.add(p.id); }
+      }
+      renderAll();
+    };
+    box.append(b);
+  });
+  requestAnimationFrame(layoutTopbar);
+}
+// 필터 가로 스크롤 인디케이터 — 좌/우 더 있으면 ‹ › 표시, 클릭 시 페이지 단위 스무스 스크롤
+function updateFilterNav() {
+  const f = $('#filters'); if (!f) return;
+  const max = f.scrollWidth - f.clientWidth;
+  const l = $('.fnav-l'), r = $('.fnav-r');
+  if (l) l.hidden = f.scrollLeft <= 1;
+  if (r) r.hidden = f.scrollLeft >= max - 1;
+}
+function setupFilterNav() {
+  const f = $('#filters'), l = $('.fnav-l'), r = $('.fnav-r');
+  if (!f) return;
+  const page = (dir) => f.scrollBy({ left: dir * Math.max(120, f.clientWidth * 0.8), behavior: 'smooth' });
+  if (l) l.onclick = () => page(-1);
+  if (r) r.onclick = () => page(1);
+  f.addEventListener('scroll', updateFilterNav, { passive: true });
+  window.addEventListener('resize', layoutTopbar);
+}
+// 상단바 단계 줄내림 — 형제 폭 측정 (필터 가용<360 → 필터 둘째줄 / 첫줄 넘침 → 탭 둘째줄 / 탭+필터 같은 줄 가능하면 합침)
+function layoutTopbar() {
+  const tb = $('.topbar'); if (!tb) return;
+  const brand = tb.querySelector('.brand'), tabs = tb.querySelector('.tabs'),
+        status = tb.querySelector('.status'), theme = $('#theme-btn');
+  if (!brand || !tabs) return;
+  tb.classList.remove('filters-stacked', 'tabs-stacked', 'tabs-filters-row');   // reset 후 자연폭 측정
+  const cs = getComputedStyle(tb);
+  const gap = parseFloat(cs.columnGap) || 16;
+  const W = tb.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+  // tabs 는 grow(flex:1)라 scrollWidth/offsetWidth 가 늘어난 폭 → 버튼 합으로 자연폭 측정
+  const tabBtns = [...tabs.querySelectorAll('.tab')];
+  const tabsGap = parseFloat(getComputedStyle(tabs).columnGap) || 6;
+  const wB = brand.offsetWidth;
+  const wT = tabBtns.reduce((s, b) => s + b.offsetWidth, 0) + Math.max(0, tabBtns.length - 1) * tabsGap;
+  const wS = status ? status.offsetWidth : 0, wTh = theme ? theme.offsetWidth : 0;
+  // 1) 필터 자리(W − 나머지) ≥ 360 → 전부 한 줄
+  if (W - (wB + wT + wS + wTh + gap * 4) >= 360) { requestAnimationFrame(updateFilterNav); return; }
+  // 2) 필터 둘째 줄
+  tb.classList.add('filters-stacked');
+  if (wB + wT + wS + wTh + gap * 3 <= W) { requestAnimationFrame(updateFilterNav); return; }   // 첫줄(필터 제외) 들어감 → 탭 첫줄 유지
+  // 3) 탭도 둘째 줄. 둘째 줄에 탭+필터(360) 들어가면 같은 줄로 합침
+  tb.classList.add('tabs-stacked');
+  if (wT + 360 + gap <= W) tb.classList.add('tabs-filters-row');
+  requestAnimationFrame(updateFilterNav);
+}
+
+function cardEl(id, projectId, titleHtml, metaHtml, detailHtml, extra) {
+  const p = projOf(projectId);
+  const expandable = !!(detailHtml && String(detailHtml).trim());
+  const c = el('div', 'card'
+    + (expandable && ui.open.has(id) ? ' open' : '')
+    + (expandable ? ' expandable' : '')
+    + (isNew(id) ? ' enter' : '')
+    + dimClass(projectId) + (extra || ''));
+  if (p) c.style.setProperty('--proj', p.color);
+  c.dataset.id = id; c.dataset.project = projectId || '';
+  const expBtn = expandable ? `<button class="exp" type="button" tabindex="-1" aria-label="상세 토글"><span class="chev"></span></button>` : '';
+  c.innerHTML = `${expBtn}<div class="body"><div class="row">${titleHtml}${metaHtml || ''}</div>`
+    + (expandable ? `<div class="detail">${detailHtml}</div>` : '') + `</div>`;
+  if (expandable) {
+    c.querySelector('.row').addEventListener('click', (e) => { if (e.target.closest('button')) return; toggleOpen(id, c); });
+    c.querySelector('.exp').addEventListener('click', (e) => { e.stopPropagation(); toggleOpen(id, c); });
+  }
+  return c;
+}
+
+function renderDone() {
+  const box = $('#done'); box.innerHTML = '';
+  // done 은 최신순. 화면은 오래된 것 위 → 최신 아래(현재 인접). 인접 NEAR 개 기본 펼침.
+  const items = (ui.state.done || []).map((d, i) => ({ d, i })).reverse();
+  items.forEach(({ d, i }, pos) => {
+    const id = 'done-' + i;
+    applyDefaultOpen(id, pos >= items.length - NEAR);
+    const when = d.at ? new Date(d.at).toLocaleString('ko-KR', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : (d.when || '');
+    const c = cardEl(id, d.project,
+      `<span class="title">${esc(d.title)}</span>`,
+      `${projChip(d.project)}<span class="when">${esc(when)}</span>`,
+      `${fmtDetail(d.detail)}${d.ref ? `<div class="ds-ref"><span class="ref">${esc(d.ref)}</span></div>` : ''}${attChips('done-' + i, d.att)}`);
+    const fb = el('button', 'pln-fb', '💬 피드백'); fb.title = '이 완료 항목에 피드백 — 검토사안에 입력 카드 추가';
+    fb.onclick = (e) => { e.stopPropagation(); openContextFeedback('done', id, d.title); };
+    c.querySelector('.row').append(fb);
+    box.append(c);
+  });
+  if (!box.children.length) box.innerHTML = '<div class="empty">완료 항목 없음</div>';
+}
+
+// current = 단일 객체(하위호환) / 배열(여러 작업 동시) — 상위 작업은 상하 구분, 같은 상위의 하위는 수평 분리.
+// 상위 진행 블로커가 하위 항목이면(blockedBy = 하위 index/id) 시각 연결(⛔·연결선) 표시.
+function renderCurrent() {
+  const cur = ui.state.current; const box = $('#current'); box.innerHTML = '';
+  const items = Array.isArray(cur) ? cur : (cur ? [cur] : []);   // 멀티(배열) / 단일(객체) / 없음
+  const foldAll = $('#cur-fold-all'); if (foldAll) foldAll.onclick = curFoldAll;
+  if (!items.length) { box.innerHTML = '<div class="empty">현재 작업 없음</div>'; ui._curKeys = []; syncCurFoldAllBtn(); return; }
+  const single = items.length === 1 && !(items[0].sub && items[0].sub.length);   // 단일·하위없음 = 기존 중앙정렬 경로
+  let firstTl = null;
+  ui._curKeys = [];
+  items.forEach((top, ti) => {
+    if (ti > 0) box.append(el('div', 'cur-sep'));                 // 상위 작업 간 상하 구분선
+    // blockedBy 가 실제 하위와 매칭될 때만 has-blocker (범위초과 → dangling 연결선 방지, codex P2 검증)
+    const subMatched = !!(top.sub && top.sub.some((s, si) => top.blockedBy === si || (s.id != null && top.blockedBy === s.id)));
+    // 접힘 키는 **위치가 아니라 내용**에서 파생해요 — 인덱스로 잡으면 상위 작업 하나가 끝나 빠질 때
+    //   아래 것들이 한 칸씩 밀려서 «사용자가 접어 둔 카드» 가 다른 카드로 옮겨 붙어요.
+    const key = 'cur:' + (top.id != null ? top.id : (top.ref || top.title || ti));
+    ui._curKeys.push(key);
+    applyDefaultOpen(key, true);   // 현재 작업은 기본 펼침 — 접힘은 사용자가 고른 상태예요
+    const card = el('div', 'cur-top' + (subMatched ? ' has-blocker' : '') + (ui.open.has(key) ? ' open' : ''));
+    const ct = el('div', 'ctitle', `${projChip(top.project)} ${esc(top.title)} ${top.ref ? `<span class="ref">${esc(top.ref)}</span>` : ''}`);
+    const cfb = el('button', 'pln-fb ctx-fb', '💬 피드백'); cfb.title = '이 작업에 피드백 — 검토사안에 입력 카드 추가';
+    cfb.onclick = () => openContextFeedback('current', 'current-' + ti, top.title);
+    const cfold = el('button', 'cur-fold', '<span class="chev"></span>');
+    cfold.type = 'button';
+    cfold.title = '이 작업 접기/펼치기';
+    cfold.setAttribute('aria-label', '이 작업 접기/펼치기');
+    cfold.onclick = (e) => { e.stopPropagation(); toggleOpen(key, card); afterFold(); };
+    ct.append(cfb, cfold); card.append(ct);
+    if (top.att && top.att.length) card.insertAdjacentHTML('beforeend', attChips('current-' + ti, top.att));
+    const tl = el('div', 'timeline');
+    (top.stages || []).forEach(s => {
+      const st = el('div', 'stage ' + (s.status || 'pending'));
+      st.innerHTML = `<div class="slabel">${esc(s.label)}</div><div class="sstat">${esc(s.status || 'pending')}</div>`;
+      tl.append(st);
+    });
+    card.append(tl);
+    if (ti === 0) firstTl = tl;
+    // 하위 작업 — 같은 상위 내 수평 분리
+    if (top.sub && top.sub.length) {
+      const row = el('div', 'cur-sub-row');
+      top.sub.forEach((sub, si) => {
+        const blocks = (top.blockedBy === si || (sub.id != null && top.blockedBy === sub.id));
+        const sc = el('div', 'cur-sub' + (blocks ? ' blocker' : ''));
+        sc.innerHTML = `<div class="sub-title">${blocks ? '⛔ ' : ''}${projChip(sub.project || top.project)} ${esc(sub.title)}</div>`;
+        if (sub.stages && sub.stages.length) {
+          const stl = el('div', 'timeline mini');
+          sub.stages.forEach(s => { const st = el('div', 'stage ' + (s.status || 'pending')); st.innerHTML = `<div class="slabel">${esc(s.label)}</div>`; stl.append(st); });
+          sc.append(stl);
+        }
+        row.append(sc);
+      });
+      card.append(row);
+    }
+    box.append(card);
+  });
+  syncCurFoldAllBtn();
+  // 가로 타임라인 중앙 추적은 단일 상위(하위 없음)일 때만 (멀티는 카드별 독립이라 생략)
+  if (single && firstTl) {
+    firstTl.addEventListener('wheel', (e) => { if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) ui.tlCentered = false; }, { passive: true });
+    firstTl.addEventListener('touchmove', () => { ui.tlCentered = false; }, { passive: true });
+    const activeLabel = (items[0].stages || []).find(s => (s.status || '') === 'active')?.label || null;
+    const activeChanged = activeLabel !== ui._prevActive;
+    ui._prevActive = activeLabel;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (activeChanged) { ui.tlCentered = true; centerActiveStage(true); }
+      else if (ui.tlCentered) centerActiveStage(false);
+    }));
+  }
+}
+
+function plannedOrdered() {
+  const list = (ui.state.planned || []).slice();
+  if (ui.localOrder) list.sort((a, b) => ui.localOrder.indexOf(a.id) - ui.localOrder.indexOf(b.id));
+  else list.sort((a, b) => (a.priority || 99) - (b.priority || 99));
+  return list;
+}
+function renderPlanned() {
+  const box = $('#planned'); box.innerHTML = '';
+  const list = plannedOrdered();
+  list.forEach((p, idx) => {
+    applyDefaultOpen(p.id, idx < NEAR);   // 최우선(상단=현재 인접) 기본 펼침
+    const title = `<span class="prio">${idx + 1}</span><span class="title">${esc(p.title)}</span>`;
+    // blocked 아니면 진행 가능 → 진행 버튼 항상 표시. waiting(자율 대기)는 대기↔진행 호버 swap, 그 외는 바로 진행.
+    const proceed = p.blocked ? '' : (p.waiting
+      ? '<button class="badge-wait" type="button" title="자율 대기 중 — 클릭하면 진행"><span class="wlbl">⏸ 대기</span><span class="glbl">▶ 진행</span></button>'
+      : '<button class="badge-wait go" type="button" title="진행 가능 — 클릭하면 착수">▶ 진행</button>');
+    const meta = `${projChip(p.project)}${p.blocked ? '<span class="badge-blocked">blocked</span>' : proceed}`;
+    const unblockHtml = p.blocked && p.unblock ? `<div class="unblock"><b>🔧 해제하려면</b>${fmtLines(p.unblock)}</div>` : '';
+    const c = cardEl(p.id, p.project, title, meta, unblockHtml + fmtDetail(p.detail) + attChips('planned-' + p.id, p.att));
+    // blocked 사유는 제목 줄이 좁아지지 않게 제목 바로 아래 별도 줄로 (▲▼ 덕에 세로 여유 있음)
+    if (p.blocked && p.blockReason) c.querySelector('.row').insertAdjacentElement('afterend', el('div', 'block-reason-row', `🔒 ${esc(p.blockReason)}`));
+    const wb = c.querySelector('.badge-wait');
+    if (wb) wb.onclick = (e) => {
+      e.stopPropagation();
+      if (p.proceedNote) openContextFeedback('planned', p.id, p.title, p.proceedNote);   // 추가 입력 필요 → 설명 포함 피드백 카드
+      else proceedPlanned(p.id, p.title, wb);                                            // 바로 진행 신호
+    };
+    // reorder controls
+    const rc = el('div', 'reorder');
+    const up = el('button', null, '▲'); up.title = '위로'; up.onclick = (e) => { e.stopPropagation(); move(p.id, -1); };
+    const dn = el('button', null, '▼'); dn.title = '아래로'; dn.onclick = (e) => { e.stopPropagation(); move(p.id, +1); };
+    rc.append(up, dn);
+    const fb = el('button', 'pln-fb', p.blocked ? '🔓 블록 해제 피드백' : '💬 피드백');
+    fb.title = p.blocked ? '블록 사유 확인 + 해제 상황 피드백' : '이 예정 작업에 피드백 — 검토사안에 입력 카드 추가';
+    fb.onclick = (e) => {
+      e.stopPropagation();
+      const note = p.blocked
+        ? `🔒 블록 사유: ${p.blockReason || ''}\n\n🔧 해제하려면:\n${p.unblock || ''}\n\n이 단계가 끝났거나 해제할 상황이면 알려주세요 — 진행하겠습니다.`
+        : null;
+      openContextFeedback('planned', p.id, p.title, note);
+    };
+    c.querySelector('.row').append(fb, rc);   // 피드백 버튼을 우선순위(▲▼) 왼쪽에
+    // drag
+    c.draggable = true;
+    c.addEventListener('dragstart', () => { c.classList.add('dragging'); ui._drag = p.id; });
+    c.addEventListener('dragend', () => c.classList.remove('dragging'));
+    c.addEventListener('dragover', (e) => e.preventDefault());
+    c.addEventListener('drop', (e) => { e.preventDefault(); dropOn(p.id); });
+    box.append(c);
+  });
+  if (!box.children.length) box.innerHTML = '<div class="empty">예정 항목 없음</div>';
+}
+function currentOrderIds() { return plannedOrdered().map(p => p.id); }
+function move(id, delta) {
+  const ids = currentOrderIds(); const i = ids.indexOf(id); const j = i + delta;
+  if (j < 0 || j >= ids.length) return;
+  ids.splice(j, 0, ids.splice(i, 1)[0]);
+  commitOrder(ids);
+}
+function dropOn(targetId) {
+  const ids = currentOrderIds(); const from = ids.indexOf(ui._drag); const to = ids.indexOf(targetId);
+  if (from < 0 || to < 0 || from === to) return;
+  ids.splice(to, 0, ids.splice(from, 1)[0]);
+  commitOrder(ids);
+}
+function commitOrder(ids) {
+  ui.localOrder = ids; renderPlanned();
+  postFeedback({ kind: 'reorder', tab: 'planned', order: ids, at: new Date().toISOString() });
+}
+
+// ---- decisions ----
+const decisionAtts = {};   // 결정별 첨부 (메모리 — 비영속, 전송 시 동봉)
+function decisionDraft(d) { const raw = localStorage.getItem(DRAFT_KEY(d.id)); return raw ? JSON.parse(raw) : {}; }
+// 검토 반영 후 입력 비우기 — 단 작성 중(포커스)이거나 검토 시점 내용과 현재 입력이 다르면 보존
+// 이미 전송+처리(reviewedText)된 부분만 제거하고 그 뒤 추가/변동분은 보존.
+// 전체 일치 → 전부 비움. 처리분이 입력 앞부분(prefix)이면 그만큼만 제거(나머지=새 미전송 내용).
+// prefix 가 아니면(중간 수정 등) 안전하게 보존. _removed = 제거 길이(커서 보정용). 포커스 무관 적용.
+function clearedIfReviewed(d, draft, isFocused) {
+  if (!d.reviewedAt || !draft || !draft.submittedAt) return draft;   // 처리 기준(전송됨+reviewedAt) 없으면 그대로
+  const rt = (d.reviewedText || ''), txt = (draft.text || '');
+  const sameChoice = (draft.choice || null) === (d.reviewedChoice || null);
+  if (txt === rt && sameChoice) {                                    // 전체 처리됨 → 비움
+    if (!isFocused) localStorage.removeItem(DRAFT_KEY(d.id));
+    return isFocused ? { text: '', _removed: txt.length } : {};
+  }
+  if (rt && txt.startsWith(rt)) {                                    // 처리분이 앞부분 → 제거, 나머지 보존
+    const rest = txt.slice(rt.length).replace(/^\s*\r?\n/, '');      // 경계 개행 1개 정리
+    const nd = { text: rest, choice: draft.choice, _removed: txt.length - rest.length };   // submittedAt 제거(나머지=미전송 새 내용)
+    if (!isFocused) saveDraft(d.id, { text: rest, choice: draft.choice });
+    return nd;
+  }
+  return draft;                                                      // prefix 아님 → 보존
+}
+// ---- tier-1 알림 (#3a — 설정 + 항목별 토글; 연결중 showNotification) ----
+const WS_NOTIF_KEY = 'constellation-notif-prefs';
+let wsNotifPrefs = (() => { const d = { master: false, decision: true, a2a: true, abort: true, background: false }; try { return Object.assign(d, JSON.parse(localStorage.getItem(WS_NOTIF_KEY) || '{}')); } catch { return d; } })();
+let wsNotifSeenDec = null;   // null=미초기화(첫 렌더 알림 억제 — 기존 검토요청에 안 울림)
+function wsSaveNotifPrefs() { try { localStorage.setItem(WS_NOTIF_KEY, JSON.stringify(wsNotifPrefs)); } catch {} }
+function wsNotify(kind, title, body) {
+  if (!wsNotifPrefs.master || !wsNotifPrefs[kind]) return;
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+  try { const n = new Notification(title, { body: (body || '').slice(0, 140), icon: '/icon-192.png', tag: 'constellation-' + kind }); n.onclick = () => { try { window.focus(); } catch {} n.close(); }; } catch {}
+}
+function wsNotifHint() {
+  const h = $('#notif-hint'); if (!h) return;
+  if (typeof Notification === 'undefined') { h.textContent = '이 브라우저는 알림 미지원'; return; }
+  if (!wsNotifPrefs.master) { h.textContent = '알림 꺼짐'; return; }
+  h.textContent = Notification.permission === 'granted' ? '✓ 알림 켜짐' : (Notification.permission === 'denied' ? '브라우저에서 차단됨 (사이트 설정에서 허용)' : '권한 대기 중');
+}
+// ---- tier-2 백그라운드 알림 (#3b — Web Push; 탭 닫혀도 도달. VAPID tickle 구독 → SW push 핸들러가 showNotification) ----
+function wsB64ToU8(b64url) {
+  const pad = '='.repeat((4 - (b64url.length % 4)) % 4);
+  const b64 = (b64url + pad).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(b64), arr = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+  return arr;
+}
+async function wsPushSubscribe() {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) throw new Error('이 브라우저는 Web Push 미지원');
+  const reg = await navigator.serviceWorker.ready;
+  let sub = await reg.pushManager.getSubscription();
+  if (!sub) {
+    const r = await fetch('/api/push/vapid-public-key'); const j = await r.json();
+    if (!j || !j.key) throw new Error('VAPID 공개키 응답 없음');
+    sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: wsB64ToU8(j.key) });
+  }
+  await fetch('/api/push/subscribe', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(sub) });
+  return sub;
+}
+async function wsPushUnsubscribe() {
+  if (!('serviceWorker' in navigator)) return;
+  const reg = await navigator.serviceWorker.ready;
+  const sub = await reg.pushManager.getSubscription();
+  if (sub) { try { await fetch('/api/push/unsubscribe', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ endpoint: sub.endpoint }) }); } catch {} try { await sub.unsubscribe(); } catch {} }
+}
+async function wsPushHint() {
+  const h = $('#notif-bg-hint'); if (!h) return;
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) { h.textContent = '이 브라우저는 백그라운드 알림 미지원'; return; }
+  try { const reg = await navigator.serviceWorker.ready; const sub = await reg.pushManager.getSubscription(); h.textContent = sub ? '✓ 구독됨 — 탭 닫아도 도달' : '구독 안 됨'; } catch { h.textContent = ''; }
+}
+function setupWsNotif() {
+  const btn = $('#ws-notif-btn'), panel = $('#ws-notif-panel');
+  const cbs = { master: $('#notif-master'), decision: $('#notif-decision'), a2a: $('#notif-a2a'), abort: $('#notif-abort'), background: $('#notif-background') };
+  if (!btn || !panel) return;
+  for (const k in cbs) if (cbs[k]) cbs[k].checked = !!wsNotifPrefs[k];
+  wsNotifHint();
+  wsPushHint();
+  btn.onclick = (e) => { e.stopPropagation(); panel.hidden = !panel.hidden; if (!panel.hidden) wsNotifHint(); };
+  document.addEventListener('click', (e) => { if (!panel.hidden && !e.target.closest('.ws-notif-wrap')) panel.hidden = true; });
+  if (cbs.master) cbs.master.onchange = () => {
+    wsNotifPrefs.master = cbs.master.checked; wsSaveNotifPrefs();
+    if (wsNotifPrefs.master && typeof Notification !== 'undefined' && Notification.permission === 'default') Notification.requestPermission().then(() => wsNotifHint());
+    else wsNotifHint();
+  };
+  for (const k of ['decision', 'a2a', 'abort']) if (cbs[k]) cbs[k].onchange = () => { wsNotifPrefs[k] = cbs[k].checked; wsSaveNotifPrefs(); };
+  if (cbs.background) cbs.background.onchange = async () => {
+    if (cbs.background.checked) {
+      try {
+        if (typeof Notification !== 'undefined' && Notification.permission === 'default') await Notification.requestPermission();
+        if (typeof Notification === 'undefined' || Notification.permission !== 'granted') { cbs.background.checked = false; wsNotifPrefs.background = false; wsSaveNotifPrefs(); const h = $('#notif-bg-hint'); if (h) h.textContent = '권한 필요 — 먼저 알림 허용'; return; }
+        await wsPushSubscribe(); wsNotifPrefs.background = true; wsSaveNotifPrefs();
+      } catch (e) { cbs.background.checked = false; wsNotifPrefs.background = false; wsSaveNotifPrefs(); const h = $('#notif-bg-hint'); if (h) h.textContent = '구독 실패: ' + ((e && e.message) || e); return; }
+    } else {
+      try { await wsPushUnsubscribe(); } catch {}
+      wsNotifPrefs.background = false; wsSaveNotifPrefs();
+    }
+    wsPushHint();
+  };
+}
+
+function renderDecisions() {
+  const box = $('#decisions');
+  // 재렌더가 입력을 방해하지 않도록 포커스/캐럿 보존 (decision did 또는 ad-hoc plannedId)
+  const active = document.activeElement;
+  const fc = (active && active.tagName === 'TEXTAREA') ? active.closest('.dcard') : null;
+  const focusKey = fc ? (fc.dataset.did ? 'did:' + fc.dataset.did : (fc.dataset.adhoc ? 'adhoc:' + fc.dataset.adhoc : null)) : null;
+  const focusedDid = (fc && fc.dataset.did) || null;
+  const caret = focusKey ? [active.selectionStart, active.selectionEnd] : null;
+  let focusedRemoved = 0;   // 포커스 카드에서 처리완료분 제거 길이(커서 보정)
+
+  box.innerHTML = '';
+  ui.adhoc.forEach(item => box.append(buildAdhocCard(item)));   // 예정작업 즉석 피드백 카드 (최상단)
+  const list = (ui.state.decisions || []).slice().sort((a, b) => (a.priority || 99) - (b.priority || 99));
+  try {   // tier-1 알림: 신규 미해결 검토요청 (#3a) — 첫 렌더는 억제, 이후 새 id 만
+    const _unres = list.filter(d => d.status !== 'resolved');
+    if (wsNotifSeenDec) { for (const d of _unres) if (!wsNotifSeenDec.has(d.id)) wsNotify('decision', '검토요청: ' + (d.title || d.id), d.detail || ''); }
+    wsNotifSeenDec = new Set(_unres.map(d => d.id));
+  } catch {}
+  { const _decCount = list.filter(d => d.status !== 'resolved').length + ui.adhoc.length; const _decBadge = $('#decisions-badge'); if (_decBadge) { _decBadge.textContent = _decCount; _decBadge.hidden = (_decCount === 0); } }   // 검토사안 0이면 뱃지만 숨김(탭 유지) — EstreUF parity
+
+  const buildCard = (d) => {
+    const draft = clearedIfReviewed(d, decisionDraft(d), focusedDid === d.id);
+    if (focusedDid === d.id) focusedRemoved = draft._removed || 0;
+    const card = el('div', 'dcard' + dimClass(d.project));
+    card.dataset.did = d.id;
+    const reviewed = d.reviewedAt ? `<span class="dreviewed-at" data-at="${esc(d.reviewedAt)}">${esc(fmtDateTime(d.reviewedAt))} <span class="rel">(${esc(relTime(d.reviewedAt))})</span></span><span class="dreviewed" title="검토 시점 ${esc(new Date(d.reviewedAt).toLocaleString('ko-KR'))}">✓ 최근 피드백 반영됨</span>` : '';
+    // detail = 텍스트 필드 → esc (done/planned 의 detail 과 동일 정책; 검토사안만 raw 였던
+    // 비대칭 해소). 의도적 시각화는 previewHtml/previewUrl 슬롯으로 분리 — operator-작성
+    // viz 채널이라 raw 유지하되, 검토사안 등재 권한 자체가 신뢰 경계.
+    card.innerHTML = `<div class="row"><span class="q">${esc(d.question)}</span> ${projChip(d.project)}${reviewed}</div>
+      <div class="ddetail md-body">${mdFull(d.detail || '')}</div>
+      ${d.status !== 'resolved' ? `<button type="button" class="dfallback" title="이 브리핑을 한 단계 더 쉬운 말로 다시 써달라고 요청해요">${esc((d.fallback && d.fallback.label) || '🙋 더 쉽게 설명해줘')}</button>` : ''}
+      ${d.previewUrl ? `<iframe src="${esc(wsSafeUrl(d.previewUrl))}" sandbox loading="lazy"></iframe>` : ''}
+      ${d.previewHtml ? `<div class="dviz">${d.previewHtml}</div>` : ''}${attChips('decision-' + d.id, d.att)}`;
+    requestAnimationFrame(() => mdMount(card));   // v2.4.135 — 브리핑 안의 다이어그램 (삽입 후에만 치수를 잴 수 있어요)
+    const fbBtn = card.querySelector('.dfallback');
+    if (fbBtn) fbBtn.onclick = async () => {
+      fbBtn.disabled = true;
+      const ok = await postFeedback({ kind: 'fallback-rerender', id: d.id, question: d.question || d.title || '', label: fbBtn.textContent, at: new Date().toISOString() });
+      fbBtn.textContent = ok ? '요청 전송됨 — 더 쉬운 설명으로 갱신 예정' : '전송 실패 — 잠시 후 다시';
+      if (!ok) fbBtn.disabled = false;
+    };
+    if (d.kind === 'choice') {
+      const ch = el('div', 'choices');
+      (d.options || []).forEach(opt => {
+        const b = el('button', 'choice' + (draft.choice === opt ? ' picked' : ''), esc(opt));
+        b.onclick = () => { draft.choice = opt; saveDraft(d.id, draft); renderDecisions(); };
+        ch.append(b);
+      });
+      card.append(ch);
+    }
+    const ta = el('textarea'); ta.placeholder = '메모/입력 (선택) · 이미지·파일 붙여넣기/드롭 가능'; ta.value = draft.text || '';
+    ta.addEventListener('input', () => { draft.text = ta.value; saveDraft(d.id, draft); });
+    card.append(ta);
+    const attList = el('div', 'att-list'); attList.hidden = true; card.append(attList);
+    const fileInput = el('input'); fileInput.type = 'file'; fileInput.multiple = true; fileInput.hidden = true; card.append(fileInput);
+    const atts = decisionAtts[d.id] || (decisionAtts[d.id] = []);
+    const bar = el('div', 'dsubmit');
+    const btn = el('button', null, draft.submittedAt ? '다시 전송' : '피드백 전송');
+    const attBtn = el('button', 'attach-btn', '📎 첨부'); attBtn.type = 'button';
+    btn.onclick = async () => {
+      const n = atts.length;
+      const ok = await postFeedback({ kind: 'decision', id: d.id, question: d.question, choice: draft.choice || null, text: draft.text || '', atts: atts.slice(), at: new Date().toISOString() });
+      draft.submittedAt = new Date().toISOString(); saveDraft(d.id, draft);
+      if (ok) atts.length = 0;
+      renderDecisions();
+      bar.querySelector('.saved').textContent = ok ? `전송됨${n ? ` (첨부 ${n})` : ''} — 검토 전까지 수정 가능` : '전송 실패(재시도)';
+    };
+    attachable({ dropEl: card, textarea: ta, fileBtn: attBtn, fileInput, listEl: attList, atts, persist: () => {} });
+    autoGrow(ta);
+    onCtrlEnter(ta, () => btn.click());
+    const saved = el('span', 'saved', draft.submittedAt
+      ? `전송됨 ${new Date(draft.submittedAt).toLocaleString('ko-KR')} — 검토 전까지 수정 가능`
+      : (d.reviewedAt && !draft.text && !draft.choice ? '↑ 이전 피드백 반영됨 · 새 입력 가능' : (draft.choice || draft.text ? '초안 저장됨(미전송)' : '')));
+    bar.append(btn, attBtn, saved);
+    // 권고/권장이 정해진 사안 → 맨 우측 "권고대로 진행" 버튼 (코멘트 없어도 진행, 있으면 함께 전송)
+    if (d.recommend && d.status !== 'resolved') {
+      const rec = el('button', 'rec-btn', '✓ 권고대로 진행');
+      rec.type = 'button'; rec.title = '권고: ' + d.recommend;
+      rec.onclick = async () => {
+        const n = atts.length;
+        const ok = await postFeedback({ kind: 'decision', id: d.id, question: d.question, choice: d.recommendChoice || draft.choice || null, text: draft.text || '', accept: 'recommended', atts: atts.slice(), at: new Date().toISOString() });
+        draft.submittedAt = new Date().toISOString(); saveDraft(d.id, draft);
+        if (ok) atts.length = 0;
+        renderDecisions();
+        const sv = document.querySelector(`.dcard[data-did="${(window.CSS && CSS.escape) ? CSS.escape(d.id) : d.id}"] .saved`);
+        if (sv) sv.textContent = ok ? `✓ 권고대로 진행 요청됨${n ? ` (첨부 ${n})` : ''} — 검토 전까지 수정 가능` : '전송 실패(재시도)';
+      };
+      bar.append(rec);
+    }
+    card.append(bar);
+    box.append(card);
+  };
+  // 진행 중(open)은 펼쳐 표시, 완료(resolved/closed)는 종결 처리해 접어 둠 — 토글로 펼침
+  const isClosed = d => d.status === 'resolved' || d.status === 'closed';
+  list.filter(d => !isClosed(d)).forEach(buildCard);
+  const closedList = list.filter(isClosed);
+  if (closedList.length) {
+    const tg = el('button', 'closed-toggle'); tg.type = 'button';
+    tg.textContent = `✓ 종결된 검토사안 ${closedList.length}건 ${ui.showClosed ? '▾ 접기' : '▸ 보기'}`;
+    tg.onclick = () => { ui.showClosed = !ui.showClosed; renderDecisions(); };
+    box.append(tg);
+    if (ui.showClosed) closedList.forEach(buildCard);
+  }
+  if (!box.children.length) box.innerHTML = '<div class="empty">검토 사안 없음</div>';
+
+  // 포커스/캐럿 복원 (decision/ad-hoc 공통)
+  if (focusKey) {
+    const i = focusKey.indexOf(':'), kind = focusKey.slice(0, i), val = focusKey.slice(i + 1);
+    const attr = kind === 'did' ? 'data-did' : 'data-adhoc';
+    const ta = box.querySelector(`.dcard[${attr}="${(window.CSS && CSS.escape) ? CSS.escape(val) : val}"] textarea`);
+    if (ta) {
+      ta.focus();
+      if (caret) {
+        const rm = kind === 'did' ? focusedRemoved : 0;   // 처리완료분 제거 길이만큼 커서 앞당김
+        const s = Math.max(0, Math.min(caret[0] - rm, ta.value.length)), e = Math.max(0, Math.min(caret[1] - rm, ta.value.length));
+        try { ta.setSelectionRange(s, e); } catch {}
+      }
+    }
+  }
+}
+// 항목 컨텍스트 즉석 피드백 카드 (ui.adhoc 항목) — 완료/현재/예정 공통
+const CTX_LABEL = { planned: '예정 작업', done: '완료 내역', current: '현재 작업' };
+function buildAdhocCard(item) {
+  item.atts = item.atts || [];
+  const label = CTX_LABEL[item.ctx] || '항목';
+  const card = el('div', 'dcard dadhoc');
+  card.dataset.adhoc = item.refId;
+  const detailHtml = item.note
+    ? `<div class="ddetail adhoc-note"><b>진행하려면 다음이 필요합니다</b>${fmtLines(item.note)}</div>`
+    : `<div class="ddetail">이 ${esc(label)} 항목에 대한 의견·요청 — 에이전트가 검토합니다.</div>`;
+  card.innerHTML = `<div class="row"><span class="q">💬 ${esc(label)} 피드백</span> <span class="adhoc-target">${esc(item.title)}</span><button class="adhoc-close" type="button" title="닫기" aria-label="닫기">✕</button></div>
+    ${detailHtml}`;
+  card.querySelector('.adhoc-close').onclick = () => { ui.adhoc = ui.adhoc.filter(a => a !== item); renderDecisions(); };
+  const ta = el('textarea'); ta.placeholder = '이 항목에 대한 의견·요청 입력… (이미지·파일 첨부, Ctrl+Enter 전송)'; ta.value = item.text || '';
+  ta.addEventListener('input', () => { item.text = ta.value; });
+  card.append(ta);
+  const attList = el('div', 'att-list'); attList.hidden = true; card.append(attList);
+  const fileInput = el('input'); fileInput.type = 'file'; fileInput.multiple = true; fileInput.hidden = true; card.append(fileInput);
+  const bar = el('div', 'dsubmit');
+  const btn = el('button', null, '피드백 전송');
+  const attBtn = el('button', 'attach-btn', '📎 첨부'); attBtn.type = 'button';
+  const saved = el('span', 'saved', '');
+  btn.onclick = async () => {
+    const n = item.atts.length;
+    const ok = await postFeedback({ kind: 'context-feedback', ctx: item.ctx, refId: item.refId, title: item.title, text: item.text || '', atts: item.atts.slice(), at: new Date().toISOString() });
+    saved.textContent = ok ? `전송됨${n ? ` (첨부 ${n})` : ''} — 검토 예정` : '전송 실패(재시도)';
+    if (ok) { ui.adhoc = ui.adhoc.filter(a => a !== item); setTimeout(renderDecisions, 700); }
+  };
+  bar.append(btn, attBtn, saved);
+  card.append(bar);
+  attachable({ dropEl: card, textarea: ta, fileBtn: attBtn, fileInput, listEl: attList, atts: item.atts, persist: () => {} });
+  autoGrow(ta); onCtrlEnter(ta, () => btn.click());
+  return card;
+}
+function openContextFeedback(ctx, refId, title, note) {
+  if (!ui.panes.includes('decisions')) {                                  // 검토사안 보이게
+    if (ui.panes.length === 2 || innerWidth >= WIDE_W) setPanes('decisions', true); else setPanes('decisions', false);
+  }
+  const ex = ui.adhoc.find(a => a.ctx === ctx && a.refId === refId);
+  if (ex) { if (note) ex.note = note; } else ui.adhoc.unshift({ ctx, refId, title, text: '', atts: [], note: note || '' });
+  renderDecisions();
+  requestAnimationFrame(() => {
+    const sel = `.dcard[data-adhoc="${(window.CSS && CSS.escape) ? CSS.escape(refId) : refId}"]`;
+    const card = document.querySelector(sel);
+    if (card) { card.scrollIntoView({ behavior: 'smooth', block: 'center' }); const ta = card.querySelector('textarea'); if (ta) ta.focus(); }
+  });
+}
+// 대기 항목 바로 진행 신호 (추가 입력 불필요한 경우)
+async function proceedPlanned(pid, title, btn) {
+  if (btn) { btn.disabled = true; }
+  const ok = await postFeedback({ kind: 'proceed', plannedId: pid, title, at: new Date().toISOString() });
+  if (btn) { btn.classList.toggle('requested', ok); btn.innerHTML = ok ? '✓ 진행 요청됨' : '전송 실패(재시도)'; if (!ok) btn.disabled = false; }
+}
+function saveDraft(id, draft) { localStorage.setItem(DRAFT_KEY(id), JSON.stringify(draft)); }
+
+// ---- 자유 추가 요청 (검토사안 최상단) — 에이전트 채팅 프롬프트와 동일 처리 ----
+const FREE_KEY = 'constellation-free-req';
+function renderFreeRequest() {
+  const ta = $('#free-req'); if (!ta) return;
+  const fr = (ui.state && ui.state.freeRequest) || {};
+  let draft; try { draft = JSON.parse(localStorage.getItem(FREE_KEY) || '{}'); } catch { draft = {}; }
+  const focused = document.activeElement === ta;
+  const caretS = focused ? ta.selectionStart : null, caretE = focused ? ta.selectionEnd : null;
+  // 처리완료(reviewedText)분만 제거하고 추가/변동분은 보존. 전체 일치 → 비움 / prefix → 그만큼만.
+  let removed = 0;
+  if (fr.reviewedAt && draft.submittedAt) {
+    const rt = fr.reviewedText || '', txt = draft.text || '';
+    if (txt === rt) { localStorage.removeItem(FREE_KEY); draft = {}; removed = txt.length; }
+    else if (rt && txt.startsWith(rt)) {
+      const rest = txt.slice(rt.length).replace(/^\s*\r?\n/, '');
+      removed = txt.length - rest.length;
+      draft = { text: rest }; localStorage.setItem(FREE_KEY, JSON.stringify(draft));   // 나머지=미전송 새 내용
+    }
+  }
+  const newVal = draft.text || '';
+  if (ta.value !== newVal) { ta.value = newVal; if (ta._fit) ta._fit(); }
+  if (focused && caretS != null) {
+    const s = Math.max(0, Math.min(caretS - removed, ta.value.length)), e = Math.max(0, Math.min(caretE - removed, ta.value.length));
+    try { ta.setSelectionRange(s, e); } catch {}
+  }
+  const saved = $('#free-req-saved');
+  if (saved) saved.textContent = draft.submittedAt
+    ? `전송됨 ${new Date(draft.submittedAt).toLocaleString('ko-KR')} — 검토 전까지 수정 가능`
+    : (fr.reviewedAt && !draft.text ? '↑ 이전 요청 반영됨 · 새 요청 가능' : '');
+}
+const freeAtts = [];   // 자유요청 첨부 (메모리 — data URL 은 localStorage quota 회피 위해 비영속)
+function setupFreeRequest() {
+  const ta = $('#free-req'), btn = $('#free-req-send'); if (!ta || !btn) return;
+  ta.addEventListener('input', () => { let d; try { d = JSON.parse(localStorage.getItem(FREE_KEY) || '{}'); } catch { d = {}; } d.text = ta.value; localStorage.setItem(FREE_KEY, JSON.stringify(d)); });
+  attachable({ dropEl: $('#free-req-card'), textarea: ta, fileBtn: $('#free-req-attach'), fileInput: $('#free-req-file'), listEl: $('#free-req-atts'), atts: freeAtts, persist: () => {} });
+  ta._fit = autoGrow(ta);
+  onCtrlEnter(ta, () => btn.click());
+  btn.onclick = async () => {
+    let d; try { d = JSON.parse(localStorage.getItem(FREE_KEY) || '{}'); } catch { d = {}; }
+    d.text = ta.value; d.submittedAt = new Date().toISOString(); localStorage.setItem(FREE_KEY, JSON.stringify(d));
+    const n = freeAtts.length;
+    const ok = await postFeedback({ kind: 'request', id: 'free-request', text: ta.value, atts: freeAtts.slice(), at: new Date().toISOString() });
+    if (ok) { freeAtts.length = 0; renderComposeAtts($('#free-req-atts'), freeAtts, () => {}); }
+    renderFreeRequest();
+    if ($('#free-req-saved')) $('#free-req-saved').textContent = ok ? `전송됨${n ? ` (첨부 ${n})` : ''} — 검토 전까지 수정 가능` : '전송 실패(재시도)';
+  };
+}
+
+// ---- 첨부 (코드/mermaid/html/img/link) — 칩 → 팝업 다이얼로그 → 별 탭 ----
+// 항목 att: [{ t:'code'|'mermaid'|'html'|'img'|'link', title, body?, src?, lang? }]
+function attChips(key, atts) {
+  if (!atts || !atts.length) return '';
+  const icon = { code: '𝄜', mermaid: '◈', html: '▤', img: '🖼', link: '🔗' };
+  return '<div class="att-row">' + atts.map((a, i) =>
+    `<button class="att-chip" type="button" data-att="${esc(key)}:${i}">${icon[a.t] || '📎'} ${esc(a.title || a.t)}</button>`).join('') + '</div>';
+}
+function findAtt(key) {
+  const ci = key.lastIndexOf(':'); const item = key.slice(0, ci); const idx = +key.slice(ci + 1);
+  let atts = null;
+  if (item.startsWith('done-')) { const d = (ui.state.done || [])[+item.slice(5)]; atts = d && d.att; }
+  else if (item.startsWith('planned-')) { const p = (ui.state.planned || []).find(x => x.id === item.slice(8)); atts = p && p.att; }
+  else if (item.startsWith('decision-')) { const d = (ui.state.decisions || []).find(x => x.id === item.slice(9)); atts = d && d.att; }
+  else if (item === 'current') atts = ui.state.current && ui.state.current.att;
+  return atts ? atts[idx] : null;
+}
+let _mermaid;
+async function ensureMermaid() {
+  if (_mermaid) return _mermaid;
+  const mod = await import('https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs');
+  _mermaid = mod.default;
+  _mermaid.initialize({ startOnLoad: false, theme: document.documentElement.getAttribute('data-theme') === 'light' ? 'default' : 'dark' });
+  return _mermaid;
+}
+async function openAttachment(a) {
+  const dlg = $('#att-dialog'), body = $('#att-body'); if (!dlg) return;
+  $('#att-title').textContent = a.title || a.t;
+  dlg._att = a;
+  // 먼저 연다 — mermaid/dagre 는 보이는(레이아웃 가능한) 컨테이너에서만 노드 치수를 잰다.
+  // 닫힌 <dialog>(display:none)에서 run 하면 getBBox=NaN → translate(undefined,NaN) 빈 SVG.
+  if (dlg.showModal) { if (!dlg.open) dlg.showModal(); } else dlg.setAttribute('open', '');
+  if (a.t === 'code') body.innerHTML = `<pre class="att-code"><code>${esc(a.body)}</code></pre>`;
+  else if (a.t === 'mermaid') {
+    body.innerHTML = '<div class="mermaid"></div>'; body.querySelector('.mermaid').textContent = a.body;   // v2.4.12 보안: raw body 를 textContent 로 주입 (innerHTML 시 <img onerror>/<script> 가 mermaid 파싱 전 same-origin 실행). mermaid.run 은 element textContent 를 다이어그램 소스로 읽으므로 동작 동일
+    try { const m = await ensureMermaid(); await m.run({ nodes: body.querySelectorAll('.mermaid') }); }
+    catch (e) { body.innerHTML = `<pre class="att-code">${esc(a.body)}</pre><div class="empty">mermaid 렌더 실패: ${esc(String(e && e.message || e))}</div>`; }
+  }
+  else if (a.t === 'html') body.innerHTML = `<iframe class="att-frame" sandbox srcdoc="${esc(a.body)}"></iframe>`;   // v2.4.12 보안: sandbox(빈 값=스크립트·동일출처 차단) — 첨부 HTML 의 same-origin JS 실행 방지 (peer 가 A2A 로 보낸 첨부 stored-XSS 차단)
+  else if (a.t === 'img') body.innerHTML = `<img class="att-img" src="${esc(a.src)}" alt="${esc(a.title || a.name || '')}">`;
+  else if (a.t === 'link') body.innerHTML = `<iframe class="att-frame" sandbox src="${esc(wsSafeUrl(a.src))}"></iframe>`;   // v2.4.12 sandbox 정적 프리뷰 + v2.4.33 스킴 allowlist (javascript:/data:text/html 차단)
+  else if (a.t === 'file') body.innerHTML = `<div class="att-fileinfo">📄 ${esc(a.name || a.title || '파일')}<div class="empty">미리보기 미지원 형식 — '새 탭'으로 열어 확인하세요${a.mime ? ` (${esc(a.mime)})` : ''}.</div></div>`;
+}
+function attNewTab(a) {
+  let url;
+  if (a.t === 'img' || a.t === 'link' || a.t === 'file') url = wsSafeUrl(a.src);   // v2.4.33 스킴 allowlist — window.open(javascript:/data:text/html) same-origin 실행 차단
+  else {
+    let doc;
+    if (a.t === 'code') doc = `<!doctype html><meta charset="utf-8"><title>${esc(a.title || 'code')}</title><style>body{margin:0;background:#0f1115;color:#e7e9ea;font:13px/1.5 ui-monospace,monospace}pre{padding:18px;white-space:pre-wrap;word-break:break-word}</style><pre>${esc(a.body)}</pre>`;
+    else if (a.t === 'mermaid') doc = `<!doctype html><meta charset="utf-8"><title>${esc(a.title || 'diagram')}</title><body style="margin:0;background:#0f1115;display:flex;justify-content:center;padding:24px"><pre class="mermaid">${esc(a.body)}</pre><script type="module">import m from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';m.initialize({startOnLoad:true,theme:'dark'});<\/script>`;   // v2.4.33 보안: esc(a.body) — raw 시 새탭 blob same-origin XSS (mermaid 는 textContent 디코딩본을 읽어 렌더 동일)
+    else doc = `<!doctype html><meta charset="utf-8"><body style="margin:0"><iframe sandbox srcdoc="${esc(a.body || '')}" style="border:0;width:100vw;height:100vh"></iframe>`;   // v2.4.33 보안: html 첨부 새탭도 sandbox iframe (raw blob same-origin XSS 차단; in-dialog 와 동일 정책)
+    url = URL.createObjectURL(new Blob([doc], { type: 'text/html' }));
+  }
+  window.open(url, '_blank', 'noopener');
+}
+function setupAttachments() {
+  document.addEventListener('click', (e) => {
+    const chip = e.target.closest('.att-chip'); if (!chip) return;
+    const a = findAtt(chip.dataset.att); if (a) openAttachment(a);
+  });
+  const dlg = $('#att-dialog'); if (!dlg) return;
+  if ($('#att-close')) $('#att-close').onclick = () => dlg.close();
+  if ($('#att-newtab')) $('#att-newtab').onclick = () => dlg._att && attNewTab(dlg._att);
+  dlg.addEventListener('click', (e) => {   // backdrop 클릭 닫기
+    const r = dlg.getBoundingClientRect();
+    if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) dlg.close();
+  });
+}
+
+// ---- 요청 입력 첨부 (클립보드 붙여넣기 · 첨부 버튼 · 드래그앤드롭) — 모든 요청 입력란 공용 ----
+// 첨부 모델: img{src dataURL} · code{body,lang,title} · file{src dataURL,name,mime}. 전송 시 atts[] 로 동봉.
+const MAX_ATT_BYTES = 12 * 1024 * 1024;   // 단일 첨부 상한 (로컬 신뢰 입력)
+const TEXT_RE = /\.(eux|md|markdown|txt|log|js|mjs|cjs|ts|tsx|jsx|json|jsonc|css|scss|html|htm|svg|xml|yml|yaml|toml|ini|sh|bash|zsh|py|rb|go|rs|java|kt|c|h|cpp|cs|php|sql|csv)$/i;
+function fmtBytes(n) { return n < 1024 ? n + 'B' : n < 1048576 ? (n / 1024).toFixed(0) + 'KB' : (n / 1048576).toFixed(1) + 'MB'; }
+function readFileAsAtt(file) {
+  return new Promise((resolve) => {
+    if (file.size > MAX_ATT_BYTES) return resolve({ error: `${file.name}: 너무 큼 (${fmtBytes(file.size)} > ${fmtBytes(MAX_ATT_BYTES)})` });
+    const r = new FileReader();
+    const isImg = /^image\//.test(file.type);
+    const isText = /^text\//.test(file.type) || TEXT_RE.test(file.name) || (!file.type && file.size < 256 * 1024);
+    if (isImg) { r.onload = () => resolve({ t: 'img', name: file.name, mime: file.type, src: r.result, size: file.size }); r.readAsDataURL(file); }
+    else if (isText) { r.onload = () => resolve({ t: 'code', title: file.name, lang: (file.name.split('.').pop() || '').toLowerCase(), body: r.result, size: file.size }); r.readAsText(file); }
+    else { r.onload = () => resolve({ t: 'file', name: file.name, mime: file.type || 'application/octet-stream', src: r.result, size: file.size }); r.readAsDataURL(file); }
+    r.onerror = () => resolve({ error: `${file.name}: 읽기 실패` });
+  });
+}
+async function addFilesToAtts(files, atts) {
+  const errs = [];
+  for (const f of files) { if (!f) continue; const a = await readFileAsAtt(f); if (a.error) errs.push(a.error); else atts.push(a); }
+  return errs;
+}
+function renderComposeAtts(listEl, atts, onChange, errs) {
+  if (!listEl) return;
+  const icon = { code: '𝄜', img: '🖼', file: '📄', mermaid: '◈', html: '▤', link: '🔗' };
+  const errHtml = (errs && errs.length) ? `<span class="att-err">${esc(errs.join(' · '))}</span>` : '';
+  if (!atts.length) { listEl.innerHTML = errHtml; listEl.hidden = !errHtml; return; }
+  listEl.hidden = false;
+  listEl.innerHTML = atts.map((a, i) =>
+    `<span class="att-pill" data-i="${i}" title="클릭하면 미리보기">${icon[a.t] || '📎'} <span class="att-name">${esc(a.title || a.name || a.t)}</span>${a.size ? ` <span class="att-sz">${fmtBytes(a.size)}</span>` : ''}<button class="att-rm" type="button" data-rm="${i}" aria-label="제거">✕</button></span>`).join('') + errHtml;
+  listEl.querySelectorAll('.att-rm').forEach(b => b.onclick = (e) => { e.stopPropagation(); atts.splice(+b.dataset.rm, 1); onChange(); });
+  listEl.querySelectorAll('.att-pill').forEach(p => p.onclick = () => { const a = atts[+p.dataset.i]; if (a) openAttachment(a); });
+}
+// textarea/카드에 붙여넣기·드롭·버튼 첨부를 연결. atts 배열을 in-place 변경, persist 로 저장.
+function attachable({ dropEl, textarea, fileBtn, fileInput, listEl, atts, persist }) {
+  const refresh = (errs) => { renderComposeAtts(listEl, atts, () => { persist(); refresh(); }, errs); };
+  refresh();
+  if (textarea) textarea.addEventListener('paste', async (e) => {
+    const files = [...(e.clipboardData?.items || [])].filter(it => it.kind === 'file').map(it => it.getAsFile()).filter(Boolean);
+    if (!files.length) return;                       // 텍스트 붙여넣기는 기본 동작 유지
+    e.preventDefault();
+    const errs = await addFilesToAtts(files, atts); persist(); refresh(errs);
+  });
+  if (fileBtn && fileInput) {
+    fileBtn.onclick = () => fileInput.click();
+    fileInput.onchange = async () => { const errs = await addFilesToAtts([...fileInput.files], atts); fileInput.value = ''; persist(); refresh(errs); };
+  }
+  if (dropEl) {
+    const hot = (on) => dropEl.classList.toggle('drop-hot', on);
+    ['dragenter', 'dragover'].forEach(ev => dropEl.addEventListener(ev, (e) => { if ([...(e.dataTransfer?.types || [])].includes('Files')) { e.preventDefault(); hot(true); } }));
+    ['dragleave', 'dragend'].forEach(ev => dropEl.addEventListener(ev, (e) => { if (!dropEl.contains(e.relatedTarget)) hot(false); }));
+    dropEl.addEventListener('drop', async (e) => { if (!e.dataTransfer?.files?.length) return; e.preventDefault(); hot(false); const errs = await addFilesToAtts([...e.dataTransfer.files], atts); persist(); refresh(errs); });
+  }
+}
+
+// ---- 입력란 공용: auto-grow(내용만큼 확장) + Ctrl+Enter 전송 + 상대시간 ----
+// v2.4.133 — 높이 맞춤은 «쓰기→읽기→쓰기» 라 한 번에 전체 레이아웃을 두 번 강제해요. 입력마다 동기로 돌리면
+//   글자당 그 값을 물어요(실측 ~185ms/키, 한글은 자모마다 input 이라 3배). 프레임당 1회로 합쳐요 — 타자는
+//   프레임보다 빠를 수 없으니 보이는 결과는 같고, 비용만 사라져요. 레이아웃 비용 자체는 style.css 의
+//   content-visibility 가 줄여요(둘은 서로를 대신하지 않아요: 여기는 횟수, 저기는 단가).
+function autoGrow(ta) {
+  let queued = false;
+  const apply = () => { queued = false; ta.style.height = 'auto'; ta.style.height = ta.scrollHeight + 'px'; };
+  const fit = () => { if (queued) return; queued = true; requestAnimationFrame(apply); };
+  ta.style.overflowY = 'hidden';
+  ta.addEventListener('input', fit);
+  requestAnimationFrame(apply);   // DOM 삽입·값 복원 후 초기 맞춤
+  return fit;
+}
+function onCtrlEnter(ta, fn) {
+  ta.addEventListener('keydown', (e) => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); fn(); } });
+}
+function fmtDateTime(iso) { try { return new Date(iso).toLocaleString('ko-KR', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }); } catch { return ''; } }
+function relTime(iso) {
+  const s = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (s < 0) return '방금';
+  if (s < 60) return '방금 전';
+  if (s < 3600) return Math.floor(s / 60) + '분 전';
+  if (s < 86400) return Math.floor(s / 3600) + '시간 전';
+  if (s < 2592000) return Math.floor(s / 86400) + '일 전';
+  return Math.floor(s / 2592000) + '개월 전';
+}
+
+// ---- theme (자동 / 라이트 / 다크) ----
+const THEME_KEY = 'constellation-theme-pref';
+const themeMql = matchMedia('(prefers-color-scheme: dark)');
+const SUN_SVG = `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4.3"/><path d="M12 2v2.2M12 19.8V22M2 12h2.2M19.8 12H22M4.9 4.9l1.6 1.6M17.5 17.5l1.6 1.6M19.1 4.9l-1.6 1.6M6.5 17.5l-1.6 1.6"/></svg>`;
+const MOON_SVG = `<svg viewBox="0 0 24 24" width="19" height="19" fill="currentColor" stroke="none"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>`;
+const AUTO_SVG = `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"/></svg>`;
+function themePref() { return localStorage.getItem(THEME_KEY) || 'auto'; }
+function resolveTheme(pref) { return pref === 'auto' ? (themeMql.matches ? 'dark' : 'light') : pref; }
+function applyTheme() {
+  const pref = themePref();
+  document.documentElement.setAttribute('data-theme', resolveTheme(pref));
+  const b = $('#theme-btn');
+  if (b) {
+    const icon = { auto: AUTO_SVG, light: SUN_SVG, dark: MOON_SVG }[pref];
+    const label = { auto: '자동(시스템)', light: '라이트', dark: '다크' }[pref];
+    b.innerHTML = icon;
+    b.title = `테마: ${label} (클릭하여 전환)`;
+  }
+}
+function cycleTheme() {
+  const order = ['auto', 'light', 'dark'];
+  localStorage.setItem(THEME_KEY, order[(order.indexOf(themePref()) + 1) % order.length]);
+  applyTheme();
+}
+themeMql.addEventListener('change', () => { if (themePref() === 'auto') applyTheme(); });
+$('#theme-btn').onclick = cycleTheme;
+applyTheme();
+
+// ---- tabs / 분할 뷰 (대시보드 ⇆ 검토사안) ----
+const PANES_KEY = 'constellation-panes', SPLIT_FRAC_KEY = 'constellation-split-frac', SPLIT_FIXED_KEY = 'constellation-split-fixed';
+const PANE_W_KEY = 'constellation-pane-weights';
+const WIDE_W = 1600;   // 이 폭 이상이면 자동 분할
+// v2.4.134 — 분할은 이제 **임의 조합 N단**이에요. 화면 배치는 탭 순서를 따라요: 어떤 순서로 켰든 왼쪽부터
+//   이 순서로 서요. 켠 순서대로 세우면 같은 집합이 매번 다른 자리에 서서 근육기억이 안 생겨요.
+const PANE_ORDER = ['dashboard', 'decisions', 'org', 'wiki'];
+const PANES_MAX = 4;
+function loadPanes() {
+  try { const p = JSON.parse(localStorage.getItem(PANES_KEY)); if (Array.isArray(p) && p.length) { const f = p.filter(x => PANE_ORDER.includes(x)); if (f.length) return [...new Set(f)].slice(0, PANES_MAX); } } catch {}
+  return innerWidth >= WIDE_W ? ['dashboard', 'decisions'] : ['dashboard'];
+}
+// pane 별 가중치(fr). 2단의 splitFrac/splitFixed 는 그대로 두고(기존 손잡이 계약 유지), 3단 이상에서만 이 표를 써요.
+function loadPaneW() { try { const w = JSON.parse(localStorage.getItem(PANE_W_KEY)); if (w && typeof w === 'object') return w; } catch {} return {}; }
+function savePaneW() { localStorage.setItem(PANE_W_KEY, JSON.stringify(ui.paneW)); }
+function paneWeight(name) { const v = Number(ui.paneW[name]); return (v > 0.15 && v < 8) ? v : 1; }
+function savePanes() { localStorage.setItem(PANES_KEY, JSON.stringify(ui.panes)); }
+ui.paneW = loadPaneW();
+function loadSplitFrac() { const v = parseFloat(localStorage.getItem(SPLIT_FRAC_KEY)); return (v >= 0.2 && v <= 0.8) ? v : 0.5; }
+function loadSplitFixed() { try { const f = JSON.parse(localStorage.getItem(SPLIT_FIXED_KEY)); if (f && (f.side === 'left' || f.side === 'right') && f.px > 120) return f; } catch {} return null; }
+function applySplitSizing() {
+  const main = $('main'), n = ui.panes.length;
+  if (n <= 1) { requestAnimationFrame(positionHomeFabs); return; }
+  if (n === 2) {                                    // 2단은 종전 계약 그대로 (비율 + 고정폭 핀)
+    const fx = ui.splitFixed;
+    if (fx) main.style.setProperty('--split-cols', fx.side === 'left' ? `${fx.px}px 12px minmax(0,1fr)` : `minmax(0,1fr) 12px ${fx.px}px`);
+    else { const f = ui.splitFrac; main.style.setProperty('--split-cols', `${f}fr 12px ${1 - f}fr`); }
+  } else {                                          // 3단 이상 — pane 별 가중치
+    main.style.setProperty('--split-cols', ui.panes.map(p => `minmax(0,${paneWeight(p)}fr)`).join(' 12px '));
+  }
+  requestAnimationFrame(positionHomeFabs);
+}
+// v2.4.134 — 분리선은 이제 **활성 pane 사이마다** 하나씩이에요(N-1개). 정적 #pane-divider 를 첫 자리에 쓰고,
+//   모자라면 같은 모양의 사본을 만들어 DOM 순서상 그 자리에 끼워요. 이벤트는 main 위임이라 사본도 그대로 작동해요.
+function layoutDividers() {
+  const main = $('main'), panes = ui.panes;
+  const dividers = [...main.querySelectorAll('.pane-divider')];
+  const need = Math.max(0, panes.length - 1);
+  while (dividers.length < need) {                                   // 사본 생성 (정적 1개 + 동적 N-2)
+    const d = $('#pane-divider').cloneNode(true);
+    d.removeAttribute('id'); d.dataset.dyn = '1';
+    d.querySelectorAll('.pin-handle').forEach(h => h.remove());       // 고정폭 핀은 2단 전용 (그 자리에만 의미가 있어요)
+    main.appendChild(d); dividers.push(d);
+  }
+  dividers.forEach((d, i) => {
+    if (i >= need) {                                                  // 남는 분리선: 사본은 없애고 정적 원본은 숨겨요
+      if (d.dataset.dyn) d.remove(); else d.hidden = true;
+      return;
+    }
+    d.hidden = false;
+    d.dataset.l = panes[i]; d.dataset.r = panes[i + 1];
+    const rightPane = document.getElementById('tab-' + panes[i + 1]);
+    if (rightPane) main.insertBefore(d, rightPane);                   // 그리드 배치 = DOM 순서
+  });
+  return [...main.querySelectorAll('.pane-divider')].filter((d) => !d.hidden);
+}
+function applyPanes() {
+  const split = ui.panes.length >= 2, main = $('main');
+  main.classList.toggle('split', split);
+  main.classList.toggle('split-multi', ui.panes.length > 2);
+  document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', ui.panes.includes(b.dataset.tab)));
+  document.querySelectorAll('.tabpane').forEach(p => p.classList.toggle('active', ui.panes.includes(p.id.replace('tab-', ''))));
+  if (typeof syncMobileTabbar === 'function') syncMobileTabbar();   // 하단 탭바 active 동기 (모바일)
+  layoutDividers();
+  const twoPane = ui.panes.length === 2;
+  document.querySelectorAll('.pin-handle').forEach(h => h.hidden = !twoPane);   // 고정폭 핀 = 2단 전용
+  if (split) { applySplitSizing(); updatePinHandles(); }
+  const hb = $('#home-btn'), hd = $('#home-btn-dec');
+  if (hb) hb.hidden = !ui.panes.includes('dashboard');
+  if (hd) hd.hidden = !ui.panes.includes('decisions');
+  positionHomeFabs();
+  ui.tab = ui.panes[ui.panes.length - 1];   // 호환 (마지막 = 주 탭)
+  // 분할 토글로 대시보드 pane 폭이 바뀌므로(창 resize 아님) 홈·타임라인 중앙 재적용
+  if (ui.panes.includes('dashboard')) requestAnimationFrame(() => { if (ui.atHome) applyHome(false); if (ui.tlCentered) centerActiveStage(false); });
+}
+// v2.4.134 — FAB 자리는 분리선이 아니라 **자기 pane 의 실제 오른쪽 끝**에서 파생해요. 분리선 기준은 2단에서만
+//   맞았고, 3단부터는 어느 분리선인지가 정해지지 않아요.
+function positionHomeFabs() {
+  const place = (btn, pane) => {
+    if (!btn) return;
+    if (ui.panes.length < 2 || !ui.panes.includes(pane)) { btn.style.right = ''; return; }
+    const p = document.getElementById('tab-' + pane);
+    if (!p) { btn.style.right = ''; return; }
+    const r = p.getBoundingClientRect();
+    btn.style.right = Math.round(innerWidth - r.right + 14) + 'px';
+  };
+  place($('#home-btn'), 'dashboard');
+  place($('#home-btn-dec'), 'decisions');
+}
+// v2.4.134 — Ctrl+탭 = **그 탭 하나를 분할 집합에 넣고 빼기**. 종전 구현은 무엇을 눌러도 대시보드+검토사안
+//   한 쌍으로 고정했어요 — 탭이 둘뿐이던 시절엔 그 둘이 유일한 조합이라 구별이 안 됐고, 넷이 되자 드러났어요.
+//   마지막 하나는 뺄 수 없어요(빈 화면 금지). 상한 4단.
+function setPanes(name, ctrl) {
+  let panes = ui.panes.slice();
+  if (ctrl) {
+    if (panes.includes(name)) { if (panes.length > 1) panes = panes.filter(p => p !== name); }
+    else if (panes.length < PANES_MAX) panes = panes.concat(name);
+    panes.sort((a, b) => PANE_ORDER.indexOf(a) - PANE_ORDER.indexOf(b));
+  } else panes = [name];                                                                           // 일반 클릭 → 단일
+  ui.panes = panes; savePanes(); applyPanes();
+}
+document.querySelectorAll('.tab').forEach(t => t.onclick = (e) => setPanes(t.dataset.tab, e.ctrlKey || e.metaKey));
+// v2.4.136 §13.25.17 — 운영자 계정 패널 (login.js). 계정이 0이면 패널이 «지금은 주소 판정» 을 설명해요.
+{ const _lb = document.getElementById('ws-login-btn');
+  if (_lb) _lb.onclick = () => { if (window.egLogin) window.egLogin.openPanel(); }; }
+
+function updatePinHandles() {
+  const fx = ui.splitFixed;
+  document.querySelectorAll('.pin-handle').forEach(h => h.classList.toggle('pinned', !!fx && fx.side === h.dataset.side));
+}
+function setupSplit() {
+  const main = $('main'), dv = $('#pane-divider');
+  // 분리선 드래그 — 2단은 비율(splitFrac), 3단 이상은 **양옆 pane 가중치 이전**. 위임이라 동적 사본도 같이 작동.
+  if (dv) {
+    let drag = null;   // 잡고 있는 분리선 엘리먼트
+    const move = (e) => {
+      if (!drag) return;
+      const r = main.getBoundingClientRect(), cx = e.touches ? e.touches[0].clientX : e.clientX;
+      if (ui.panes.length === 2) {
+        let f = (cx - r.left) / r.width; f = Math.max(0.2, Math.min(0.8, f));
+        ui.splitFrac = f; ui.splitFixed = null; localStorage.removeItem(SPLIT_FIXED_KEY);
+        localStorage.setItem(SPLIT_FRAC_KEY, String(f.toFixed(4))); applySplitSizing(); updatePinHandles();
+        return;
+      }
+      const L = drag.dataset.l, R = drag.dataset.r;
+      const lp = document.getElementById('tab-' + L), rp = document.getElementById('tab-' + R);
+      if (!lp || !rp) return;
+      const lr = lp.getBoundingClientRect(), rr = rp.getBoundingClientRect();
+      const span = rr.right - lr.left;                       // 두 pane 이 나눠 갖는 폭
+      if (span < 80) return;
+      const total = paneWeight(L) + paneWeight(R);
+      let lf = ((cx - lr.left) / span) * total;
+      lf = Math.max(0.2, Math.min(total - 0.2, lf));         // 어느 쪽도 완전히 눌리지 않게
+      ui.paneW[L] = Math.round(lf * 1000) / 1000;
+      ui.paneW[R] = Math.round((total - lf) * 1000) / 1000;
+      savePaneW(); applySplitSizing();
+    };
+    const up = () => { if (drag) { drag.classList.remove('dragging'); drag = null; document.body.style.userSelect = ''; if (ui.atHome) applyHome(false); if (ui.tlCentered) centerActiveStage(false); } };
+    const grab = (e) => { const d = e.target.closest('.pane-divider'); if (!d || e.target.closest('.pin-handle')) return; drag = d; d.classList.add('dragging'); document.body.style.userSelect = 'none'; if (e.cancelable) e.preventDefault(); };
+    main.addEventListener('mousedown', grab);
+    main.addEventListener('touchstart', grab, { passive: true });
+    main.addEventListener('dblclick', (e) => {
+      const d = e.target.closest('.pane-divider'); if (!d) return;
+      if (ui.panes.length === 2) { ui.splitFrac = 0.5; ui.splitFixed = null; localStorage.removeItem(SPLIT_FIXED_KEY); localStorage.setItem(SPLIT_FRAC_KEY, '0.5'); }
+      else { ui.panes.forEach(p => { ui.paneW[p] = 1; }); savePaneW(); }
+      applySplitSizing(); updatePinHandles();
+    });
+    window.addEventListener('mousemove', move); window.addEventListener('touchmove', move, { passive: true });
+    window.addEventListener('mouseup', up); window.addEventListener('touchend', up);
+    // pane 안쪽 고정-px 핸들 (iOS 손잡이) — divider 양옆에 배치
+    ['left', 'right'].forEach(side => {
+      const h = el('div', 'pin-handle pin-' + side, '<span class="ph-bars"></span>');
+      h.dataset.side = side; h.hidden = true; h.title = (side === 'left' ? '좌측' : '우측') + '을 고정 폭으로 — 드래그 (더블클릭 해제)';
+      dv.appendChild(h);
+      let pdrag = false;
+      const pmove = (e) => {
+        if (!pdrag) return;
+        const r = main.getBoundingClientRect(), cx = e.touches ? e.touches[0].clientX : e.clientX;
+        let px = side === 'left' ? cx - r.left : r.right - cx;
+        px = Math.max(200, Math.min(r.width - 260, px));
+        ui.splitFixed = { side, px: Math.round(px) }; localStorage.setItem(SPLIT_FIXED_KEY, JSON.stringify(ui.splitFixed));
+        applySplitSizing(); updatePinHandles();
+      };
+      const pup = () => { if (pdrag) { pdrag = false; h.classList.remove('dragging'); document.body.style.userSelect = ''; if (ui.atHome) applyHome(false); if (ui.tlCentered) centerActiveStage(false); } };
+      h.addEventListener('mousedown', (e) => { pdrag = true; h.classList.add('dragging'); document.body.style.userSelect = 'none'; e.preventDefault(); e.stopPropagation(); });
+      h.addEventListener('dblclick', (e) => { e.stopPropagation(); ui.splitFixed = null; localStorage.removeItem(SPLIT_FIXED_KEY); applySplitSizing(); updatePinHandles(); });
+      window.addEventListener('mousemove', pmove); window.addEventListener('mouseup', pup);
+    });
+  }
+  // 폭이 1600 을 상향 교차하면 자동 분할 (사용자 토글은 그 위에서 자유)
+  ui._wasWide = innerWidth >= WIDE_W;
+  window.addEventListener('resize', () => {
+    const wide = innerWidth >= WIDE_W;
+    if (wide && !ui._wasWide && ui.panes.length === 1) setPanes(ui.panes[0] === 'dashboard' ? 'decisions' : 'dashboard', true);
+    ui._wasWide = wide;
+    if (ui.panes.length >= 2) applySplitSizing();
+  });
+}
+$('#home-btn').innerHTML = `<svg viewBox="0 0 24 24" width="23" height="23" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"><path d="M3 10.6 12 3.2l9 7.4"/><path d="M5.2 9.3V20.4h13.6V9.3"/><path d="M9.6 20.4v-6.1h4.8v6.1"/></svg>`;
+$('#home-btn').onclick = () => {
+  if (!ui.panes.includes('dashboard')) setPanes('dashboard', false);
+  centerCurrent(true);
+};
+$('#home-btn-dec').innerHTML = `<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4.4h14"/><path d="M12 20.4V8.2"/><path d="M5.6 13.6 12 7.2l6.4 6.4"/></svg>`;
+$('#home-btn-dec').onclick = () => {
+  if (!ui.panes.includes('decisions')) setPanes('decisions', false);
+  const pane = $('#tab-decisions'); if (pane) pane.scrollTo({ top: 0, behavior: 'smooth' });
+  const fr = $('#free-req'); if (fr) fr.focus({ preventScroll: true });
+};
+
+// ---- Compendium wiki tab (v0.2-d) — static /compendium.json export, dual-register + click-to-define cross-links ----
+// v0.2 polish (§8/§11): cross-link side panel = non-modal complementary landmark. A cross-link click opens the
+//   term's gloss in an aside (peek without losing reading position) instead of only jumping. §8.2 a11y: glosses can
+//   contain cross-links → dialog/disclosure semantics (aria-haspopup="dialog", never role=tooltip); focus moves into
+//   the panel on open, Escape closes + restores focus to the trigger; mobile (≤560px) renders as a bottom-sheet.
+let wikiData = null, wikiReg = localStorage.getItem('eg-wiki-reg') || 'plain', wikiQuery = '';
+let wikiById = {}, wikiAsideTrigger = null;
+function wikiSpecUrl(sp) {
+  if (!sp) return null;
+  const h = sp.indexOf('#'); const f = h < 0 ? sp : sp.slice(0, h), s = h < 0 ? '' : sp.slice(h + 1);
+  return 'https://github.com/SoliEstre/EstreGenesis/blob/main/' + f + (s ? '#' + s : '');
+}
+// cross-link anchors — §8.2 dialog semantics (the gloss they open may itself contain cross-links).
+function wikiXlinksHTML(e, byId) {
+  return (e.links || []).filter((id) => byId[id]).map((id) =>
+    '<a class="wiki-xlink" href="#wiki-' + esc(id) + '" data-wiki-def="' + esc(id) + '" aria-haspopup="dialog" aria-controls="wiki-aside" aria-expanded="false">' + esc(byId[id].title || id) + '</a>').join('');
+}
+function wikiGlossText(e) { const g = (e.glosses || []).find((x) => x.register === wikiReg); return g ? g.text : (e.definition || ''); }
+function wikiEntryMetaHTML(e, byId) {
+  const reg = e.register_class === 'internal' ? '<span class="wiki-tag int">내부어</span>' : '<span class="wiki-tag gen">일반어</span>';
+  const st = e.status && e.status !== 'active' ? ' <span class="wiki-tag sup">' + esc(e.status) + '</span>' : '';
+  const sp = wikiSpecUrl(e.owner_spec);
+  const ptr = sp
+    ? '<a class="wiki-ptr" href="' + esc(wsSafeUrl(sp)) + '" target="_blank" rel="noopener">정의 원본 → ' + esc(e.owner_spec) + '</a>'
+    : '<span class="wiki-ptr gen">일반어 — Compendium 이 정의 소유</span>';
+  const xl = wikiXlinksHTML(e, byId);
+  return { reg, st, ptr, xl };
+}
+// §11 cross-link side panel — open a term's gloss in the non-modal aside (chainable; focus moves into the panel).
+function wikiOpenAside(id, trigger) {
+  const e = wikiById[id]; if (!e) return;
+  const aside = $('#wiki-aside'), body = $('#wiki-aside-body'); if (!aside || !body) return;
+  if (wikiAsideTrigger && wikiAsideTrigger !== trigger) wikiAsideTrigger.setAttribute('aria-expanded', 'false');
+  if (trigger) wikiAsideTrigger = trigger;
+  const m = wikiEntryMetaHTML(e, wikiById);
+  body.innerHTML = '<h3 class="wiki-aside-title">' + esc(e.title || e.id) + m.reg + m.st + '</h3>'
+    + '<p class="wiki-def">' + esc(wikiGlossText(e)) + '</p>'
+    + '<div class="wiki-meta">' + m.ptr + (m.xl ? '<span class="wiki-rel">관련: ' + m.xl + '</span>' : '') + '</div>'
+    + '<a class="wiki-aside-jump" href="#wiki-' + esc(e.id) + '" data-wiki-jump="' + esc(e.id) + '">전체 항목으로 →</a>';
+  aside.hidden = false; aside.classList.add('open');
+  if (trigger) trigger.setAttribute('aria-expanded', 'true');
+  body.querySelectorAll('[data-wiki-def]').forEach((a) => { a.onclick = (ev) => { ev.preventDefault(); wikiOpenAside(a.dataset.wikiDef, a); }; });
+  body.querySelectorAll('[data-wiki-jump]').forEach((a) => { a.onclick = (ev) => { ev.preventDefault(); wikiCloseAside(true); wikiJumpTo(a.dataset.wikiJump); }; });
+  const cl = $('#wiki-aside-close'); if (cl) cl.focus();
+}
+function wikiCloseAside(skipFocus) {
+  const aside = $('#wiki-aside'); if (!aside || aside.hidden) return;
+  aside.classList.remove('open'); aside.hidden = true;
+  if (wikiAsideTrigger) { wikiAsideTrigger.setAttribute('aria-expanded', 'false'); if (!skipFocus) { try { wikiAsideTrigger.focus(); } catch {} } wikiAsideTrigger = null; }
+}
+function wikiJumpTo(id) {
+  const t = document.getElementById('wiki-' + id);
+  if (t) { t.scrollIntoView({ behavior: 'smooth', block: 'center' }); t.classList.add('wiki-flash'); setTimeout(() => t.classList.remove('wiki-flash'), 1200); }
+}
+function renderWiki() {
+  const body = $('#wiki-body'); if (!body || !wikiData) return;
+  const q = wikiQuery.trim().toLowerCase();
+  const all = wikiData.entries || [];
+  const byId = Object.fromEntries(all.map((e) => [e.id, e])); wikiById = byId;
+  const list = all.filter((e) => !q || (e.id + ' ' + (e.title || '') + ' ' + (e.definition || '')).toLowerCase().includes(q));
+  body.innerHTML = list.map((e) => {
+    const gloss = (e.glosses || []).find((g) => g.register === wikiReg);
+    const text = gloss ? gloss.text : (e.definition || '');
+    const reg = e.register_class === 'internal' ? '<span class="wiki-tag int">내부어</span>' : '<span class="wiki-tag gen">일반어</span>';
+    const st = e.status && e.status !== 'active' ? ' <span class="wiki-tag sup">' + esc(e.status) + '</span>' : '';
+    const sp = wikiSpecUrl(e.owner_spec);
+    const ptr = sp
+      ? '<a class="wiki-ptr" href="' + esc(wsSafeUrl(sp)) + '" target="_blank" rel="noopener">정의 원본 → ' + esc(e.owner_spec) + '</a>'
+      : '<span class="wiki-ptr gen">일반어 — Compendium 이 정의 소유</span>';
+    const xlinks = wikiXlinksHTML(e, byId);
+    return '<article class="wiki-entry" id="wiki-' + esc(e.id) + '">'
+      + '<h3 class="wiki-e-title">' + esc(e.title || e.id) + reg + st + '</h3>'
+      + '<p class="wiki-def">' + esc(text) + '</p>'
+      + '<div class="wiki-meta">' + ptr + (xlinks ? '<span class="wiki-rel">관련: ' + xlinks + '</span>' : '') + '</div>'
+      + '</article>';
+  }).join('') || '<div class="empty">검색 결과 없음.</div>';
+  // §8/§11 click-to-define: a cross-link opens the term's gloss in the non-modal side panel (§8.1 — anchors over the escaped DOM, never raw HTML)
+  body.querySelectorAll('[data-wiki-def]').forEach((a) => { a.onclick = (ev) => { ev.preventDefault(); wikiOpenAside(a.dataset.wikiDef, a); }; });
+}
+function setupWiki() {
+  document.querySelectorAll('.wiki-reg-btn').forEach((b) => {
+    b.classList.toggle('active', b.dataset.reg === wikiReg);
+    b.onclick = () => { wikiReg = b.dataset.reg; localStorage.setItem('eg-wiki-reg', wikiReg);
+      document.querySelectorAll('.wiki-reg-btn').forEach((x) => x.classList.toggle('active', x.dataset.reg === wikiReg)); wikiCloseAside(true); renderWiki(); };
+  });
+  const s = $('#wiki-search'); if (s) s.oninput = () => { wikiQuery = s.value; wikiCloseAside(true); renderWiki(); };
+  const cl = $('#wiki-aside-close'); if (cl) cl.onclick = () => wikiCloseAside();
+  document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') { const a = $('#wiki-aside'); if (a && !a.hidden) { ev.stopPropagation(); wikiCloseAside(); } } });
+  fetch('compendium.json', { cache: 'no-store' }).then((r) => r.json()).then((d) => {
+    wikiData = d; const cnt = $('#wiki-count'); if (cnt) cnt.textContent = (d.count || (d.entries || []).length) + ' terms'; renderWiki();
+  }).catch((e) => { const body = $('#wiki-body'); if (body) body.innerHTML = '<div class="empty">Compendium 데이터 로드 실패 (' + esc(String(e && e.message || e)) + ').</div>'; });
+}
+
+// ==== §13.33 조직도 탭 (Corporate 모듈 §10·§11 투영) ====
+// 보드는 조직을 소유하지 않아요 — CorporateChart(구조)·RoleState(좌석 생사) 두 선언만 받아 렌더해요.
+// 렌더 불변식(§13.33.3): ① 상태 미선언 좌석은 '미선언'(unknown) — 절대 유휴로 그리지 않아요(데이터가 없을 때
+// 표면이 가장 건강해 보이는 실패) ② 차트가 안 실은 필드는 그럴듯한 기본값이 아니라 부재로 ③ 티어·모델은 해석된
+// 값만(차트가 준 그대로, 체인의 한 층 아님) ④ reportsTo=실선(가로 줄 배치)·links[]=점선 ⑤ deskRef 는 불투명
+// 라벨이라 경로처럼 렌더하지 않아요 ⑥ 와이어 유래 문자열은 전부 textContent (innerHTML 에 원본 금지, §8.1).
+const ORG_ST = { idle: '유휴', working: '작업 중', blocked: '막힘', 'waiting-gate': '승인 대기', offline: '오프라인' };   // 라벨 문구는 마크업 범례와 일치시켜요
+const ORG_ST_KEYS = ['idle', 'working', 'blocked', 'waiting-gate', 'offline'];
+const ORG_UNKNOWN = '미선언';
+const ORG_UNDECLARED = '선언되지 않았어요';
+const ORG_LIVE_MS = 30 * 60 * 1000;   // 엣지 live 판정 창 — 최근 30분 내 두 좌석 사이 A2A 관측
+const ORG_A2A_N = 8;                  // 상세 팝업 최근 A2A 표시 건수
+// 아래 라벨 맵은 '알려진 값 → 평이한 한국어' 변환일 뿐이고, 미등록 값은 원문 그대로 보존해요(식별자 보존·번역 발명 금지).
+const ORG_TOPOLOGY_KO = { 'flat': '평면(동료 구조)', 'flat peer': '평면(동료 구조)', 'hierarchical': '계층', 'mixed': '혼합' };
+const ORG_DRIVE_KO = { 'event-driven': '이벤트 구동(반자율)', 'event-driven semi-autonomous': '이벤트 구동(반자율)', 'goal-driven': '목표 구동(자율)', 'goal-driven autonomous': '목표 구동(자율)', 'between': '중간' };
+const ORG_VAR_KO = { 'static': '고정', 'dynamic': '가변(런타임 좌석 생성·해산)' };
+const ORG_RES_KO = { 'resident': '상주', 'on-wake': '기상 시', 'on-demand': '요청 시', 'scheduled': '예약' };
+const ORG_LANE_KO = { 'interactive': '대화 레인', 'automation': '자동화 레인', 'local': '로컬 레인' };
+const ORG_TRACE_KO = { 'full-trace': '전체 트레이스', 'result-only': '결과만' };
+const ORG_WIRING_KO = { 'directed': '지정 경로', 'discretionary': '재량 경로' };
+const ORG_ROOM_MODE_KO = { 'persistent': '상시', 'temporary': '임시' };
+const ORG_SEAT_FIELDS = ['role', 'seat', 'owner', 'assignee', 'raisedBy'];   // 보드 항목이 좌석을 밝히는 필드 — 없으면 좌석별로 가리지 않아요(추정 금지)
+function orgKo(map, v) { const s = (v == null) ? '' : String(v); if (!s) return ''; return map[s.toLowerCase()] || s; }
+function orgStr(v) { return (v == null) ? '' : String(v); }
+function orgHas(v) { return v != null && String(v) !== ''; }
+
+function orgRolesArr() { return (orgChart && Array.isArray(orgChart.roles)) ? orgChart.roles.filter(r => r && orgHas(r.role)) : []; }
+function orgRoleObj(role) { const w = String(role); return orgRolesArr().find(r => String(r.role) === w) || null; }
+function orgStateOf(role) { const s = roleStates.get(String(role)); return (s && typeof s === 'object') ? s : null; }
+// 불변식 1 의 뒷면 — 부재를 idle 로 접지 않는 것과 같은 이유로, **낡은 선언을 현재값으로 그리지도 않아요**.
+// status 는 어떤 프로세스가 한 주장이고, 그 프로세스가 지금 붙어 있지 않으면 그건 현재가 아니라 마지막 값이에요.
+// 세션이 끝나면 working 이 영원히 남던 문제가 이것 — 특히 보드가 부팅 자동 시작이 된 뒤로는, 아무도 없는
+// 아침에 보드가 "작업 중"을 띄우게 돼요. 생존 판정은 **좌석 자신의 agentId**(그 상태가 서술하는 대상)로 해요.
+// declaredBy(대신 선언한 쪽)로 하면 안 돼요 — 메인이 내려가도 서기는 살아 있을 수 있으니까요.
+const ORG_STALE_MS = 12 * 60 * 60 * 1000;   // agentId 미선언이라 생존 확인이 불가능할 때만 쓰는 2차 그물
+function orgLiveness(role) {
+  const s = orgStateOf(role);
+  if (!s) return { fresh: false, why: 'none' };
+  let agentId = '';
+  try {
+    const d = (orgChart && Array.isArray(orgChart.roles)) ? orgChart.roles.find((r) => r && orgStr(r.role) === String(role)) : null;
+    agentId = d ? orgStr(d.agentId) : '';
+  } catch (e) {}
+  if (agentId) {
+    let present = false;
+    try { present = !!(wsState.present && wsState.present.has(agentId)); } catch (e) {}
+    return { fresh: present, why: present ? 'present' : 'absent', agentId, last: s };
+  }
+  const ts = (typeof s.updatedAt === 'number') ? s.updatedAt : ((typeof s.since === 'number') ? s.since : null);
+  if (ts == null) return { fresh: false, why: 'undated', last: s };
+  return { fresh: (Date.now() - ts) <= ORG_STALE_MS, why: (Date.now() - ts) <= ORG_STALE_MS ? 'recent' : 'aged', last: s };
+}
+// 낡은 선언은 unknown 으로 접어요 — offline 으로 접으면 안 돼요. offline 은 에이전트가 **스스로 선언**하는
+// 값이라, 추론으로 그걸 쓰면 하지 않은 선언을 지어내는 셈이에요 (불변식 2).
+function orgStatusKey(role) {
+  const s = orgStateOf(role); if (!s) return 'unknown';
+  if (!orgLiveness(role).fresh) return 'unknown';
+  const st = orgStr(s.status); return ORG_ST_KEYS.indexOf(st) >= 0 ? st : 'unknown';
+}
+function orgStatusLabel(role) { const k = orgStatusKey(role); return k === 'unknown' ? ORG_UNKNOWN : ORG_ST[k]; }
+// unknown 이 왜 unknown 인지 — 부재/낡음/미기재는 서로 다른 상황이라 한 낱말로 접지 않아요.
+function orgUnknownWhy(role) {
+  const lv = orgLiveness(role);
+  const s = lv.last, raw = s ? orgStr(s.status) : '';
+  const label = (ORG_ST_KEYS.indexOf(raw) >= 0) ? ORG_ST[raw] : raw;
+  const when = (s && orgHas(s.updatedAt)) ? relTime(s.updatedAt) : ((s && orgHas(s.since)) ? relTime(s.since) : '');
+  if (lv.why === 'none') return '이 좌석의 상태 선언을 받지 못했어요';
+  if (lv.why === 'absent') return '선언한 에이전트 "' + lv.agentId + '" 가 지금 보드에 없어요 — 마지막 선언은 ' + (label || '?') + (when ? ' (' + when + ')' : '') + ' 이라 현재값으로 볼 수 없어요';
+  if (lv.why === 'aged') return '마지막 선언이 ' + (when || '오래 전') + ' 이라 현재값으로 보기 어려워요 (' + (label || '?') + ')';
+  if (lv.why === 'undated') return '선언에 시각이 없어 최신인지 알 수 없어요 (' + (label || '?') + ')';
+  return '선언된 상태값(' + (raw || '-') + ')이 규약 밖이라 해석하지 않았어요';
+}
+function orgHostTitle(host) {
+  if (!orgHas(host)) return '';
+  const h = (orgChart && Array.isArray(orgChart.hosts) ? orgChart.hosts : []).find(x => x && String(x.host) === String(host));
+  if (!h) return '차트 hosts[] 에 이 호스트 선언이 없어요';
+  return [orgHas(h.label) ? String(h.label) : '', orgHas(h.address) ? '주소 ' + String(h.address) : '', orgHas(h.accelerator) ? '가속기 ' + String(h.accelerator) : '', orgHas(h.memory) ? '메모리 ' + String(h.memory) : ''].filter(Boolean).join(' · ');
+}
+function orgGroupTitle(group) {
+  if (!orgHas(group)) return '';
+  const g = (orgChart && Array.isArray(orgChart.groups) ? orgChart.groups : []).find(x => x && String(x.group) === String(group));
+  return (g && orgHas(g.title)) ? String(g.title) + ' (' + String(group) + ')' : String(group);
+}
+// 보고 깊이 — reportsTo 를 따라 올라가며 계산. 상위 미선언은 그 지점에서 끊고(없는 좌석 발명 금지), 순환은 방어해요.
+function orgDepths(roles) {
+  const by = new Map(roles.map(r => [String(r.role), r]));
+  const depth = new Map(), dangling = new Set(), cyclic = new Set();
+  for (const r of roles) {
+    const id = String(r.role);
+    let d = 0, cur = r; const seen = new Set([id]);
+    for (;;) {
+      if (!orgHas(cur.reportsTo)) break;
+      const up = by.get(String(cur.reportsTo));
+      if (!up) { if (cur === r) dangling.add(id); break; }
+      const uid = String(up.role);
+      if (seen.has(uid)) { cyclic.add(id); break; }
+      seen.add(uid); d++; cur = up;
+      if (d > 64) { cyclic.add(id); break; }
+    }
+    depth.set(id, d);
+  }
+  return { depth, dangling, cyclic };
+}
+// 좌석명 → 실시간 채널. 돌려주는 모양 3가지: {id, exact} 매칭됨 · {id:null, declared} 선언은 있는데 아직 미합류 · null 선언도 매칭도 없음.
+// 좌석은 **이 조직의 좌석**이므로 후보는 로컬측 채널(main·local·board-worker)뿐이에요 — peer/upstream/collab 은 정의상
+// 다른 프로젝트·다른 당사자라(§13.9.3) 좌석에 대응할 수 없어요.
+function orgResolveChannel(role) {
+  try {
+    const want = orgStr(role).trim(); if (!want) return null;
+    // ① 차트가 agentId 를 선언했으면 그것만이 답 — 미합류면 "없음"으로 끝내요(fail-closed). v2.6.4 서버측과 같은 규칙:
+    //    선언 불일치를 유사매칭으로 메우면 엉뚱한 상대에게 말을 걸어요.
+    let declared = '';
+    try {
+      const d = (orgChart && Array.isArray(orgChart.roles)) ? orgChart.roles.find((r) => r && orgStr(r.role) === want) : null;
+      declared = d ? orgStr(d.agentId) : '';
+    } catch (e) {}
+    if (declared) return wsState.channels.has(declared) ? { id: declared, exact: true, declared } : { id: null, declared };
+    // ② 선언이 없을 때만 이름으로 찾고, **exact 만** 봐요. 부분일치는 폐기했어요 — 좌석명은 'main'·'watch' 같은
+    //    일반어라 다른 프로젝트 채널의 id·이름에 우연히 들어있고, 그러면 조용히 성공해서 남의 메인으로 연결돼요
+    //    (2026-07-26 실측: main 좌석의 대화 버튼이 협업 피어 메인으로 이어짐).
+    const roleOk = (c) => !c || !orgHas(c.role) || ['main', 'local', 'board-worker'].indexOf(String(c.role)) >= 0;
+    const ents = [...wsState.channels.entries()];
+    const usable = ents.filter(([id, c]) => id && !wsIsMon(id) && !wsIsGroup(id) && String(id).indexOf('room:') !== 0 && roleOk(c));
+    const order = usable.filter(([, c]) => !(c && c.hidden)).concat(usable.filter(([, c]) => (c && c.hidden)));
+    const lw = want.toLowerCase();
+    for (const [id, c] of order) if (String(id) === want || orgStr(c && c.routeId) === want) return { id, exact: true };
+    for (const [id, c] of order) if (String(id).toLowerCase() === lw || orgStr(c && c.routeId).toLowerCase() === lw) return { id, exact: true };
+    return null;
+  } catch { return null; }   // TDZ 가드 — 초기 렌더가 wsState/WS_MON_* 선언 실행 전일 수 있어요 (v2.4.32 사고 클래스)
+}
+// A2A 관측 자료구조 = 모니터 채널 행의 src {from,to} (wsPushRow 가 실측 발신·수신 agentId 로 채워요) + row.ts.
+function orgA2aRows() {
+  const out = [];
+  try { for (const c of wsState.channels.values()) { if (!c || !Array.isArray(c.rows)) continue; for (const r of c.rows) if (r && r.src && r.src.from && r.src.to) out.push(r); } } catch {}
+  return out;
+}
+function orgA2aRowsFor(chanId) { const w = String(chanId); return orgA2aRows().filter(r => String(r.src.from) === w || String(r.src.to) === w).sort((a, b) => (a.ts || 0) - (b.ts || 0)); }
+function orgLivePairs() {
+  const set = new Set(), now = Date.now();
+  for (const r of orgA2aRows()) {
+    if (r.ts != null && (now - r.ts) > ORG_LIVE_MS) continue;
+    const f = String(r.src.from), t = String(r.src.to);
+    set.add(f + '\u0000' + t); set.add(t + '\u0000' + f);
+  }
+  return set;
+}
+// 조용한 실패 금지 — 채널 매칭이 안 됐거나 근사 매칭이면 1줄로 알려요. 자체 완결(인라인 스타일) 이라 스타일 계약에 의존하지 않아요.
+function orgNote(msg) {
+  let n = document.getElementById('org-note');
+  if (!n) {
+    n = document.createElement('div'); n.id = 'org-note';
+    n.setAttribute('role', 'status'); n.setAttribute('aria-live', 'polite');
+    n.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);bottom:22px;z-index:99999;max-width:min(560px,92vw);padding:10px 14px;border-radius:10px;background:rgba(22,24,30,.96);color:#eef1f6;font-size:13px;line-height:1.55;border:1px solid rgba(255,255,255,.16);box-shadow:0 6px 24px rgba(0,0,0,.38)';
+    document.body.appendChild(n);
+  }
+  n.textContent = orgStr(msg);
+  n.hidden = false;
+  if (n._t) clearTimeout(n._t);
+  n._t = setTimeout(() => { n.hidden = true; }, 7000);
+}
+// 타깃이 없으면 **창을 열지 않아요**. 옛 판(열되 active 는 그대로)은 직전에 보던 남의 채널을 띄워서
+// "연결된 것처럼" 보이게 했어요 — 조직도의 대화 버튼이 협업 피어로 이어진 사고의 절반이 이 함수였어요.
+function orgSwitchChannel(id) {
+  if (!id) return false;
+  try { wsState.active = id; } catch {}
+  try { toggleWsPop(true); } catch {}
+  try { wsRenderTabs(); wsRenderActiveStream(); } catch {}
+  return true;
+}
+function orgTalk(role) {
+  const hit = orgResolveChannel(role);
+  if (hit && hit.id) { orgSwitchChannel(hit.id); return; }
+  if (hit && hit.declared) orgNote('좌석 "' + orgStr(role) + '" 은 에이전트 "' + hit.declared + '" 로 선언돼 있는데 아직 보드에 합류하지 않았어요 — 말을 걸 표면이 없어서 창을 열지 않았어요.');
+  else orgNote('좌석 "' + orgStr(role) + '" 에는 agentId 선언이 없어서 상대를 특정할 수 없어요 — 로스터에 이 좌석의 agentId 를 선언하면 연결돼요. 이름이 비슷한 채널로 짐작해서 잇지는 않아요(남의 프로젝트 메인으로 갈 수 있어서요).');
+}
+function orgOpenRoom(roomId) {
+  const key = 'room:' + orgStr(roomId);   // §13.30 방 채널 키 규약 (wsChanKey·wsRtIntake 와 동일)
+  let has = false; try { has = wsState.channels.has(key); } catch {}
+  if (has) { orgSwitchChannel(key); return; }
+  orgNote('방 "' + orgStr(roomId) + '" 채널이 아직 없어요 (이 방의 트래픽을 받은 적이 없어요) — 열 대화 표면이 없어서 창을 열지 않았어요.');
+}
+function orgOpenPair(from, to) {
+  const ca = orgResolveChannel(from), cb = orgResolveChannel(to);
+  const ia = (ca && ca.id) || null, ib = (cb && cb.id) || null;
+  let mon = null;
+  if (ia && ib) {
+    try {
+      for (const [id, c] of wsState.channels.entries()) {
+        if (!wsIsMon(id) || !Array.isArray(c.rows)) continue;
+        if (c.rows.some(r => r && r.src && ((String(r.src.from) === ia && String(r.src.to) === ib) || (String(r.src.from) === ib && String(r.src.to) === ia)))) { mon = id; break; }
+      }
+    } catch {}
+  }
+  const target = mon || ib || ia || null;
+  if (orgSwitchChannel(target)) {
+    if (!mon) orgNote('두 좌석 사이 전용 모니터 채널을 찾지 못해 "' + target + '" 채널로 열었어요.');
+    return;
+  }
+  orgNote('"' + orgStr(from) + ' ⇢ ' + orgStr(to) + '" 두 좌석 중 합류한 채널이 없어요 — 열 대화 표면이 없어서 창을 열지 않았어요.');
+}
+// 예산 — 차트가 실은 형태를 모르므로 숫자로 해석되는 경우에만 게이지를 그리고, 아니면 선언값을 칩으로만 보여줘요(허구 게이지 금지).
+function orgBudget(budget, used) {
+  const num = (x) => (typeof x === 'number' && isFinite(x)) ? x : ((typeof x === 'string' && x.trim() !== '' && isFinite(Number(x))) ? Number(x) : null);
+  if (budget == null && used == null) return null;
+  let limit = null, u = null; const extra = [];
+  if (budget != null && typeof budget === 'object') {
+    for (const k of ['limit', 'max', 'ceiling', 'tokens', 'amount']) { if (limit == null) limit = num(budget[k]); }
+    if (orgHas(budget.period)) extra.push('주기 ' + String(budget.period));
+    if (orgHas(budget.unit)) extra.push('단위 ' + String(budget.unit));
+  } else if (budget != null) limit = num(budget);
+  if (used != null && typeof used === 'object') { for (const k of ['used', 'tokens', 'amount']) { if (u == null) u = num(used[k]); } }
+  else if (used != null) u = num(used);
+  const title = ['예산 ' + (limit != null ? '상한 ' + limit : (budget != null ? '선언됨(숫자 해석 불가)' : '미선언')), (u != null ? '사용 ' + u : (used != null ? '사용 선언됨(숫자 해석 불가)' : '')), ...extra].filter(Boolean).join(' · ');
+  if (limit != null && limit > 0 && u != null) {
+    const pct = Math.max(0, Math.min(100, Math.round((u / limit) * 1000) / 10));
+    return { pctOk: true, pct, title: title + ' · ' + pct + '%' };
+  }
+  const bits = [];
+  if (budget != null) bits.push('예산 ' + (limit != null ? String(limit) : '선언됨'));
+  if (used != null) bits.push('사용 ' + (u != null ? String(u) : '선언됨'));
+  return { pctOk: false, text: bits.join(' / '), title };
+}
+function orgSubText() {
+  if (!orgChart) return '아직 조직 선언(CorporateChart)을 받지 못했어요.';
+  const o = (orgChart.org && typeof orgChart.org === 'object') ? orgChart.org : null;
+  const parts = [];
+  if (o) {
+    if (orgHas(o.topology)) parts.push('형태 ' + orgKo(ORG_TOPOLOGY_KO, o.topology));
+    if (orgHas(o.drive)) parts.push('구동 ' + orgKo(ORG_DRIVE_KO, o.drive));
+    if (orgHas(o.variability)) parts.push('가변성 ' + orgKo(ORG_VAR_KO, o.variability));
+    if (o.seatCeiling != null) parts.push('좌석 상한 ' + String(o.seatCeiling));
+    if (o.fanoutCeiling != null) parts.push('동시 분기 상한 ' + String(o.fanoutCeiling));
+  } else parts.push('조직 형태가 선언되지 않았어요');
+  parts.push('좌석 ' + orgRolesArr().length + '개');
+  const hosts = Array.isArray(orgChart.hosts) ? orgChart.hosts.length : 0; if (hosts) parts.push('호스트 ' + hosts + '대');
+  const rooms = Array.isArray(orgChart.rooms) ? orgChart.rooms.length : 0; if (rooms) parts.push('방 ' + rooms + '개');
+  return parts.join(' · ');
+}
+// 레인 B 마크업이 id 만 걸어둔 경우에도 클래스가 붙도록 보정 + 상태 점 범례를 1회 생성(멱등).
+function orgEnsureClasses() {
+  const add = (sel, cls) => { const e = $(sel); if (e && !e.classList.contains(cls)) e.classList.add(cls); };
+  add('#org-sub', 'org-sub'); add('#org-chart', 'org-chart'); add('#org-rooms', 'org-rooms'); add('#org-empty', 'org-empty');
+  add('#org-refresh', 'org-btn'); add('#org-pop', 'org-pop'); add('#org-pop-head', 'org-pop-head'); add('#org-pop-body', 'org-pop-body'); add('#org-pop-x', 'org-pop-x');
+  const pane = $('#tab-org');
+  if (pane && !pane.querySelector('.org-legend')) {
+    const rf = $('#org-refresh');
+    const host = (rf && rf.parentNode) || pane.querySelector('.org-tools') || pane.querySelector('.org-head');
+    if (host) {
+      const lg = el('div', 'org-legend');
+      for (const k of ORG_ST_KEYS.concat(['unknown'])) {
+        const w = el('span'); const d = el('span', 'org-dot ' + k); const t = el('span');
+        t.textContent = (k === 'unknown' ? ORG_UNKNOWN : ORG_ST[k]);
+        w.append(d, t); lg.append(w);
+      }
+      if (rf && rf.parentNode === host) host.insertBefore(lg, rf); else host.append(lg);
+    }
+  }
+}
+function orgNodeEl(r, opt) {
+  const role = String(r.role), k = orgStatusKey(role), st = orgStateOf(role);
+  const n = el('div', 'org-node' + (k === 'unknown' ? ' unknown' : k === 'blocked' ? ' blocked' : k === 'working' ? ' working' : ''));
+  n.dataset.role = role; n.tabIndex = 0; n.title = '클릭하면 이 좌석의 상세를 열어요';
+  const name = el('div', 'org-name');
+  const dot = el('span', 'org-dot ' + k);
+  dot.title = '상태 ' + orgStatusLabel(role) + (k === 'unknown' ? ' — ' + orgUnknownWhy(role) : (st && orgHas(st.since) ? ' · ' + relTime(st.since) : ''));
+  const nm = el('span'); nm.textContent = role;
+  name.append(dot, nm);
+  // 머리줄 = 좌석명(왼쪽) + 대화 버튼(오른쪽 위). 버튼을 카드 맨 아래가 아니라 여기 두면
+  // 카드 높이가 제각각이어도 버튼 위치가 한 줄로 정렬돼서 눈으로 찾는 비용이 사라져요.
+  const top = el('div', 'org-node-top');
+  top.append(name, orgTalkBtn(role, opt && opt.chan));
+  n.append(top);
+  const ttl = el('div', 'org-role-title'); ttl.textContent = orgHas(r.title) ? String(r.title) : '직무 ' + ORG_UNDECLARED; n.append(ttl);
+  const task = el('div', 'org-task');
+  // 낡은 선언이면 작업 문구 대신 "왜 모르는지" — 지난 작업 제목을 그대로 두면 지금 그걸 하는 것처럼 읽혀요.
+  if (!st || k === 'unknown') task.textContent = ORG_UNKNOWN + ' — ' + orgUnknownWhy(role);
+  else {
+    const bits = [orgStatusLabel(role)];
+    if (orgHas(st.task)) bits.push(String(st.task));
+    else if (orgHas(st.blockReason)) bits.push(String(st.blockReason));
+    else bits.push('작업 ' + ORG_UNDECLARED);
+    if (orgHas(st.since)) bits.push(relTime(st.since));
+    task.textContent = bits.join(' · ');
+  }
+  n.append(task);
+  const meta = el('div', 'org-meta');
+  const chip = (text, cls, title) => { if (!text) return; const c = el('span', 'org-chip' + (cls ? ' ' + cls : '')); c.textContent = text; if (title) c.title = title; meta.append(c); };
+  if (orgHas(r.tier)) chip('티어 ' + String(r.tier), '', '차트가 준 해석된 값이에요 (체인의 한 층이 아니에요)');
+  if (orgHas(r.residency)) chip('잔류 ' + orgKo(ORG_RES_KO, r.residency), String(r.residency) === 'resident' ? 'res-resident' : '');
+  if (orgHas(r.host)) chip('호스트 ' + String(r.host), '', orgHostTitle(r.host));
+  if (orgHas(r.lane)) chip(orgKo(ORG_LANE_KO, r.lane), String(r.lane) === 'automation' ? 'lane-automation' : (String(r.lane) === 'local' ? 'lane-local' : ''), '자격증명 레인 선언 (§9.1)');
+  if (orgHas(r.harness)) chip('하네스 ' + String(r.harness));
+  if (orgHas(r.traceMode)) chip('트레이스 ' + orgKo(ORG_TRACE_KO, r.traceMode), '', '이 좌석으로 무엇이 넘어오는지 (§6.6)');
+  if (orgHas(r.group)) chip('그룹 ' + orgGroupTitle(r.group));
+  if (orgHas(r.reportsTo)) chip('보고 → ' + String(r.reportsTo), '', '실선 보고선이에요');
+  if (opt && opt.dangling) chip('상위 미선언', '', 'reportsTo 가 가리키는 좌석이 차트에 없어요 — 없는 좌석을 만들지 않고 여기서 끊었어요');
+  if (opt && opt.cyclic) chip('보고 순환', '', '보고선이 순환해서 깊이 계산을 끊었어요');
+  const bud = orgBudget(r.budget, st && st.budgetUsed);
+  if (bud && !bud.pctOk && bud.text) chip(bud.text, '', bud.title);
+  n.append(meta);
+  if (bud && bud.pctOk) {
+    const b = el('div', 'org-budget'); b.title = bud.title;
+    const f = el('span', 'org-budget-fill'); f.style.width = bud.pct + '%';
+    b.append(f); n.append(b);
+  }
+  if (Array.isArray(r.owns) && r.owns.length) {
+    const o = el('div', 'org-owns');
+    o.textContent = '경계 ' + r.owns.length + '곳 · ' + r.owns.map(x => orgStr(x)).join(' · ');
+    o.title = '이 좌석이 쓸 수 있는 경로예요 (§6.7 쓰기 분할)';
+    n.append(o);
+  }
+  n.onclick = () => orgOpenDetail(role);
+  n.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); orgOpenDetail(role); } };
+  return n;
+}
+// 대화 버튼 — 붙을 곳이 없는 좌석은 눌러보기 전에 보이게 표시해요(.unbound). 그래도 클릭은 살려둬요:
+// 비활성 버튼은 이유를 말해주지 못하는데, 여기선 "왜 못 붙는지"가 정보예요.
+function orgTalkBtn(role, chan) {
+  const b = el('button', 'org-talk'); b.type = 'button';
+  const bound = !!(chan && chan.id);
+  b.textContent = '💬 대화';
+  if (!bound) {
+    b.classList.add('unbound');
+    b.textContent = '💬 대화 (미연결)';
+    b.title = (chan && chan.declared)
+      ? '선언된 에이전트 "' + chan.declared + '" 가 아직 보드에 합류하지 않았어요 — 좌석 미가동이에요'
+      : '이 좌석엔 agentId 선언이 없어요 — 짐작해서 잇지 않아요';
+  } else b.title = '이 좌석의 실시간 대화 표면으로 (채널 ' + chan.id + ')';
+  b.onclick = (e) => { e.stopPropagation(); orgTalk(role); };
+  return b;
+}
+function orgLinkEl(l, chanOf, livePairs) {
+  const from = String(l.from), to = String(l.to);
+  const ca = chanOf.get(from) || null, cb = chanOf.get(to) || null;
+  const live = !!(ca && ca.id && cb && cb.id && livePairs.has(ca.id + '\u0000' + cb.id));
+  const row = el('div', 'org-link' + (live ? ' live' : ''));
+  const txt = el('span');
+  txt.textContent = from + ' ⇢ ' + to
+    + (orgHas(l.reason) ? ' · ' + String(l.reason) : ' · 사유 ' + ORG_UNDECLARED)
+    + (orgHas(l.wiring) ? ' · ' + orgKo(ORG_WIRING_KO, l.wiring) : '')
+    + (live ? ' · 최근 대화 있음' : '');
+  row.append(txt);
+  row.tabIndex = 0;
+  row.title = live ? '최근 30분 내 두 좌석 사이 A2A 가 관측됐어요 — 클릭하면 그 대화 표면으로' : '클릭하면 이 페어의 대화 표면을 열어요 (최근 A2A 관측 없음)';
+  row.onclick = () => orgOpenPair(from, to);
+  row.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); orgOpenPair(from, to); } };
+  return row;
+}
+function orgRoomEl(rm) {
+  const roomId = String(rm.roomId);
+  const box = el('div', 'org-room'); box.dataset.roomId = roomId; box.tabIndex = 0;
+  const top = el('div', 'org-room-topic');
+  top.textContent = '🪑 ' + (orgHas(rm.topic) ? String(rm.topic) : roomId) + (orgHas(rm.mode) ? ' · ' + orgKo(ORG_ROOM_MODE_KO, rm.mode) : '');
+  const head = el('div', 'org-node-top'); head.append(top);   // 좌석 카드와 같은 자리(오른쪽 위)에 버튼
+  box.append(head);
+  const chips = el('div', 'org-room-chips');
+  for (const p of (Array.isArray(rm.participants) ? rm.participants : [])) {
+    const isObj = p && typeof p === 'object';
+    const nm = isObj ? orgStr(p.agentId != null ? p.agentId : (p.role != null ? p.role : p.name)) : orgStr(p);
+    if (!nm) continue;
+    const human = (isObj && orgStr(p.speakerClass) === 'human-operator') || nm === 'human-operator';
+    const c = el('span', 'org-room-chip' + (human ? ' human' : ''));
+    c.textContent = (human ? '👤 ' : '') + nm + ((isObj && orgHas(p.role) && orgStr(p.agentId) !== '') ? ' · ' + String(p.role) : '');
+    chips.append(c);
+  }
+  if (!chips.children.length) { const c = el('span', 'org-room-chip'); c.textContent = '참여자 ' + ORG_UNDECLARED; chips.append(c); }
+  box.append(chips);
+  let rhas = false; try { rhas = wsState.channels.has('room:' + roomId); } catch {}
+  const talk = el('button', 'org-talk' + (rhas ? '' : ' unbound')); talk.type = 'button';
+  talk.textContent = rhas ? '💬 방 대화' : '💬 방 대화 (미연결)';
+  talk.title = rhas ? '이 방의 실시간 탭으로' : '이 방의 트래픽을 아직 받은 적이 없어요 — 열 탭이 없어요';
+  talk.onclick = (e) => { e.stopPropagation(); orgOpenRoom(roomId); };
+  head.append(talk);
+  box.onclick = () => orgOpenRoom(roomId);
+  box.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); orgOpenRoom(roomId); } };
+  return box;
+}
+function renderOrg() {
+  const chartEl = $('#org-chart'); if (!chartEl) return;   // 마크업 미배포 → 조용히 반환 (기존 관례)
+  const roomsEl = $('#org-rooms'), emptyEl = $('#org-empty'), badge = $('#org-badge'), subEl = $('#org-sub');
+  orgEnsureClasses();
+  const roles = orgRolesArr();
+  chartEl.innerHTML = ''; if (roomsEl) roomsEl.innerHTML = '';
+  // 배지 = 상태를 선언했고 내려가지 않은 좌석 수 / 차트가 선언한 좌석 수 (Map 조회·배열 길이에서만 계산, 추정 없음)
+  let live = 0; for (const r of roles) { const k = orgStatusKey(r.role); if (k !== 'unknown' && k !== 'offline') live++; }
+  if (badge) {
+    badge.textContent = roles.length ? (live + '/' + roles.length) : '0';
+    badge.hidden = !roles.length;
+    badge.title = roles.length ? ('가동 ' + live + ' / 선언 ' + roles.length + ' — 상태 미선언 좌석은 가동으로 세지 않아요') : '조직 선언 수신 전';
+  }
+  if (subEl) { subEl.textContent = orgSubText(); subEl.title = (orgChart && orgChart.version != null) ? ('차트 버전 ' + String(orgChart.version)) : ''; }
+  if (!orgChart || !roles.length) {
+    if (emptyEl) {
+      emptyEl.hidden = false;
+      emptyEl.textContent = orgChart
+        ? '조직 차트는 받았지만 선언된 좌석이 없어요 (roles[] 가 비어 있어요).'
+        : '아직 조직 선언(CorporateChart)을 받지 못했어요 — 조직을 선언하는 메인이 붙으면 여기에 그려요.';
+    }
+    if (orgPopRole) orgCloseDetail();
+    return;
+  }
+  if (emptyEl) emptyEl.hidden = true;
+  const dep = orgDepths(roles);
+  const chanOf = new Map(); for (const r of roles) chanOf.set(String(r.role), orgResolveChannel(r.role));
+  const livePairs = orgLivePairs();
+  let maxD = 0; for (const r of roles) maxD = Math.max(maxD, dep.depth.get(String(r.role)) || 0);
+  for (let d = 0; d <= maxD; d++) {
+    const tierRoles = roles.filter(r => (dep.depth.get(String(r.role)) || 0) === d);
+    if (!tierRoles.length) continue;
+    const tier = el('div', 'org-tier');
+    const lab = el('div', 'org-tier-label');
+    lab.textContent = (d === 0 ? '최상위' : '보고 깊이 ' + d) + ' · 좌석 ' + tierRoles.length + '개';
+    tier.append(lab);
+    for (const r of tierRoles) tier.append(orgNodeEl(r, { dangling: dep.dangling.has(String(r.role)), cyclic: dep.cyclic.has(String(r.role)), chan: chanOf.get(String(r.role)) || null }));
+    chartEl.append(tier);
+  }
+  const links = (orgChart && Array.isArray(orgChart.links)) ? orgChart.links.filter(l => l && orgHas(l.from) && orgHas(l.to)) : [];
+  if (links.length) {
+    const box = el('div', 'org-links');
+    const h = el('div', 'org-tier-label');
+    h.textContent = '추가 연결(점선) ' + links.length + '건 — 보고선과 별개예요';
+    box.append(h);
+    for (const l of links) box.append(orgLinkEl(l, chanOf, livePairs));
+    chartEl.append(box);
+  }
+  if (roomsEl) {
+    const rooms = (orgChart && Array.isArray(orgChart.rooms)) ? orgChart.rooms.filter(x => x && orgHas(x.roomId)) : [];
+    for (const rm of rooms) roomsEl.append(orgRoomEl(rm));
+    if (!rooms.length) { const e = el('div', 'org-empty'); e.textContent = '선언된 방이 없어요.'; roomsEl.append(e); }
+  }
+  if (orgPopRole) { if (orgRoleObj(orgPopRole)) orgOpenDetail(orgPopRole); else orgCloseDetail(); }   // 열려 있던 상세는 새 선언으로 갱신
+}
+// ---- 상세 팝업 (§13.33.3-5: 새 위젯 클래스가 아니라 한 좌석으로 좁힌 모니터) ----
+function orgSec(title) { const s = el('div', 'org-sec'); const h = el('div', 'org-sec-h'); h.textContent = title; s.append(h); return s; }
+function orgRow(k, v, title, extra) {
+  const row = el('div', 'org-row');
+  const kk = el('span', 'org-k'); kk.textContent = orgStr(k);
+  const vv = el('span', 'org-v'); vv.textContent = orgHas(v) ? String(v) : ORG_UNDECLARED;
+  if (title) row.title = title;
+  row.append(kk, vv);
+  if (extra) vv.append(document.createTextNode(' '), extra);
+  return row;
+}
+// §8.4 — 조직 어휘를 편람(Compendium) 항목으로 잇는 다리. **항목이 실재할 때만** 링크를 만들어요:
+// 없는 곳으로 가는 링크는 오늘 고친 «닮음으로 붙기»와 같은 부류의 거짓 어포던스예요.
+// 정의는 여기서 복제하지 않아요 — 편람 항목 자체가 스펙을 가리키는 포인터고(pointer-not-paraphrase),
+// 이 링크는 그 포인터로 가는 길일 뿐이에요.
+function orgWikiHas(id) { try { return !!(wikiData && (wikiData.entries || []).some((e) => e && String(e.id) === String(id))); } catch (e) { return false; } }
+function orgWikiLink(id, label) {
+  if (!orgWikiHas(id)) return null;
+  const a = el('a', 'org-wiki-link');
+  a.href = '#'; a.textContent = label || ('용어 ' + id);
+  a.title = '편람 항목 "' + id + '" 을 열어요 — 정의 원본은 스펙(owner_spec)이 SSoT 예요';
+  a.onclick = (ev) => {
+    ev.preventDefault(); ev.stopPropagation();
+    // v2.4.134 — 낱말 링크는 위키를 **곁에** 열어요(추가 분할). 종전엔 보던 탭을 위키로 갈아치워서,
+    //   「이 낱말 뭐지」 한 번에 읽던 화면을 잃었어요. 좁으면 종전대로 단일 전환(4단을 우겨넣지 않아요).
+    try { setPanes('wiki', innerWidth >= WIDE_W && ui.panes.length < PANES_MAX); } catch (e) {}
+    try { wikiOpenAside(String(id)); } catch (e) {}
+  };
+  return a;
+}
+function orgFindCurrent(ref) {
+  if (!orgHas(ref) || !ui.state) return null;
+  const cur = ui.state.current, items = Array.isArray(cur) ? cur : (cur ? [cur] : []), want = String(ref);
+  for (const it of items) if (it && it.id != null && String(it.id) === want) return it;
+  for (const it of items) if (it && Array.isArray(it.sub)) for (const s of it.sub) if (s && s.id != null && String(s.id) === want) return s;
+  return null;
+}
+function orgSeatOf(entry) { for (const f of ORG_SEAT_FIELDS) { const v = entry && entry[f]; if (orgHas(v)) return String(v); } return null; }
+function orgAnySeatAttr(list) { return (Array.isArray(list) ? list : []).some(e => orgSeatOf(e)); }
+function orgBoardSlice(list, role, taskRef) {
+  const want = String(role), ref = orgStr(taskRef), out = [];
+  for (const e of (Array.isArray(list) ? list : [])) {
+    if (!e) continue;
+    const seat = orgSeatOf(e);
+    if ((seat && seat === want) || (ref && e.id != null && String(e.id) === ref)) out.push(e);
+  }
+  return out;
+}
+function orgCloseDetail() { orgPopRole = null; const p = $('#org-pop'); if (p) p.hidden = true; }
+function orgOpenDetail(role) {
+  const pop = $('#org-pop'), body = $('#org-pop-body'); if (!pop || !body) return;
+  const r = orgRoleObj(role); if (!r) return;
+  orgPopRole = String(role);
+  orgEnsureClasses();
+  const st = orgStateOf(orgPopRole), k = orgStatusKey(orgPopRole), ch = orgResolveChannel(orgPopRole);
+  // 머리 — 닫기 버튼(#org-pop-x)을 지우지 않도록 머리 전체를 덮지 않아요. 제목 자리(#org-pop-title)가 있으면 그걸 쓰고,
+  // 없을 때만 내가 만든 .org-title 을 넣어요. 내가 만든 요소는 data-org-owned 로 표시해 다음 열기 때 그것만 교체해요.
+  const head = $('#org-pop-head');
+  const headTitle = orgPopRole + (orgHas(r.title) ? ' · ' + String(r.title) : '') + ' · ' + orgStatusLabel(orgPopRole);
+  const popTitle = $('#org-pop-title');
+  if (popTitle) popTitle.textContent = headTitle;
+  if (head) {
+    head.querySelectorAll('[data-org-owned="1"]').forEach(n => n.remove());
+    const add = [];
+    if (!popTitle) { const t = el('span', 'org-title'); t.dataset.orgOwned = '1'; t.textContent = headTitle; add.push(t); }
+    // 좌석 이름 자체가 편람 항목인 경우(liaison 처럼 어휘로 등재된 duty profile)에만 용어 링크를 붙여요.
+    const seatTerm = orgWikiLink(orgPopRole, '📖 용어');
+    if (seatTerm) { seatTerm.dataset.orgOwned = '1'; add.push(seatTerm); }
+    const talk = orgTalkBtn(orgPopRole, ch); talk.dataset.orgOwned = '1';
+    add.push(talk);
+    const x = $('#org-pop-x');
+    if (x && x.parentNode === head) for (const n of add) head.insertBefore(n, x);
+    else head.append(...add);
+  }
+  body.innerHTML = '';
+  // ① 현재 작업 + 단계 타임라인 (taskRef 로 보드 current[] 항목을 참조 — 복제 아니라 참조)
+  const s1 = orgSec('현재 작업');
+  if (!st) s1.append(orgRow('상태', ORG_UNKNOWN + ' — 이 좌석의 상태 선언을 받지 못했어요'));
+  else {
+    s1.append(orgRow('상태', orgStatusLabel(orgPopRole) + (k === 'unknown' ? ' — ' + orgUnknownWhy(orgPopRole) : '')));
+    // 상세 화면에서는 마지막 값을 지워버리지 않아요 — 카드에선 감추지만 여기선 "지금 값이 아님" 딱지를 붙여 보존해요.
+    if (k === 'unknown') s1.append(orgRow('마지막 선언', (ORG_ST[orgStr(st.status)] || orgStr(st.status) || null), '지금 값이 아니라 마지막으로 받은 값이에요'));
+    s1.append(orgRow('작업', orgHas(st.task) ? String(st.task) : null));
+    s1.append(orgRow('시작', orgHas(st.since) ? fmtDateTime(st.since) + ' (' + relTime(st.since) + ')' : null));
+    if (k === 'blocked' || orgHas(st.blockReason)) s1.append(orgRow('막힌 이유', orgHas(st.blockReason) ? String(st.blockReason) : null));
+    s1.append(orgRow('보드 항목 (taskRef)', orgHas(st.taskRef) ? String(st.taskRef) : null));
+  }
+  const curItem = orgFindCurrent(st && st.taskRef);
+  if (curItem && Array.isArray(curItem.stages) && curItem.stages.length) {
+    const row = el('div', 'org-row');
+    const kk = el('span', 'org-k'); kk.textContent = '단계';
+    const vv = el('span', 'org-v');
+    for (const sg of curItem.stages) {
+      const sstat = orgStr(sg && sg.status);
+      const e = el('span', 'org-stage ' + (sstat === 'done' ? 'done' : sstat === 'active' ? 'active' : 'pending'));
+      e.textContent = orgStr(sg && sg.label);
+      e.title = '상태 ' + (sstat || 'pending');
+      vv.append(e);
+    }
+    row.append(kk, vv); s1.append(row);
+  } else {
+    s1.append(orgRow('단계', null, (st && orgHas(st.taskRef))
+      ? (curItem ? '그 보드 항목에 stages[] 가 없어요' : 'taskRef 가 가리키는 보드 항목을 현재 작업에서 찾지 못했어요')
+      : 'taskRef 가 없어 보드 항목과 연결할 수 없어요'));
+  }
+  body.append(s1);
+  // ② 최근 보고 — 좌석 귀속 필드 또는 taskRef 일치분만 (추정으로 끌어오지 않아요)
+  const s2 = orgSec('최근 보고');
+  const doneList = (ui.state && ui.state.done) || [];
+  const mineDone = orgBoardSlice(doneList, orgPopRole, st && st.taskRef).slice(0, 5);
+  if (mineDone.length) for (const d of mineDone) s2.append(orgRow(orgHas(d.at) ? fmtDateTime(d.at) : (orgHas(d.when) ? String(d.when) : '완료'), orgHas(d.title) ? String(d.title) : null));
+  else {
+    s2.append(orgRow('보고', null));
+    if (doneList.length && !orgAnySeatAttr(doneList)) s2.append(orgRow('참고', '보드 완료 항목에 좌석 귀속 필드가 없어서 좌석별로 가릴 수 없어요'));
+  }
+  body.append(s2);
+  // ③ 이 좌석의 예정 슬라이스
+  const s3 = orgSec('예정 슬라이스');
+  const planList = (ui.state && ui.state.planned) || [];
+  const minePlan = orgBoardSlice(planList, orgPopRole, st && st.taskRef);
+  if (minePlan.length) for (const p of minePlan) s3.append(orgRow(p.blocked ? '막힘' : (p.waiting ? '대기' : '예정'), orgHas(p.title) ? String(p.title) : null, orgHas(p.blockReason) ? String(p.blockReason) : ''));
+  else {
+    s3.append(orgRow('예정', null));
+    if (planList.length && !orgAnySeatAttr(planList)) s3.append(orgRow('참고', '보드 예정 항목에 좌석 귀속 필드가 없어서 좌석별로 가릴 수 없어요'));
+  }
+  body.append(s3);
+  // ④ 경계 (owns[] — §6.7 쓰기 분할)
+  const s4 = orgSec('경계 (쓰기 가능 경로)');
+  if (Array.isArray(r.owns) && r.owns.length) for (const p of r.owns) s4.append(orgRow('경로', orgStr(p)));
+  else s4.append(orgRow('경로', null));
+  body.append(s4);
+  // ⑤ 해석된 토글 — 차트가 준 값 그대로 (불변식 3·4)
+  const s5 = orgSec('해석된 토글 · 좌석 선언');
+  s5.append(orgRow('티어', orgHas(r.tier) ? String(r.tier) : null, '차트가 준 해석된 값이에요'));
+  s5.append(orgRow('잔류', orgHas(r.residency) ? orgKo(ORG_RES_KO, r.residency) : null));
+  s5.append(orgRow('하네스', orgHas(r.harness) ? String(r.harness) : null));
+  s5.append(orgRow('호스트', orgHas(r.host) ? String(r.host) + (orgHostTitle(r.host) ? ' — ' + orgHostTitle(r.host) : '') : null));
+  s5.append(orgRow('레인', orgHas(r.lane) ? orgKo(ORG_LANE_KO, r.lane) : null));
+  s5.append(orgRow('잔류 등급', orgHas(r.residency) ? orgKo(ORG_RES_KO, r.residency) : null, '이 좌석의 모델 프로세스 수명 등급이에요', orgWikiLink('residency-class', '용어')));
+  s5.append(orgRow('트레이스', orgHas(r.traceMode) ? orgKo(ORG_TRACE_KO, r.traceMode) : null));
+  s5.append(orgRow('그룹', orgHas(r.group) ? orgGroupTitle(r.group) : null));
+  s5.append(orgRow('생성 근거 (createdFor)', orgHas(r.createdFor) ? String(r.createdFor) : null));
+  s5.append(orgRow('책상 라벨 (deskRef)', orgHas(r.deskRef) ? String(r.deskRef) : null, '불투명 라벨이에요 — 파일 경로가 아니에요', orgWikiLink('desk', '용어')));
+  if (ch && ch.exact) {
+    let ops = null; try { ops = wsOpsStates.get(ch.id) || null; } catch {}
+    if (ops) {
+      const bits = [orgHas(ops.model) ? '모델 ' + String(ops.model) : '', orgHas(ops.effort) ? 'effort ' + String(ops.effort) : '', ops.fast != null ? 'fast ' + String(ops.fast) : '', orgHas(ops.subscaler) ? 'subscaler ' + String(ops.subscaler) : ''].filter(Boolean).join(' · ');
+      s5.append(orgRow('운용 선언 (OpsState)', bits || null, '채널 ' + ch.id + ' 가 스스로 선언한 값이에요 — 차트와 별개 소스예요'));
+    }
+  }
+  body.append(s5);
+  // ⑥ 최근 A2A — 모니터 행의 src {from,to} 실측분만
+  const s6 = orgSec('최근 A2A ' + ORG_A2A_N + '건');
+  // 사유는 값 자리에 적어요 — null 로 넘기면 orgRow 가 '미선언' 으로 접어버려서 "선언은 됐는데 미합류" 와
+  // "선언 자체가 없음" 이 같은 글자로 보여요 (렌더 기본값이 구분을 삼키는 부류).
+  if (!ch) s6.append(orgRow('대응 채널', 'agentId 미선언 — 짐작 매칭 안 함', '좌석명과 정확히 같은 채널도 없어요. 로스터에 이 좌석의 agentId 를 선언하면 연결돼요'));
+  else if (!ch.id) s6.append(orgRow('대응 채널', '선언 "' + orgStr(ch.declared) + '" · 아직 미합류', '좌석 미가동이에요 — 선언된 에이전트가 보드에 합류하면 연결돼요'));
+  else {
+    const rows = orgA2aRowsFor(ch.id).slice(-ORG_A2A_N).reverse();
+    if (!rows.length) s6.append(orgRow('메시지', null, '채널 ' + ch.id + ' 에서 관측된 A2A 가 없어요'));
+    else for (const rw of rows) {
+      const dir = String(rw.src.from) === ch.id ? '→ ' + String(rw.src.to) : '← ' + String(rw.src.from);
+      const sum = [orgStr(rw.label), orgStr(rw.a2a && rw.a2a.summary)].filter(Boolean).join(' · ');
+      s6.append(orgRow(orgStr(rw.t) + ' ' + dir, sum || null));
+    }
+  }
+  body.append(s6);
+  // ⑦ 이 좌석의 게이트 큐 (열린 검토사안)
+  const s7 = orgSec('게이트 큐');
+  const decs = ((ui.state && Array.isArray(ui.state.decisions)) ? ui.state.decisions : []).filter(d => d && d.status !== 'resolved');
+  const mineDec = decs.filter(d => { const seat = orgSeatOf(d); return seat && seat === orgPopRole; });
+  if (mineDec.length) for (const d of mineDec) s7.append(orgRow(orgHas(d.id) ? String(d.id) : '검토', orgHas(d.question) ? String(d.question) : (orgHas(d.title) ? String(d.title) : null)));
+  else {
+    s7.append(orgRow('열린 검토사안', null));
+    if (decs.length && !orgAnySeatAttr(decs)) s7.append(orgRow('참고', '열린 검토사안 ' + decs.length + '건이 있지만 좌석 귀속 필드가 없어요 — 좌석별로 가릴 수 없어요'));
+  }
+  body.append(s7);
+  pop.hidden = false;
+}
+function setupOrg() {
+  const rf = $('#org-refresh'); if (rf) rf.onclick = () => { try { renderOrg(); } catch {} };
+  const x = $('#org-pop-x'); if (x) x.onclick = () => orgCloseDetail();
+  // ESC = 상세 팝업만 닫고 전파 차단 (#wiki-aside 관례와 동일)
+  document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') { const p = $('#org-pop'); if (p && !p.hidden) { ev.stopPropagation(); orgCloseDetail(); } } });
+  try { renderOrg(); } catch {}
+}
+
+// ---- boot ----
+ui.panes = loadPanes(); ui.splitFrac = loadSplitFrac(); ui.splitFixed = loadSplitFixed();
+setupTopbar();         // fixed 상단바 높이 → --topbar-h (메인 패딩)
+setupSplit();          // 분할 뷰 분리선/핸들 + 폭 1600 자동 분할
+applyPanes();          // 복원된 panes 로 단일/분할 레이아웃 적용
+setupFilterNav();      // 필터 가로 스크롤 인디케이터 (‹ ›)
+setupFreeRequest();    // 검토사안 최상단 자유 추가 요청
+setupAttachments();    // 항목 첨부(코드/mermaid/시각) 칩 → 팝업 → 별 탭
+setupStandbyToggle();  // 무한 대기 모드 토글 (conn 왼쪽)
+setupHomeTracking();   // 콘텐츠 크기 변화에 맞춰 홈 위치 유지 (초기 센터링 포함)
+setupWiki();           // Compendium 위키 탭 (v0.2-d) — /compendium.json fetch + dual-register 렌더
+setupOrg();            // §13.33 조직도 탭 — 새로고침·상세 팝업 닫기(✕/ESC) 배선 + 초기 빈 상태 렌더
+fetch('/api/state').then(r => r.json()).then(applyState).catch(() => {});
+connect();
+// 검토 반영 시각의 상대시간 실시간 갱신
+setInterval(() => {
+  document.querySelectorAll('.dreviewed-at').forEach(s => { const at = s.dataset.at, rel = s.querySelector('.rel'); if (at && rel) rel.textContent = '(' + relTime(at) + ')'; });
+}, 30000);
+
+// ==== WS 실시간 채널 (WS-PROTOCOL.md v0.2 multi-agent) — 대시보드 = board 클라이언트 ====
+// ⚠ 대시보드는 HELLO 미송신. server 가 SERVER_HELLO + CUSTOM/AgentList(연결된 에이전트 목록) push.
+//    agent outbound(agentId 태그) → 채널별 분류·표시. 입력은 활성 채널의 targetAgentId 로 송신.
+const wsState = {
+  ws: null, open: false, retry: null, popOpen: false,
+  channels: new Map(),    // agentId → { name, rows:[], unseen, agentSeen, runId, seq, msgBuf }
+  active: null,           // 활성 채널 agentId
+  present: new Set(),     // 현재 연결된 agentId (AgentList 기준)
+  replaying: false,       // 서버 History 재생 중 (렌더·뱃지 억제)
+  debugOpen: false,       // raw 이벤트 debug drawer 표시 여부 (timeline 과 전환)
+  textareas: new Map(),   // 채널키 → 별도 textarea (탭별 독립 입력)
+  taH: 54,                // 전 채널 입력란 통일 높이(최대값)
+};
+const wsAtts = [];        // WS 입력 첨부 (전송 시 동봉, 비영속)
+
+// ---- 채널 탭별 입력란: 별도 textarea·내용 유지·영속·auto-grow·전탭 최대높이 일괄 통일 (사용자 #166) ----
+const WS_DRAFTS = 'constellation-ws-drafts';
+const WS_TA_MIN = 54, WS_TA_MAX = 240;
+let wsDrafts = {};        // { 채널키: 입력텍스트 } — 새로고침 영속
+function wsLoadDrafts() { try { const o = JSON.parse(localStorage.getItem(WS_DRAFTS) || 'null'); if (o) { wsDrafts = o.drafts || {}; if (o.taH) wsState.taH = Math.min(WS_TA_MAX, Math.max(WS_TA_MIN, o.taH)); } } catch {} }
+function wsSaveDrafts() { try { const d = { ...wsDrafts }; for (const [k, ta] of wsState.textareas) { if (ta.value) d[k] = ta.value; else delete d[k]; } wsDrafts = d; localStorage.setItem(WS_DRAFTS, JSON.stringify({ drafts: d, taH: wsState.taH })); } catch {} }   // loaded drafts baseline 에 materialized 만 merge — 비활성(미생성) 채널 draft 소실 방지 (codex P2)
+// 활성 textarea 필요높이 측정 → 전 채널 최대값으로 모든 입력란 일괄 높이(탭 전환 시 위치 불변)
+function wsRecalcTaH() {
+  const a = wsState.active, ta = a && wsState.textareas.get(a);
+  if (ta && ta.classList.contains('active')) { const p = ta.style.height; ta.style.height = 'auto'; ta._h = Math.min(WS_TA_MAX, Math.max(WS_TA_MIN, ta.scrollHeight)); ta.style.height = p; }
+  let max = WS_TA_MIN; for (const t of wsState.textareas.values()) max = Math.max(max, t._h || WS_TA_MIN);
+  wsState.taH = max;
+  for (const t of wsState.textareas.values()) t.style.height = max + 'px';
+}
+function wsTextareaFor(key) {
+  let ta = wsState.textareas.get(key); if (ta) return ta;
+  ta = el('textarea'); ta.className = 'ws-ta'; ta.dataset.chan = key; ta._h = WS_TA_MIN;
+  ta.placeholder = '진행 중인 에이전트에게 바로 전달… (이미지·파일 붙여넣기/드롭 가능)';
+  ta.value = wsDrafts[key] || '';
+  ta.addEventListener('input', () => { wsRecalcTaH(); wsSaveDrafts(); wsCmdAcEval(ta); });   // v2.4.67 슬래시 자동완성 트리거
+  ta.addEventListener('keydown', wsCmdAcKeydown);
+  ta.addEventListener('blur', () => setTimeout(wsCmdAcClose, 120));
+  ta.addEventListener('click', () => { if (wsCmdAc && wsCmdAc.ta === ta) wsCmdAcEval(ta); });   // 커서 이동 재평가
+  onCtrlEnter(ta, wsSendPrompt);
+  attachable({ textarea: ta, atts: wsAtts, persist: () => {}, listEl: $('#ws-atts'), dropEl: null, fileBtn: null, fileInput: null });   // paste(파일) 첨부만
+  const stack = $('#ws-text-stack'); if (stack) stack.appendChild(ta);
+  wsState.textareas.set(key, ta); return ta;
+}
+let wsRoTa = null;        // 그룹·모니터(읽기 전용) 안내 입력란(공유)
+function wsRoTextarea() { if (wsRoTa) return wsRoTa; wsRoTa = el('textarea'); wsRoTa.className = 'ws-ta'; wsRoTa.disabled = true; wsRoTa.placeholder = '모니터·그룹 뷰는 읽기 전용 — 개별 에이전트 탭에서 입력하세요'; wsRoTa.style.height = WS_TA_MIN + 'px'; const stack = $('#ws-text-stack'); if (stack) stack.appendChild(wsRoTa); return wsRoTa; }
+function wsActiveTextarea() {
+  const a = wsState.active;
+  if (!a || wsIsMon(a)) return null;   // 모니터 = 읽기전용
+  if (wsIsGroup(a)) { const rep = wsGroupRep(a); return rep ? wsTextareaFor(rep) : null; }   // 그룹 = 대표 워커 입력란
+  return wsTextareaFor(a);
+}
+function wsShowTextarea(key) {
+  const stack = $('#ws-text-stack'); if (!stack) return;
+  wsCmdAcClose();   // v2.4.67 채널 전환 시 후보 닫기
+  for (const t of wsState.textareas.values()) t.classList.remove('active');
+  if (wsRoTa) wsRoTa.classList.remove('active');
+  if (!key) return;
+  if (wsIsMon(key)) { wsRoTextarea().classList.add('active'); return; }   // 모니터 = 읽기전용
+  if (wsIsGroup(key)) {
+    const rep = wsGroupRep(key);
+    if (rep) { const ta = wsTextareaFor(rep); ta.classList.add('active'); wsRecalcTaH(); if (wsState.popOpen) ta.focus({ preventScroll: true }); }
+    else { wsRoTextarea().classList.add('active'); }   // 그룹 멤버 없으면 읽기전용 fallback
+    return;
+  }
+  const ta = wsTextareaFor(key); ta.classList.add('active'); wsRecalcTaH(); if (wsState.popOpen) ta.focus({ preventScroll: true });
+}
+// ---- v2.4.67 주입행 슬래시 명령 자동완성 ----
+// 트리거: 커서 앞 텍스트가 '/'+토큰 전부일 때(공백·개행 나오면 닫힘). ESC=닫기 · ↑↓=이동 ·
+// Enter/Tab=적용 · Ctrl+Enter=그대로 전송. 후보 = 유효 타깃의 CommandManifest(선언) 우선 +
+// 미선언분은 WS_CMD_COMMON(공통 후보 — 해석은 대상 하네스 몫). §8.1 esc-only: 매니페스트 값은
+// 와이어-유래(임의 접속 에이전트 발신 가능) → textContent 로만 렌더, el() 3인자 금지.
+let wsCmdAc = null;   // { items[], sel, ta } — 열림 상태 (닫힘 = null)
+function wsCmdAcEl() {
+  let d = $('#ws-cmd-ac');
+  if (!d) { d = el('div', 'ws-cmd-ac'); d.id = 'ws-cmd-ac'; d.hidden = true; const inp = document.querySelector('.ws-input'); (inp || document.body).appendChild(d); }
+  return d;
+}
+function wsCmdAcCandidates(prefix) {
+  const eff = wsEffectiveTarget();
+  if (!eff || eff.indexOf('room:') === 0) return [];   // room 발화는 자유 발화 — 명령 후보 없음
+  const ch = wsState.channels.get(eff);
+  const route = (ch && ch.routeId) || eff;
+  const man = route && wsCmdManifests.get(route);
+  const declared = (man && Array.isArray(man.commands)) ? man.commands : [];
+  const seen = new Set(declared.map((c) => c && c.name));
+  const merged = declared.map((c) => ({ name: String((c && c.name) || ''), desc: String((c && c.desc) || ''), src: '선언' }))
+    .concat(WS_CMD_COMMON.filter((c) => !seen.has(c.name)).map((c) => ({ ...c, src: '공통' })));
+  const p = prefix.toLowerCase();
+  return merged.filter((c) => c.name && c.name.toLowerCase().indexOf(p) === 0).slice(0, 24);
+}
+function wsCmdAcEval(ta) {
+  // v2.4.69 토큰 기반 트리거: 커서 앞 마지막 공백/줄바꿈 이후 토큰이 '/'+명령문자([A-Za-z0-9_-])
+  // 형태일 때만 오픈 — 문장 중간에서도 뜨고, 두 번째 '/'·'.'·':' 등 path 신호가 나오면 자동 닫힘
+  // (예: src/foo·./x·c:/…·/README.md 는 후보 아님).
+  const cur = ta.selectionStart == null ? ta.value.length : ta.selectionStart;
+  const pre = ta.value.slice(0, cur);
+  const wsIdx = Math.max(pre.lastIndexOf(' '), pre.lastIndexOf('\n'), pre.lastIndexOf('\t'));
+  const token = pre.slice(wsIdx + 1);
+  if (!/^\/[A-Za-z0-9_-]*$/.test(token)) { wsCmdAcClose(); return; }
+  const items = wsCmdAcCandidates(token);
+  if (!items.length) { wsCmdAcClose(); return; }
+  wsCmdAc = { items, sel: 0, ta, tokenStart: wsIdx + 1 };
+  wsCmdAcRender();
+}
+function wsCmdAcRender() {
+  if (!wsCmdAc) return;
+  const d = wsCmdAcEl(); d.innerHTML = ''; d.hidden = false;
+  wsCmdAc.items.forEach((c, i) => {
+    const it = el('div', 'ws-ac-it' + (i === wsCmdAc.sel ? ' on' : ''));
+    const nm = el('span', 'ws-ac-name'); nm.textContent = c.name;
+    const ds = el('span', 'ws-ac-desc'); ds.textContent = c.desc || '';
+    const sc = el('span', 'ws-ac-src ' + (c.src === '선언' ? 'man' : 'com')); sc.textContent = c.src;
+    it.append(nm, ds, sc);
+    it.addEventListener('mousedown', (e) => { e.preventDefault(); if (wsCmdAc) { wsCmdAc.sel = i; wsCmdAcApply(); } });   // mousedown — textarea blur 보다 먼저
+    d.appendChild(it);
+  });
+  const on = d.querySelector('.ws-ac-it.on'); if (on) { try { on.scrollIntoView({ block: 'nearest' }); } catch {} }
+}
+function wsCmdAcClose() { if (!wsCmdAc) return; wsCmdAc = null; const d = $('#ws-cmd-ac'); if (d) { d.hidden = true; d.innerHTML = ''; } }
+function wsCmdAcApply() {
+  if (!wsCmdAc) return;
+  const { ta, items, sel } = wsCmdAc, c = items[sel];
+  if (!c) { wsCmdAcClose(); return; }
+  const cur = ta.selectionStart == null ? ta.value.length : ta.selectionStart;
+  const start = wsCmdAc.tokenStart || 0;   // v2.4.69 토큰만 치환 (문장 중간 트리거 대응)
+  const rest = ta.value.slice(cur).replace(/^[^\S\n]+/, '');
+  ta.value = ta.value.slice(0, start) + c.name + ' ' + rest;
+  const p = start + c.name.length + 1;
+  wsCmdAcClose();
+  try { ta.setSelectionRange(p, p); } catch {}
+  wsRecalcTaH(); wsSaveDrafts(); ta.focus();
+}
+function wsCmdAcKeydown(e) {
+  if (!wsCmdAc || wsCmdAc.ta !== e.target) return;
+  if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); wsCmdAcClose(); return; }   // 실제 UI 처럼 ESC=후보만 닫기 (stopPropagation — 모달/창 닫힘 방지)
+  if (e.key === 'ArrowDown') { e.preventDefault(); wsCmdAc.sel = (wsCmdAc.sel + 1) % wsCmdAc.items.length; wsCmdAcRender(); return; }
+  if (e.key === 'ArrowUp') { e.preventDefault(); wsCmdAc.sel = (wsCmdAc.sel - 1 + wsCmdAc.items.length) % wsCmdAc.items.length; wsCmdAcRender(); return; }
+  if ((e.key === 'Enter' && !e.ctrlKey && !e.metaKey && !e.shiftKey) || e.key === 'Tab') { e.preventDefault(); e.stopPropagation(); wsCmdAcApply(); return; }
+}
+// ---- v2.4.71 입력줄 상태 스트립 (OpsState) ----
+// 유효 타깃의 운용 상태(model·effort·fast·subscaler)를 입력줄 왼쪽 끝에 표시 + 클릭 드랍다운.
+// 데이터 = OpsState 선언 우선, backends.json 폴백. actionable 항목은 대상이 CommandManifest 로
+// 선언한 명령(예: /subscaler)을 UserPrompt 텍스트로 보내는 경로만 — 미선언 제어는 읽기 전용
+// (보드가 하네스 제어를 지어내지 않음). §8.1 esc-only: 전부 textContent.
+function wsOpsShort(m) { return String(m || '').replace(/^claude-/, ''); }
+function wsOpsTargetInfo() {
+  const eff = wsEffectiveTarget();
+  if (!eff || eff.indexOf('room:') === 0) return null;
+  const ch = wsState.channels.get(eff);
+  const route = (ch && ch.routeId) || eff;
+  return { route, ops: wsOpsStates.get(route) || null, bk: wsBackends[route] || null };
+}
+function wsOpsStripSync() {
+  // 좌석 얼굴은 «지금 말 걸고 있는 상대» 를 따라가요 — 타깃이 바뀌는 자리가 여기라서 같이 불러요.
+  //   안 부르면 얼굴이 직전 타깃의 숫자로 남고, 그건 정확히 이번에 고친 부류(출처 불일치)예요.
+  try { wsSeatBtnSync(); } catch {}
+  const b = $('#ws-ops-strip'); if (!b) return;
+  const t = wsOpsTargetInfo();
+  if (!t || (!t.ops && !t.bk)) { b.hidden = true; if (wsOpsMenuOpen) wsOpsMenuClose(); return; }
+  b.hidden = false;
+  let txt = '⚙ ' + wsOpsShort((t.ops && t.ops.model) || (t.bk && t.bk.model) || '?');
+  if (t.ops && t.ops.effort) txt += '·' + t.ops.effort;
+  if (t.ops && t.ops.fast) txt += '·fast';
+  if (t.ops && t.ops.superscalar && t.ops.superscalar.mode) txt += ' · ss:' + t.ops.superscalar.mode;   // v2.4.86 — 디스패치 적극성 (Superscalar §5.2)
+  // v2.4.152 — 투기 승인 모드 (Superscalar §4). off 는 **적어요**, 생략하지 않아요 — 생략하면
+  //   「투기 안 함」과 「모르겠음」이 같은 화면이 되고, 이건 토큰을 버릴 수 있는 유일한 디스패치라
+  //   그 둘이 갈리는 게 중요해요. 대신 좁게: `sp:off`.
+  if (t.ops && t.ops.speculation && t.ops.speculation.mode) txt += ' · sp:' + t.ops.speculation.mode;
+  if (t.ops && t.ops.subscaler) txt += ' · sub:' + (t.ops.subscaler.on ? 'on' : 'off');
+  const _ec = wsEchoState[t.route]; if (_ec && _ec.level && _ec.level !== 'off') txt += ' · 📡' + _ec.level;   // v2.4.81 — 에코 모드 (EchoModeState 공지 기준; off/미공지 = 요약 생략)
+  b.textContent = txt;
+}
+let wsOpsMenuOpen = false;
+function wsOpsMenuClose() { const m = $('#ws-ops-menu'); if (m) m.remove(); wsOpsMenuOpen = false; document.removeEventListener('keydown', wsOpsMenuKey, true); document.removeEventListener('click', wsOpsMenuDoc, true); }
+function wsOpsMenuKey(e) { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); wsOpsMenuClose(); } }
+function wsOpsMenuDoc(e) { if (!e.target.closest('#ws-ops-menu') && !e.target.closest('#ws-ops-strip')) wsOpsMenuClose(); }
+function wsOpsMenuToggle() {
+  if (wsOpsMenuOpen) { wsOpsMenuClose(); return; }
+  const t = wsOpsTargetInfo(); if (!t) return;
+  const man = wsCmdManifests.get(t.route);
+  const hasSubCmd = !!(man && Array.isArray(man.commands) && man.commands.some((c) => c && c.name === '/subscaler'));
+  const menu = el('div', 'ws-ops-menu'); menu.id = 'ws-ops-menu';
+  const row = (label, val, action) => {
+    const r = el('div', 'ws-ops-row' + (action ? ' act' : ''));
+    const l = el('span', 'ws-ops-k'); l.textContent = label;
+    const v = el('span', 'ws-ops-v'); v.textContent = val;
+    r.append(l, v);
+    if (action) r.addEventListener('mousedown', (e) => { e.preventDefault(); action(); });
+    menu.appendChild(r);
+  };
+  row('model', wsOpsShort((t.ops && t.ops.model) || (t.bk && t.bk.model) || '(미선언)'), null);
+  row('effort', (t.ops && t.ops.effort) || '(미선언)', null);
+  if (t.ops && typeof t.ops.fast === 'boolean') row('fast', t.ops.fast ? 'on' : 'off', null);
+  // v2.4.86 — superscalar 모드 행 (Superscalar §5.2 always/auto/off). 컨트롤 규율 동일: 타깃이 /superscalar 를 선언한 경우만 actionable, 순환 auto→always→off→auto.
+  {
+    const ss = t.ops && t.ops.superscalar;
+    if (ss) {
+      const hasSsCmd = !!(man && Array.isArray(man.commands) && man.commands.some((c) => c && c.name === '/superscalar'));
+      const cur = ss.mode || 'auto';
+      const nextS = cur === 'auto' ? 'always' : (cur === 'always' ? 'off' : 'auto');
+      row('superscalar', cur + (ss.autoDemotedFrom ? ' (↓' + ss.autoDemotedFrom + ')' : ''), hasSsCmd ? () => {
+        const promptId = 'p-' + Date.now().toString(36);
+        if (wsSend({ type: 'CUSTOM', name: 'UserPrompt', value: { promptId, text: '/superscalar ' + nextS, atts: [] } })) wsLocalRow('user', '🙋 UserPrompt', '/superscalar ' + nextS, { promptId });
+        wsOpsMenuClose();
+      } : null);
+      if (hasSsCmd) { const h = el('div', 'ws-ops-hint'); h.textContent = 'superscalar 클릭 = /superscalar ' + nextS + ' 전송 (대상이 선언한 명령)'; menu.appendChild(h); }
+    }
+  }
+  // v2.4.152 — speculation 행 (Superscalar §4 off/auto/on/always). 컨트롤 규율 동일: 타깃이
+  //   /speculation 을 선언한 경우만 actionable. 순환은 **위험이 커지는 순서**로 한 칸씩:
+  //   off→auto→on→always→off. 한 번 클릭이 `off` 에서 `always` 로 건너뛰지 않아요 — 이 축은
+  //   토큰을 버릴 수 있는 유일한 디스패치라, 실수로 한 칸 넘는 것과 세 칸 넘는 것이 달라요.
+  {
+    const sp = t.ops && t.ops.speculation;
+    if (sp) {
+      const hasSpCmd = !!(man && Array.isArray(man.commands) && man.commands.some((c) => c && c.name === '/speculation'));
+      const cur = sp.mode || 'off';
+      const ORDER = ['off', 'auto', 'on', 'always'];
+      const nextP = ORDER[(Math.max(0, ORDER.indexOf(cur)) + 1) % ORDER.length];
+      row('speculation', cur + (sp.autoDemotedFrom ? ' (↓' + sp.autoDemotedFrom + ')' : ''), hasSpCmd ? () => {
+        const promptId = 'p-' + Date.now().toString(36);
+        if (wsSend({ type: 'CUSTOM', name: 'UserPrompt', value: { promptId, text: '/speculation ' + nextP, atts: [] } })) wsLocalRow('user', '🙋 UserPrompt', '/speculation ' + nextP, { promptId });
+        wsOpsMenuClose();
+      } : null);
+      if (hasSpCmd) { const h = el('div', 'ws-ops-hint'); h.textContent = 'speculation 클릭 = /speculation ' + nextP + ' 전송 — 승인자만 바뀌어요, 불가역 장벽은 어느 모드에서도 안 움직여요'; menu.appendChild(h); }
+    }
+  }
+  const sub = t.ops && t.ops.subscaler;
+  if (sub) {
+    const next = sub.on ? 'off' : 'on';
+    row('subscaler', (sub.on ? 'on' : 'off') + (sub.pair ? ' (' + sub.pair + (sub.effort ? '·' + sub.effort : '') + ')' : ''), hasSubCmd ? () => {
+      const promptId = 'p-' + Date.now().toString(36);
+      if (wsSend({ type: 'CUSTOM', name: 'UserPrompt', value: { promptId, text: '/subscaler ' + next, atts: [] } })) wsLocalRow('user', '🙋 UserPrompt', '/subscaler ' + next, { promptId });
+      wsOpsMenuClose();
+    } : null);
+    if (hasSubCmd) { const h = el('div', 'ws-ops-hint'); h.textContent = 'subscaler 클릭 = /subscaler ' + next + ' 전송 (대상이 선언한 명령)'; menu.appendChild(h); }
+  }
+  // v2.4.81 — 에코 모드 행 (데이터 = §13.26.4 EchoModeState 공지, OpsState 아님 — 표시는 소스 무관 정직 표시).
+  // 컨트롤 규율 동일: 타깃 CommandManifest 가 /echo-mode 를 선언한 경우만 actionable (순환 off→on→mirror→off).
+  {
+    const ec = wsEchoState[t.route];
+    const ecLv = ec && ec.level ? ec.level : null;
+    const hasEchoCmd = !!(man && Array.isArray(man.commands) && man.commands.some((c) => c && c.name === '/echo-mode'));
+    const nextE = ecLv === 'on' ? 'mirror' : (ecLv === 'mirror' ? 'off' : 'on');
+    row('echo', ecLv ? ecLv + (ec.provenance ? ' (' + ec.provenance + ')' : '') : '(미공지)', hasEchoCmd ? () => {
+      const promptId = 'p-' + Date.now().toString(36);
+      if (wsSend({ type: 'CUSTOM', name: 'UserPrompt', value: { promptId, text: '/echo-mode ' + nextE, atts: [] } })) wsLocalRow('user', '🙋 UserPrompt', '/echo-mode ' + nextE, { promptId });
+      wsOpsMenuClose();
+    } : null);
+    if (hasEchoCmd) { const h = el('div', 'ws-ops-hint'); h.textContent = 'echo 클릭 = /echo-mode ' + nextE + ' 전송 (대상이 선언한 명령)'; menu.appendChild(h); }
+  }
+  const src = el('div', 'ws-ops-hint');
+  src.textContent = t.ops ? 'OpsState 선언 기준 · ' + (t.ops.updatedAt ? new Date(t.ops.updatedAt).toLocaleTimeString() : '') : 'backends 선언 폴백 (에이전트 미선언)';
+  menu.appendChild(src);
+  const wrap = document.querySelector('.ws-input'); (wrap || document.body).appendChild(menu);
+  wsOpsMenuOpen = true;
+  document.addEventListener('keydown', wsOpsMenuKey, true);
+  document.addEventListener('click', wsOpsMenuDoc, true);
+}
+function wsOpsStripInit() {
+  const acts = document.querySelector('.ws-actions'); if (!acts || $('#ws-ops-strip')) return;
+  const b = el('button', 'ws-ops-strip'); b.id = 'ws-ops-strip'; b.type = 'button'; b.hidden = true;
+  b.title = '대상 에이전트 운용 상태 (model·effort·superscalar·speculation·subscaler·echo) — 클릭 = 상세/제어';
+  b.onclick = (e) => { e.stopPropagation(); wsOpsMenuToggle(); };
+  const left = document.getElementById('ws-act-left');   // v2.4.80 좌측 그룹 — ⚙ 이 그룹 맨 왼쪽, 🧵 이 그 오른쪽
+  if (left) left.prepend(b); else acts.appendChild(b);   // 폴백: 구 마크업이면 종전 위치(.ws-actions 는 row-reverse — 마지막 append = 왼쪽 끝)
+  wsOpsStripSync();
+}
+function wsURL() { return `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`; }
+function connectWS() {
+  try { if (wsState.ws) { wsState.ws.onclose = null; wsState.ws.close(); } } catch {}
+  let ws;
+  try { ws = wsState.ws = new WebSocket(wsURL()); } catch { scheduleWSReconnect(); return; }
+  ws.onopen = () => { wsState.open = true; updateWsConn(); };
+  ws.onmessage = (e) => { let m; try { m = JSON.parse(e.data); } catch { return; } onWsEvent(m); };
+  ws.onerror = () => {};
+  ws.onclose = () => { if (wsState.ws === ws) { wsState.open = false; wsState.ws = null; wsState.present = new Set(); updateWsConn(); wsRenderTabs(); scheduleWSReconnect(); } };
+}
+// v2.4.153 §13.25.17 — **거부당한 접속은 죽은 서버와 다른 사건이에요.** 그런데 브라우저는 실패한
+//   WS 핸드셰이크의 HTTP 상태(401)를 스크립트에 안 줘요 — onclose code 1006 뿐이라, 여기서는
+//   「끊김」과 「거부」가 **글자까지 같은 모양**이에요. 그래서 종전엔 3초마다 조용히 재시도만 했고,
+//   운영자에게는 보드가 죽은 것으로 보였어요(2026-08-09 실측: 보드 재기동 후 세션은 메모리라
+//   사라지는데 화면은 그 사실을 한 번도 말하지 않았어요. 로그에만 «미인증 브라우저 거부» 가 쌓였어요).
+//   상태를 못 읽으면 **물어보면 돼요** — /api/whoami 는 세션 없이도 닿는 자리라 그 답이 판별자예요.
+//   그리고 **로그인 막은 페이지 로드 때만 판정**해요 (login.js render()). 재기동 전부터 열려 있던
+//   탭은 그래서 영원히 안 물어봐요 — 이번 사건의 실제 모양이 그거예요(탭은 어제부터 열려 있었고,
+//   그 안의 보드 내용은 restart 이전 화면이라 «멈춘 보드» 로 보여요). 여기서 `refresh()` 를 불러
+//   그 판정을 **다시** 돌려요. 계정 관리 패널(openPanel)이 아니에요 — 그건 다른 표면이에요.
+async function wsCheckAuthGate() {
+  try {
+    const r = await fetch('/api/whoami', { credentials: 'same-origin' });
+    const j = await r.json();
+    const gated = !!(j && j.loginRequired && !j.operator);
+    wsState.authGate = gated;
+    updateWsConn();
+    if (gated) { try { if (window.egLogin) await window.egLogin.refresh(); } catch (_) {} }   // render() 가 로그인 막을 띄워요 (이미 떠 있으면 그대로 둬요 — 입력 중 날림 방지)
+    return gated;
+  } catch (_) { return false; }               // whoami 도 못 닿으면 그건 진짜 서버 문제 — 재시도가 맞아요
+}
+function scheduleWSReconnect() {
+  if (wsState.retry) return;
+  wsCheckAuthGate();                          // 재시도 전에 **왜** 끊겼는지 한 번 물어요
+  wsState.retry = setTimeout(() => { wsState.retry = null; connectWS(); }, 3000);
+}
+// 탭 복귀 시 끊긴 WS 즉시 재연결 (SSE 와 동일 정책)
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && (!wsState.ws || wsState.ws.readyState > 1)) connectWS(); });
+
+function nowHM() { return new Date().toTimeString().slice(0, 8); }
+// 발신 시각 보존 (EstreUF parity) — 새로고침·History replay 후에도 원본 발신 시각 고정. 우선순위: m.timestamp(epoch ms) → m.at(ISO) → null.
+function wsMsgEpoch(m) {
+  if (m && typeof m.timestamp === 'number' && isFinite(m.timestamp)) return m.timestamp;
+  if (m && typeof m.timestamp === 'string') { const e = Date.parse(m.timestamp); if (!isNaN(e)) return e; }   // v2.4.60 — 일부 발신 경로가 ISO 문자열로 스탬프 → 숫자-전제 파싱이 null 로 떨어져 매 새로고침 현재시간 표시되던 버그
+  if (m && m.at) { const e = Date.parse(m.at); if (!isNaN(e)) return e; }
+  return null;
+}
+function wsRowTime(m) { const e = wsMsgEpoch(m); return e != null ? new Date(e).toTimeString().slice(0, 8) : nowHM(); }
+function wsFmtVal(v) { if (v == null) return ''; if (typeof v === 'string') return v; try { return JSON.stringify(v); } catch { return String(v); } }
+function wsTrunc(s, n = 220) { s = wsFmtVal(s); return s.length > n ? s.slice(0, n) + '…' : s; }
+function wsOutcome(o) { return !o ? '' : (o.type === 'cancelled' ? `취소됨${o.reason ? ' · ' + o.reason : ''}` : (o.type || 'success')); }
+
+// ---- 채널 ----
+// 채널 scoping(§4): 키 = channelId(있으면, threadId 다르면 :threadId) 우선, 없으면 agentId.
+// routeId = 사용자 입력 라우팅용 agentId(server 는 agentId 로 등록 → channelId 키여도 routeId 로 송신).
+function wsChanKey(m) {
+  // 채널 = 에이전트 단위(agentId). channelId/threadId 는 채널을 쪼개지 않고 row 출처 뱃지로 표시
+  if (m.roomId) return 'room:' + m.roomId;   // §13.30 roundtable — room 트래픽은 방 자체 채널
+  return m.agentId || m.targetAgentId || m.channelId;
+}
+function wsChanLabel(m) {   // row 출처 뱃지 — 에이전트 통합 채널 안에서 대화 출처(channelId/threadId) 구분, 길면 축약
+  const cid = m.channelId; if (!cid) return '';
+  const tid = m.threadId;
+  if (!tid || tid === cid) return cid;
+  const segs = String(tid).split(':').filter((s) => s && s !== 'agent' && s !== 'main').map((s) => /^-?\d+$/.test(s) ? s.slice(-4) : s);
+  return cid + '·' + segs.slice(-3).join(':');
+}
+function wsChanFull(m) { return (m.channelId && m.threadId && m.threadId !== m.channelId) ? m.channelId + ':' + m.threadId : (m.channelId || ''); }
+function wsChanEl(row) { const c = el('span', 'ws-chan'); c.textContent = row.chan; if (row.chanFull) c.title = row.chanFull; return c; }
+function wsSrcEl(row) {   // A2A 방향 뱃지 — 각 에이전트 이름을 role 색(업스트림 주황·메인 보라·로컬 녹색)으로
+  const s = el('span', 'ws-src');
+  const mk = (id) => { const sp = el('span', 'r-' + wsRoleOf(id)); sp.textContent = wsName(id); return sp; };
+  s.append(mk(row.src.from), document.createTextNode(' → '), mk(row.src.to));
+  s.title = wsName(row.src.from) + ' → ' + wsName(row.src.to);
+  return s;
+}
+function wsChannel(key, name, meta) {
+  let ch = wsState.channels.get(key);
+  if (!ch) {
+    ch = { name: name || key, rows: [], unseen: 0, agentSeen: false, runId: null, seq: null, msgBuf: Object.create(null), toolBuf: Object.create(null), debug: [], routeId: key, channelId: null, threadId: null, projectName: '', githubRepo: '', connStatus: '', hidden: wsLoadHidden().indexOf(key) >= 0 };
+    wsState.channels.set(key, ch);
+    if (!wsState.active && !ch.hidden && !wsState.replaying) wsState.active = key;   // 재생 중엔 active 고정 안 함 → 재생 후 메인 우선 선택(wsReplayHistory)
+    if (!wsState.replaying) wsRenderTabs();
+  } else if (name && name !== key && ch.name !== name) { ch.name = name; if (!wsState.replaying) wsRenderTabs(); }
+  if (meta) {   // project/channel scoped 메타 갱신(§4·§6)
+    if (meta.routeId) ch.routeId = meta.routeId;
+    if (meta.channelId != null) ch.channelId = meta.channelId;
+    if (meta.threadId != null) ch.threadId = meta.threadId;
+    if (meta.projectName) ch.projectName = meta.projectName;
+    if (meta.githubRepo) ch.githubRepo = meta.githubRepo;
+  }
+  return ch;
+}
+function wsSyncAgents(agents) {
+  wsState.present = new Set(agents.map(a => a.agentId));
+  let anyUnhidden = false;
+  for (const a of agents) {
+    const c = wsChannel(a.agentId, a.agentName);
+    // ⚠ **열린 사안 (2026-08-08)**: 폴백이 `'local'` 이라 **역할을 모르는 채널이 로컬 그룹에 앉아요.**
+    //   서버 쪽 §3.1 은 「모르는 kind 는 등록 경계에서 거부, 기본값으로 강제 금지」라고 규범으로 적고
+    //   있는데 이 줄이 그 반대예요. 실측 — 어느 그룹에도 안 속한 `role=undefined` 채널이 존재하고
+    //   (`*-a2a-dispatch`), 세션 순서에 따라 그게 로컬 그룹 첫 멤버가 될 수 있어요.
+    //   **여기서 폴백을 바로 없애지 않는 이유**: 그러면 그 채널들이 어느 그룹에도 안 떠서 **화면에서
+    //   사라져요** — 오분류(보임)보다 부재(안 보임)가 더 나쁜 교환이에요. 처방은 «미분류» 그룹을
+    //   따로 만들어 렌더는 하되 전송 대표에서 제외하는 것이고, 그건 별도 결정이에요.
+    //   그때까지의 완화는 `wsGroupRep` 이 **화면의 첫 탭**을 대표로 쓰게 한 것 — 오분류가 남아도
+    //   운영자가 그 자리에서 보게 돼요(숨은 채널이 대상이 되는 상태는 닫혔어요).
+    c.role = (wsBackends[a.agentId] && wsBackends[a.agentId].role) || a.role || 'local';   // §13.1 role; C1: backends.json overlay 가 board-worker 등 선언 role 우선
+    if (c.hidden) { c.hidden = false; anyUnhidden = true; }   // FIX: agent 가 AgentList 에 present 면 닫힌 탭에서 자동 복원 (새로고침 후 업스트림 등이 archived stub 으로 처리됐다가 실제 연결돼 있을 때)
+  }
+  if (anyUnhidden) { wsSaveHidden(); wsRenderArchived(); }
+  if (!wsState.active && agents.length) wsState.active = agents[0].agentId;
+  wsRenderTabs(); updateWsConn();
+}
+
+
+// ---- 마크다운 풀 렌더 (v2.4.135, deps0 · esc 선행) ----
+// 종전 wsMd 는 대화 전용 미니 렌더라 **표·순서목록·인용·mermaid 가 없었어요** — 그리고 없다는 게
+// 파이프 문자가 그대로 보이는 모양으로만 드러나서, 「렌더가 안 된다」 말고는 진단이 안 붙었어요.
+// 보안 규율은 그대로: 원문을 먼저 esc 하고 그 위에서만 태그를 만들어요. mermaid 는 소스를 속성에
+// 담아 두고 textContent 로 주입해요(innerHTML 이면 파싱 전에 <img onerror> 가 실행돼요 — v2.4.12 교훈).
+function mdCells(l) { return l.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(c => c.trim()); }
+function mdIsSep(l) { return /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/.test(l || ''); }
+function mdFull(src) {
+  if (!src) return '';
+  const cb = [];
+  let s = String(src).replace(/```([^\n]*)\n?([\s\S]*?)```/g, (_, info, code) => {
+    cb.push({ lang: String(info || '').trim().toLowerCase(), code: code.replace(/\n+$/, '') });
+    return '\u0000CB' + (cb.length - 1) + '\u0000';
+  });
+  s = esc(s);
+  s = s.replace(/`([^`\n]+)`/g, '<code class="ws-code">$1</code>')
+       .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+       .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>')
+       .replace(/~~([^~\n]+)~~/g, '<del>$1</del>')
+       .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  const lines = s.split('\n'), out = [];
+  let list = null;
+  const closeList = () => { if (list) { out.push('</' + list + '>'); list = null; } };
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+    if (/\|/.test(ln) && mdIsSep(lines[i + 1])) {                       // GFM 표
+      closeList();
+      const head = mdCells(ln); let j = i + 2; const body = [];
+      while (j < lines.length && lines[j].trim() && /\|/.test(lines[j])) { body.push(mdCells(lines[j])); j++; }
+      out.push('<div class="md-table-wrap"><table class="md-table"><thead><tr>' + head.map(h => '<th>' + h + '</th>').join('') +
+        '</tr></thead><tbody>' + body.map(r => '<tr>' + r.map(c => '<td>' + c + '</td>').join('') + '</tr>').join('') + '</tbody></table></div>');
+      i = j - 1; continue;
+    }
+    const mH = ln.match(/^(#{1,6})\s+(.*)$/);
+    const mUl = ln.match(/^\s*[-*+]\s+(.*)$/);
+    const mOl = ln.match(/^\s*\d+[.)]\s+(.*)$/);
+    const mQ = ln.match(/^\s*&gt;\s?(.*)$/);
+    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(ln)) { closeList(); out.push('<hr class="md-hr">'); }
+    else if (mH) { closeList(); out.push('<div class="ws-md-h md-h' + mH[1].length + '">' + mH[2] + '</div>'); }
+    else if (mUl) { if (list !== 'ul') { closeList(); out.push('<ul class="ws-md-ul">'); list = 'ul'; } out.push('<li>' + mUl[1] + '</li>'); }
+    else if (mOl) { if (list !== 'ol') { closeList(); out.push('<ol class="ws-md-ol">'); list = 'ol'; } out.push('<li>' + mOl[1] + '</li>'); }
+    else if (mQ) { closeList(); out.push('<blockquote class="md-q">' + mQ[1] + '</blockquote>'); }
+    else { closeList(); out.push(ln); }
+  }
+  closeList();
+  // 줄바꿈 변환이 **먼저**, 자리표 복원이 **나중**이에요. 뒤집으면 줄바꿈 태그가 다이어그램 소스와
+  //   코드 블록 안까지 들어가서 mermaid 가 파싱에 실패해요(실측 — 첫 판이 정확히 그랬어요).
+  s = out.join('\n');
+  s = s.replace(/\n/g, '<br>');
+  s = s.replace(/\u0000CB(\d+)\u0000/g, (_, i) => {
+    const b = cb[+i];
+    if (b.lang === 'mermaid') return '<div class="md-mermaid" data-mmd="' + esc(b.code) + '">◈ 다이어그램…</div>';
+    return '<pre class="ws-pre"><code>' + esc(b.code) + '</code></pre>';
+  });
+  s = s.replace(/(<\/(?:pre|ul|ol|div|table|blockquote)>|<hr class="md-hr">)<br>/g, '$1')
+       .replace(/<br>(<(?:pre|ul|ol|div|li|table|blockquote|hr))/g, '$1');
+  return s;
+}
+// mermaid 자리표 → 실제 렌더. 보이는 컨테이너에서만 치수를 잴 수 있어서 삽입 **후** 불러요.
+async function mdMount(root) {
+  const nodes = [...(root || document).querySelectorAll('.md-mermaid:not([data-mounted])')];
+  if (!nodes.length) return;
+  for (const n of nodes) { n.dataset.mounted = '1'; n.textContent = n.dataset.mmd || ''; n.classList.add('mermaid'); }
+  try { const m = await ensureMermaid(); await m.run({ nodes }); }
+  catch (e) { for (const n of nodes) { n.classList.remove('mermaid'); n.innerHTML = '<pre class="ws-pre"><code>' + esc(n.dataset.mmd || '') + '</code></pre>'; } }
+}
+
+// 종전 이름 유지 (호출처 다수) — 이제 풀 렌더로 위임해요.
+function wsMd(src) { return mdFull(src); }
+function wsMdLegacy(src) {
+  if (!src) return '';
+  const cb = [];
+  let s = String(src).replace(/```[^\n]*\n?([\s\S]*?)```/g, function (_, code) { cb.push(code.replace(/\n+$/, '')); return '@@CB' + (cb.length - 1) + 'BC@@'; });
+  s = esc(s);
+  s = s.replace(/`([^`\n]+)`/g, '<code class="ws-code">$1</code>');
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+  s = s.replace(/~~([^~\n]+)~~/g, '<del>$1</del>');
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  const lines = s.split('\n'); const out = []; let inList = false;
+  const closeList = function () { if (inList) { out.push('</ul>'); inList = false; } };
+  for (const ln of lines) {
+    const mH = ln.match(/^(#{1,6})\s+(.*)$/);
+    const mL = ln.match(/^\s*[-*]\s+(.*)$/);
+    if (mH) { closeList(); out.push('<div class="ws-md-h">' + mH[2] + '</div>'); }
+    else if (mL) { if (!inList) { out.push('<ul class="ws-md-ul">'); inList = true; } out.push('<li>' + mL[1] + '</li>'); }
+    else { closeList(); out.push(ln); }
+  }
+  closeList();
+  s = out.join('\n');
+  s = s.replace(/@@CB(\d+)BC@@/g, function (_, i) { return '<pre class="ws-pre"><code>' + esc(cb[+i]) + '</code></pre>'; });
+  s = s.replace(/\n/g, '<br>');
+  s = s.replace(/(<\/(?:pre|ul|div)>)<br>/g, '$1').replace(/<br>(<(?:pre|ul|div|li))/g, '$1');
+  return s;
+}
+
+// ---- 대화 기록 = 서버 보관. 접속 시 History(active full + cold/archived stub) → 재생 복원, 나머지는 lazy ----
+function wsReplayHistory(events, cold, archived, roles) {
+  const keep = new Map(); for (const [id, c] of wsState.channels) keep.set(id, { role: c.role, name: c.name });   // AgentList(먼저 수신)로 설정된 role/name 보존 — a2a 모니터 분류(§13.5)가 role 참조
+  wsState.channels.clear(); wsState.active = null;
+  for (const t of wsState.textareas.values()) t.remove(); wsState.textareas.clear();   // 채널 입력란 리셋(draft 는 localStorage 유지·재생성 시 복원)
+  wsState.replaying = true;
+  // v2.4.161 — 서버가 영속해 둔 role(HELLO 때 기록)을 **events 채널에도** 먼저 심어요. 종전엔 AgentList 에 있는
+  //   채널만 role 을 가졌고, 메인이 접속 중이 아니면 메인 채널이 role=undefined 로 재생돼 어느 그룹에도 안 앉았어요
+  //   (모바일 페이저 = 그룹 병합만 그리니 메인 대화가 통째로 사라진 자리). 라이브 AgentList(keep)가 뒤에 덮어써요.
+  if (roles && typeof roles === 'object') { for (const id of Object.keys(roles)) { if (!roles[id] || wsIsMon(id)) continue; const c = wsChannel(id); if (!c.role) c.role = roles[id]; if (roles[id] === 'main') WS_LOCAL = id; } }
+  for (const [id, mt] of keep) { const c = wsChannel(id, mt.name); if (mt.role) c.role = mt.role; }   // 선복원 → 재생 중 wsRoleOf 정확(모니터 Up↔Main/Main↔Local 분류)
+  for (const ev of (events || [])) { try { onWsEvent(ev); } catch {} }
+  // C(lazy): cold(끊긴)·archived(닫은) 채널은 stub 만 생성 — 탭/드롭다운 표시, 내용은 탭 클릭·복원 시 on-demand
+  // role 부여(탭 그룹 byRole 분류용) — v2.4.59: 서버가 HELLO 시점 role 을 영속해 stub 에 동봉 (upstream/collab/peer
+  // 가 끊겨도 그룹 유지). stub role 부재(구 서버) 시에만 채널키 기반 기본(local-ide=main, 그 외 local) 폴백.
+  for (const c of (cold || [])) { const ch = wsChannel(c.key); ch._cold = true; ch._loaded = false; ch._count = c.count; if (!ch.role) ch.role = c.role || wsRoleOf(c.key); }
+  for (const c of (archived || [])) { const ch = wsChannel(c.key); ch._cold = true; ch._loaded = false; ch._count = c.count; ch.hidden = true; if (!ch.role) ch.role = c.role || wsRoleOf(c.key); }
+  wsState.replaying = false;
+  if (archived && archived.length) wsSaveHidden();
+  if (wsState.channels.size) {
+    let saved = null; try { saved = localStorage.getItem(WS_ACTIVE_KEY); } catch {}   // 새로고침 시 마지막 탭 복원 (탭별 draft 는 wsSaveDrafts 가 별도 영속). FIX: saved 가 valid 면 wsChannel() 자동 active 무시하고 saved 우선 적용.
+    const savedOk = saved && (
+      (wsState.channels.has(saved) && !wsState.channels.get(saved).hidden) ||
+      (wsIsGroup(saved) && wsGroupMembers(saved).length)
+    );
+    if (savedOk) wsState.active = saved;
+    else if (!wsState.active) {
+      if (wsState.channels.has(WS_LOCAL) && !wsState.channels.get(WS_LOCAL).hidden) wsState.active = WS_LOCAL;   // 기본 활성 = 메인(로컬 IDE) 우선
+      else { for (const [id, c] of wsState.channels) { if (!c.hidden && !wsIsMon(id)) { wsState.active = id; break; } } if (!wsState.active) wsState.active = wsState.channels.keys().next().value; }
+    }
+  }
+  wsRenderTabs(); wsRenderActiveStream(); updateWsConn(); updateWsBadge();
+  if (wsState.active) wsShowTextarea(wsState.active);   // FIX: 새로고침 복원 시 활성 채널의 textarea 생성·표시·draft 적용 (wsTextareaFor 가 wsDrafts[key] 에서 값 가져옴). 기존엔 wsSetActive 만 wsShowTextarea 호출 → wsReplayHistory 복원 경로에서 textarea 누락.
+  if (wsState.debugOpen) wsRenderDebug();
+  if (wsState.active) wsMaybeRequestHistory(wsState.active);   // active 가 cold stub 이면 즉시 내용 로드
+  // v2.4.161 — 모바일 페이저는 채널이 아니라 **그룹 병합 페이지**를 보여요. 그러니 열리는 페이지의 cold 멤버도
+  //   같이 당겨요 (swipe 로 들어올 땐 wsActivateFromSwipe 가 이미 그렇게 해요 — 첫 열림만 빠져 있었어요).
+  if (wsState.active && wsPagerOn()) { for (const cid of wsGroupMembers(wsGroupKeyOf(wsState.active))) wsMaybeRequestHistory(cid); }
+}
+function wsMaybeRequestHistory(id) {   // C: cold stub 채널을 처음 열 때 server 에 내용 on-demand 요청
+  if (!id || wsIsGroup(id) || wsIsMon(id)) return;
+  const ch = wsState.channels.get(id);
+  if (!ch || !ch._cold || ch._loaded || ch.rows.length) return;
+  const ws = wsState.ws; if (!ws || ws.readyState !== 1) return;
+  ch._loaded = true;
+  try { ws.send(JSON.stringify({ ...wsCommon(), type: 'CUSTOM', name: 'RequestChannelHistory', value: { channelKey: ch.routeId || id } })); } catch { ch._loaded = false; }
+}
+function wsReplayChannelHistory(channelKey, events) {   // C: on-demand 로 받은 한 채널 내용 재생(D: cold 복원도 이 경로)
+  if (!channelKey) return;
+  const ch = wsState.channels.get(channelKey);
+  if (ch) { ch.rows = []; ch.debug = []; ch._cold = false; ch._loaded = true; }
+  wsState.replaying = true;
+  for (const ev of (events || [])) { try { onWsEvent(ev); } catch {} }
+  wsState.replaying = false;
+  wsRenderTabs();
+  const a = wsState.active;
+  if (a === channelKey || (wsIsGroup(a) && wsGroupMembers(a).indexOf(channelKey) >= 0)) wsRenderActiveStream();
+  updateWsConn(); updateWsBadge();
+  if (wsState.debugOpen) wsRenderDebug();
+}
+// ── 이력 이어받기 (v2.4.129) ────────────────────────────────────────────────
+// 오래 도는 보드에서 활성 채널의 줄이 수천으로 자라 첫 페인트를 눌렀어요(운영자 보고 2026-08-01).
+//   서버가 최근 N 건만 주고 «잘렸다» 를 scope.truncated 로 알려주면, 여기서 위쪽에 「이전 대화 더
+//   보기」를 띄우고 눌렀을 때만 이어받아요. 자동으로 계속 당기지 않아요 — 그러면 상한을 둔 의미가
+//   없어지고, 사용자가 원치 않는데 옛 줄이 계속 쌓여요.
+const wsMoreState = {};   // channelKey → { oldestTs, remaining }
+function wsMoreNote(channelKey, oldestTs, remaining) {
+  if (!channelKey || !remaining) { delete wsMoreState[channelKey]; return; }
+  wsMoreState[channelKey] = { oldestTs, remaining };
+}
+function wsRequestOlder(channelKey) {
+  const st = wsMoreState[channelKey]; if (!st) return;
+  const ws = wsState.ws; if (!ws || ws.readyState !== 1) return;
+  try {
+    ws.send(JSON.stringify({ ...wsCommon(), type: 'CUSTOM', name: 'RequestChannelHistory',
+      value: { channelKey, beforeTs: st.oldestTs } }));
+  } catch {}
+}
+function wsPrependChannelHistory(channelKey, events, v) {
+  const ch = wsState.channels.get(channelKey);
+  if (!ch) return;
+  const before = ch.rows.slice();
+  ch.rows = []; ch.debug = ch.debug || [];
+  wsState.replaying = true;
+  for (const ev of (events || [])) { try { onWsEvent(ev); } catch {} }
+  wsState.replaying = false;
+  ch.rows = ch.rows.concat(before);          // 새로 받은 옛 줄이 **앞**에
+  wsMoreNote(channelKey, v.oldestSentTs || 0, v.more ? (v.remaining || 0) : 0);
+  const a = wsState.active;
+  if (a === channelKey || (wsIsGroup(a) && wsGroupMembers(a).indexOf(channelKey) >= 0)) wsRenderActiveStream();
+}
+// ✕ 닫기 = 아카이브(숨김). 대화 내역은 서버 history 에 유지(닫아도 사라지지 않음·재연결 복원). "닫은 세션" 드롭다운으로 복원.
+const WS_HIDDEN = 'constellation-ws-hidden';
+function wsLoadHidden() { try { const a = JSON.parse(localStorage.getItem(WS_HIDDEN) || '[]'); return Array.isArray(a) ? a : []; } catch { return []; } }
+function wsSaveHidden() { try { localStorage.setItem(WS_HIDDEN, JSON.stringify([...wsState.channels.entries()].filter(([, c]) => c.hidden).map(([id]) => id))); } catch {} }
+function wsCloseChannel(id) {
+  const ch = wsState.channels.get(id); if (!ch) return;
+  ch.hidden = true;
+  // D: server 에 아카이브 통지 → active 파일을 archived/(cold)로 이동(active 스캔·cap 제외). 모니터·그룹은 대상 아님
+  if (!wsIsMon(id) && !wsIsGroup(id)) { const ws = wsState.ws; if (ws && ws.readyState === 1) { try { ws.send(JSON.stringify({ ...wsCommon(), type: 'CUSTOM', name: 'ArchiveChannel', value: { agentId: ch.routeId || id } })); } catch {} } }
+  if (wsState.active === id) wsState.active = [...wsState.channels.keys()].find((k) => k !== id && !wsState.channels.get(k).hidden && !wsIsMon(k)) || null;
+  wsSaveHidden();
+  wsRenderTabs(); wsRenderArchived(); wsRenderActiveStream(); updateWsConn(); updateWsBadge();
+}
+function wsRestoreChannel(id) {
+  const ch = wsState.channels.get(id); if (!ch) return;
+  ch.hidden = false; wsSaveHidden();
+  const menu = $('#ws-arch-menu'); if (menu) menu.hidden = true;
+  wsSetActive(id);   // 복원하며 활성화(렌더 포함)
+  wsRenderArchived();
+}
+function wsRenderArchived() {   // "닫은 세션" 버튼 + 드롭다운 — 닫은(hidden) 채널 목록, 선택 시 복원
+  const btn = $('#ws-arch-btn'), menu = $('#ws-arch-menu'); if (!btn || !menu) return;
+  const hidden = [...wsState.channels.entries()].filter(([id, c]) => c.hidden && !wsIsMon(id));
+  btn.hidden = false;   // v2.3.23: 항상 표시 (닫은 세션 0개일 때도 카운터 보임 — 사용자 발견성 향상)
+  btn.textContent = '📂 ' + hidden.length;
+  menu.innerHTML = '';
+  if (!hidden.length) {
+    const empty = el('div', 'ws-arch-empty'); empty.textContent = '닫은 세션이 없어요';
+    menu.appendChild(empty); return;
+  }
+  for (const [id, c] of hidden) {
+    const item = el('div', 'ws-arch-item');
+    const present = wsState.present.has(c.routeId || id);   // 현재 연결 여부 — 닫힌 세션도 에이전트가 다시 붙어 있으면 표시
+    const dot = el('span', 'ws-arch-dot' + (present ? ' on' : ''));
+    dot.title = present ? '현재 연결됨' : '연결 끊김(닫힌 세션)';
+    const lbl = el('span', 'ws-arch-lbl'); lbl.textContent = (c.name || id) + (c.role && c.role !== 'local' ? ' · ' + c.role : '');
+    lbl.title = '복원: ' + id; lbl.onclick = () => wsRestoreChannel(id);
+    const del = el('span', 'ws-arch-del'); del.textContent = '🗑'; del.title = '이 세션 기록 영구 삭제';
+    del.onclick = (e) => { e.stopPropagation(); wsDeleteChannel(id, c.name || id); };
+    item.append(dot, lbl, del);
+    menu.appendChild(item);
+  }
+  const all = el('div', 'ws-arch-all');
+  const ab = el('button', 'ws-arch-allbtn'); ab.type = 'button'; ab.textContent = '🗑 전체 삭제 (' + hidden.length + ')';
+  ab.onclick = (e) => { e.stopPropagation(); wsDeleteAllChannels(); };
+  all.appendChild(ab); menu.appendChild(all);
+}
+async function wsDeleteChannel(id, name) {   // 개별 기록 삭제 — wsConfirm 후 server 통지 + 로컬 채널 제거
+  if (!(await wsConfirm(`'${name}' 세션 기록을 영구 삭제할까요? 복원할 수 없어요.`, { title: '세션 기록 삭제', danger: true, okLabel: '삭제' }))) return;
+  const ws = wsState.ws; if (ws && ws.readyState === 1) { try { ws.send(JSON.stringify({ ...wsCommon(), type: 'CUSTOM', name: 'DeleteChannelHistory', value: { agentId: id } })); } catch {} }
+  wsState.channels.delete(id);
+  if (wsState.active === id) wsState.active = [...wsState.channels.keys()].find((k) => !wsState.channels.get(k).hidden && !wsIsMon(k)) || null;
+  wsSaveHidden(); wsRenderTabs(); wsRenderArchived(); wsRenderActiveStream(); updateWsConn(); updateWsBadge();
+}
+async function wsDeleteAllChannels() {   // 전체삭제 — 닫은 세션 전부 영구 삭제 (wsConfirm)
+  const hidden = [...wsState.channels.entries()].filter(([id, c]) => c.hidden && !wsIsMon(id));
+  if (!hidden.length) return;
+  if (!(await wsConfirm(`닫은 세션 ${hidden.length}개 기록을 모두 영구 삭제할까요? 복원할 수 없어요.`, { title: '전체 세션 기록 삭제', danger: true, okLabel: '전체 삭제' }))) return;
+  const ws = wsState.ws; if (ws && ws.readyState === 1) { for (const [id] of hidden) { try { ws.send(JSON.stringify({ ...wsCommon(), type: 'CUSTOM', name: 'DeleteChannelHistory', value: { agentId: id } })); } catch {} } }
+  for (const [id] of hidden) { if (wsState.active === id) wsState.active = null; wsState.channels.delete(id); }
+  if (!wsState.active) wsState.active = [...wsState.channels.keys()].find((k) => !wsState.channels.get(k).hidden && !wsIsMon(k)) || null;
+  wsSaveHidden(); wsRenderTabs(); wsRenderArchived(); wsRenderActiveStream(); updateWsConn(); updateWsBadge();
+  const menu = $('#ws-arch-menu'); if (menu) menu.hidden = true;
+}
+
+// ---- TOOL_CALL aggregate 카드 (toolCallId 기준 start/args/end/result 한 카드) ----
+// display.kind/status/title/subtitle/summary/compact + argsPreview/resultPreview 우선 렌더(핸드오프 §3)
+const WS_TOOL_ICON = { read: '📖', write: '✏️', edit: '✏️', search: '🔍', grep: '🔍', shell: '⌨️', bash: '⌨️', web: '🌐', fetch: '🌐', file: '📄' };
+function wsToolStat(s) {
+  s = (s || 'running').toLowerCase();
+  if (s === 'error' || s === 'failed' || s === 'denied') return ['err', '⚠ ' + (s === 'denied' ? '거부됨' : '실패')];
+  if (s === 'running' || s === 'pending' || s === 'in_progress' || s === 'started') return ['running', '● 실행 중'];
+  return ['done', '✓ 완료'];
+}
+// ---- A2A-intent CUSTOM 카드 (Report·BlockerManifest·ReviewSLAAck·PR* / Deadlock* family — §13.16.9 allowlist) ----
+// 이전엔 ✦ <name> 단일 text row(+hover full)로 흘러 "raw/TEXT" 로 보였다. 이제 아이콘 + envelope summary + 펼침 details 카드.
+// raw JSON 은 timeline 에 직접 노출하지 않음(§1) — 의미 필드만 key/value 로, 전체 원본은 debug drawer.
+const _helloCardAt = new Map();   // agentId → 마지막 «합류» 카드 시각 (반복 접기용)
+const WS_A2A_INTENT = {   // name → { icon, label, summaryKeys[] } (summaryKeys: 한 줄 요약 후보, 앞에서부터 첫 비어있지 않은 값)
+  Report:            { icon: '📄', label: 'Report',        sum: ['re', 'subject', 'summary', 'status'] },
+  BlockerManifest:   { icon: '🚧', label: 'Blocker',       sum: ['re', 'subject', 'summary', 'reason', 'status'] },
+  BlockerNudge:      { icon: '🚧', label: 'Blocker nudge', sum: ['re', 'subject', 'reason', 'summary', 'status'] },
+  ReviewSLAAck:      { icon: '⏱', label: 'SLA ack',        sum: ['re', 'subject', 'kind', 'commitment', 'status'] },
+  PRRequest:         { icon: '🔀', label: 'PR 요청',       sum: ['re', 'subject', 'title', 'summary', 'sourceRepo'] },
+  PRMergeRequest:    { icon: '🔀', label: 'PR 머지 요청',  sum: ['re', 'subject', 'title', 'summary', 'targetRepo'] },
+  PRDraftReady:      { icon: '🔀', label: 'PR draft',      sum: ['re', 'subject', 'draftRef', 'summary', 'status'] },
+  PRRequestRejected: { icon: '🚫', label: 'PR 반려',       sum: ['reason', 're', 'subject', 'suggest', 'status'] },
+  PRMergeAck:        { icon: '✅', label: 'PR 머지 ack',   sum: ['re', 'subject', 'status', 'prUrl', 'summary'] },
+  PRMergeRejected:   { icon: '🚫', label: 'PR 머지 반려',  sum: ['reason', 're', 'subject', 'status'] },
+  PRStatusUpdate:    { icon: '🔃', label: 'PR 상태',       sum: ['status', 're', 'subject', 'prUrl', 'summary'] },
+  DeadlockProbe:     { icon: '🔁', label: 'Deadlock probe', sum: ['reason', 're', 'trigger', 'subject', 'status'] },
+  PreemptRequest:    { icon: '🔁', label: 'Preempt 요청',  sum: ['re', 'subject', 'reason', 'target', 'status'] },
+  PreemptForce:      { icon: '🔁', label: 'Preempt 강제',  sum: ['re', 'subject', 'reason', 'target', 'status'] },
+  MediationProposal: { icon: '⚖️', label: 'Mediation 제안', sum: ['re', 'subject', 'proposal', 'summary', 'status'] },
+  MediationAck:      { icon: '⚖️', label: 'Mediation ack', sum: ['re', 'subject', 'status', 'summary'] },
+  EscalationRequest: { icon: '⚠️', label: 'Escalation 요청', sum: ['re', 'subject', 'reason', 'tier', 'status'] },
+  EscalationSurfaced:{ icon: '⚠️', label: 'Escalation', sum: ['re', 'subject', 'reason', 'tier', 'decisionId', 'status'] },
+  // 코디네이션 메시지 — 이전엔 text/user/ok row 였으나 카드로 통일 (카드 미표시 항목도 카드화). re > summary 우선.
+  Delegate:          { icon: '📋', label: '위임',     sum: ['re', 'subject', 'summary', 'reason', 'task', 'notice'] },
+  WorkerReport:      { icon: '📤', label: '보고',     sum: ['re', 'subject', 'summary', 'done', 'status', 'note', 'notice'] },
+  WorkerAck:         { icon: '📥', label: 'ack',      sum: ['re', 'subject', 'ack', 'summary', 'note', 'notice'] },
+  OnboardAck:        { icon: '🤝', label: '온보딩',   sum: ['re', 'welcome', 'guide', 'summary', 'policy'] },
+  AgentHello:        { icon: '👋', label: '합류',     sum: ['agentName', 'note', 'agentId', 'env'] },
+};
+// v2.4.137 — **공용 요약 꼬리.** intent 마다 키를 손으로 열거하면 그 목록은 «빠뜨리는» 쪽으로 뒤처져요:
+//   다른 그룹이 자기 어휘로 보내는 순간(실측: 협업 상대의 `topic`) 어느 키에도 안 걸려 미리보기가 빈칸이 돼요.
+//   그래서 각 intent 의 고유 순서는 그대로 두고, 그 **뒤에 공용 꼬리 하나**를 붙여요 — 새로 관측된 방언은
+//   스무 줄이 아니라 이 한 줄에 추가돼요. `topic` 은 `re` 와 같은 역할(무엇에 관한 글인가)이라 바로 옆에 둬요.
+const WS_A2A_SUM_TAIL = ['topic', 're', 'subject', 'summary', 'title', 'headline', 'text', 'message', 'notice', 'reason', 'ask', 'status', 'note', 'body', 'detail', 'label'];
+// 전송 계층 칸(§13.13 어휘표) — 사람이 읽을 내용이 아니라서 «첫 서술 필드» 후보에서 빼요.
+const WS_A2A_TRANSPORT_KEYS = new Set(['msgId', 'messageId', 'targetAgentId', 'agentId', 'threadId', 'contextId', 'parentId', 'seq', 'ts', 'timestamp', 'kind', 'tier', 'nonce', 'ackFor', 'from', 'recipients', 'offline', 'dedupHit', 'attemptCount', 'lastError', 'format', 'promptId', 'runId', 'id']);
+// 관측된 방언 수집기 — «목록에 없어서 마지막 수단으로 집은 키» 를 이름별로 세요. 콘솔에 한 번만 알리고
+//   `window.wsDialectKeys` 로 언제든 읽을 수 있어요. 이게 「계속 수집해서 목록을 갱신」의 기계 부분이에요.
+const wsDialectKeys = new Map();
+window.wsDialectKeys = wsDialectKeys;
+function wsDialectSeen(name, key) {
+  const k = (name || '?') + '.' + key;
+  const n = (wsDialectKeys.get(k) || 0) + 1;
+  wsDialectKeys.set(k, n);
+  if (n === 1) console.info('[a2a] 방언 관측 — %s 의 «%s» 를 요약 키 목록이 모르고 있어요. 반복되면 WS_A2A_SUM_TAIL 에 추가하세요. (window.wsDialectKeys 로 전체 확인)', name || '?', key);
+}
+// 값이 «사람이 읽을 문장» 처럼 생겼는가. 해시·id·토큰은 미리보기에 떠도 아무것도 안 알려줘요
+//   (실측: 어느 상대의 첫 필드가 attachmentSha256 이라 미리보기에 해시가 떴어요).
+function wsProseLike(s) {
+  const x = String(s).trim();
+  if (!x) return false;
+  if (/^[0-9a-f]{16,}$/i.test(x)) return false;                 // 해시
+  if (/^[A-Za-z0-9._-]{20,}$/.test(x) && !/\s/.test(x)) return false;   // 토큰·id 류(공백 없는 긴 식별자)
+  return /\s/.test(x) || x.length >= 6;
+}
+function wsA2aSummary(spec, v) {   // summary 1줄 — intent 고유 순서 → 공용 꼬리 → 첫 «산문» 필드(방언 수집)
+  if (v == null) return '';
+  if (typeof v === 'string') return v;
+  // 대소문자는 그 자체가 방언 축이에요(TOPIC vs topic). 목록을 두 벌로 늘리지 않고 찾을 때 접어서 봐요.
+  const lower = new Map();
+  for (const k of Object.keys(v)) { const lk = k.toLowerCase(); if (!lower.has(lk)) lower.set(lk, k); }
+  const val = (k) => {
+    const rk = (k in v) ? k : lower.get(String(k).toLowerCase());
+    if (rk == null) return null;
+    const s = v[rk];
+    return (s != null && (typeof s === 'string' || typeof s === 'number') && String(s).trim() !== '') ? String(s) : null;
+  };
+  const pick = (keys) => { for (const k of keys) { const s = val(k); if (s != null) return s; } return ''; };
+  const hit = pick(spec.sum || []) || pick(WS_A2A_SUM_TAIL);
+  if (hit) return hit;
+  // 마지막 수단 — 아직 아무 목록에도 없는 칸. **빈칸으로 두지 않아요**: 빈 미리보기와 «내용 없는
+  //   메시지» 가 같은 모양이면 목록이 낡았다는 사실이 화면에서 사라져요. 산문처럼 생긴 값을 먼저 보고,
+  //   그런 게 없을 때만 아무거나 집어요(그때도 무엇을 집었는지 수집돼요).
+  //   선호 순서는 셋이에요: **문장**(공백 있음) → 산문 같은 값 → 아무거나. 실측에서 「문장이 있는데
+  //   짧은 식별자를 집는」 경우가 나왔어요(freshEvidence 를 두고 fallback 을 집음) — 공백이 그 둘을 갈라요.
+  const cands = Object.keys(v).filter((k) => !WS_A2A_TRANSPORT_KEYS.has(k) && (typeof v[k] === 'string' || typeof v[k] === 'number') && String(v[k]).trim() !== '');
+  const best = cands.find((k) => /\s/.test(String(v[k]).trim()) && wsProseLike(v[k])) || cands.find((k) => wsProseLike(v[k])) || cands[0];
+  if (best) { wsDialectSeen(spec && spec.label, best); return String(v[best]); }
+  return '';
+}
+// §13.16.12 Pattern 7 fallback — 미정합 adopter 가 A2A Report 를 envelope 대신 TEXT_MESSAGE.text 에
+// [자연어 + ```json{...}``` ] 직렬화로 보낼 때 코드블록 JSON 을 파싱해 A2A-intent 면 a2acard 로 승격(raw text 깨짐 방지).
+function wsExtractA2aReport(text) {
+  if (!text || typeof text !== 'string') return null;
+  const m = text.match(/```(?:json)?\s*\n?(\{[\s\S]*?\})\s*```/);
+  if (!m) return null;
+  let obj; try { obj = JSON.parse(m[1]); } catch { return null; }
+  if (!obj || typeof obj !== 'object') return null;
+  const name = (obj.name && obj.name !== 'CUSTOM') ? obj.name : obj.type;   // structured CUSTOM wrapper {type:"CUSTOM",name:"Report"} 도 잡음 + {type:"Report"} fallback
+  if (!name || !WS_A2A_INTENT[name]) return null;
+  const prefix = text.slice(0, m.index).replace(/\[A2A Report[^\]]*\]/gi, '').trim();
+  return { name, value: obj, prefix };
+}
+function wsA2aCardEl(row) {
+  const a = row.a2a || {};
+  const spec = a.spec || { icon: '✦', label: a.name || 'CUSTOM', sum: [] };
+  const v = a.value || {};
+  const card = el('div', 'ws-a2a');
+  const head = el('div', 'ws-a2a-h');
+  const ic = el('span', 'ws-a2a-ic'); ic.textContent = spec.icon || '✦';
+  const nm = el('span', 'ws-a2a-name'); nm.textContent = spec.label || a.name || 'CUSTOM';
+  const sm = el('span', 'ws-a2a-sum'); sm.textContent = a.summary || '';
+  head.append(ic, nm, sm);
+  card.append(head);
+  // details — value 의 의미 필드 key/value (요약으로 이미 보인 키 포함, 전체 envelope 의 가독 뷰). raw 원본은 debug drawer.
+  // 헤더 hover/클릭은 wsRowHover(미리보기 + 단독 플로팅 창) 전용 — collapse 는 최우측 별도 ▸/▾ 버튼으로만(충돌 방지: 버튼 onclick 에서 e.stopPropagation).
+  const fields = (v && typeof v === 'object' && !Array.isArray(v)) ? Object.entries(v).filter(([k]) => k !== 'type') : null;
+  if (fields && fields.length) {
+    const body = el('div', 'ws-a2a-body');
+    for (const [k, val] of fields) {
+      const r = el('div', 'ws-a2a-row');
+      const kk = el('span', 'ws-a2a-k'); kk.textContent = k;
+      const vv = el('span', 'ws-a2a-v');
+      vv.textContent = (val == null) ? '' : (typeof val === 'string' ? val : (Array.isArray(val) ? val.map(z => typeof z === 'string' ? z : JSON.stringify(z)).join('\n') : JSON.stringify(val, null, 2)));
+      r.append(kk, vv); body.append(r);
+    }
+    card.append(body);
+    { const _atts = wsAttachments(row.full); if (_atts.length) { const ab = el('div', 'ws-att-row'); for (const a of _atts) ab.appendChild(wsAttChipEl(a)); card.append(ab); } }   // A2A 카드 첨부 칩(접힘 무관 항상 표시)
+    const expanded = !!row._expanded;
+    body.hidden = !expanded;
+    const tg = el('button', 'ws-a2a-toggle'); tg.type = 'button';
+    tg.textContent = '◀'; tg.classList.toggle('expanded', expanded);
+    tg.title = expanded ? '접기' : '펼치기'; tg.setAttribute('aria-label', tg.title); tg.setAttribute('aria-expanded', String(expanded));
+    tg.onclick = (ev) => {
+      ev.stopPropagation(); ev.preventDefault();
+      row._expanded = body.hidden; body.hidden = !body.hidden;
+      tg.classList.toggle('expanded', !body.hidden);
+      tg.title = body.hidden ? '펼치기' : '접기'; tg.setAttribute('aria-label', tg.title); tg.setAttribute('aria-expanded', String(!body.hidden));
+    };
+    head.append(tg);
+  }
+  return card;
+}
+function wsToolMergeDisplay(tool, d) {
+  if (!d) return;
+  if (d.kind != null) tool.dkind = d.kind;
+  if (d.status != null) tool.status = d.status;
+  if (d.title != null) tool.title = d.title;
+  if (d.subtitle != null) tool.subtitle = d.subtitle;
+  if (d.summary != null) tool.summary = d.summary;
+  if (d.compact != null) tool.compact = !!d.compact;
+}
+function wsToolKV(k, txt) {
+  const kv = el('div', 'ws-tool-kv');
+  const lab = el('span', 'ws-tool-kk'); lab.textContent = k;
+  const pre = el('pre', 'ws-tool-pre'); pre.textContent = wsTrunc(txt, 600);
+  kv.append(lab, pre); return kv;
+}
+function wsToolCardEl(row) {
+  const tl = row.tool;
+  const [scls, slabel] = wsToolStat(tl.status);
+  const card = el('div', 'ws-tool ' + scls + (tl.compact ? ' compact' : ''));
+  const head = el('div', 'ws-tool-h');
+  const ic = el('span', 'ws-tool-ic'); ic.textContent = WS_TOOL_ICON[(tl.dkind || tl.name || '').toLowerCase()] || '🔧';
+  const ti = el('span', 'ws-tool-title'); ti.textContent = (tl.title || tl.name || tl.toolCallId || 'tool');
+  const st = el('span', 'ws-tool-st ' + scls); st.textContent = slabel;
+  head.append(ic, ti, st);
+  card.append(head);
+  if (tl.subtitle) { const sub = el('div', 'ws-tool-sub'); sub.textContent = tl.subtitle; card.append(sub); }
+  if (tl.summary) { const sm = el('div', 'ws-tool-sum'); sm.textContent = tl.summary; card.append(sm); }
+  const argTxt = tl.argsPreview || (tl.args != null ? wsFmtVal(tl.args) : '');
+  const resTxt = tl.resultPreview || (tl.result != null ? wsFmtVal(tl.result) : '');
+  if (argTxt || resTxt) {
+    const body = el('div', 'ws-tool-body');
+    if (argTxt) body.append(wsToolKV('args', argTxt));
+    if (resTxt) body.append(wsToolKV('result', resTxt));
+    card.append(body);
+    // compact 면 기본 접힘 — 헤더 클릭으로 펼침(상태는 row._expanded 에 보존)
+    const expanded = tl.compact ? !!row._expanded : true;
+    body.hidden = !expanded;
+    if (tl.compact) {
+      const cv = el('span', 'ws-tool-cv'); cv.textContent = expanded ? '⌄' : '›'; head.append(cv);
+      head.style.cursor = 'pointer';
+      head.onclick = () => { row._expanded = body.hidden; body.hidden = !body.hidden; cv.textContent = body.hidden ? '›' : '⌄'; };
+    }
+  }
+  return card;
+}
+function wsUpdateTool(row) {
+  if (wsState.replaying) return;
+  if (!row._card || !row._card.parentNode) return;   // 활성·팝업 열림일 때만 in-place(아니면 row.tool 데이터만 갱신, 활성화 시 재렌더)
+  const fresh = wsToolCardEl(row); row._card.replaceWith(fresh); row._card = fresh;
+  const s = $('#ws-stream'); if (s) s.scrollTop = s.scrollHeight;
+}
+
+// ---- CUSTOM/Attachment 수신 카드 (image/audio/video/file, mock 선구현 — 핸드오프 §6) ----
+// 보안: raw local path 는 절대 노출 안 함. url+available 일 때만 로드, blocked/failed 는 안전 표시.
+const WS_ATT_ICON = { image: '🖼', audio: '🎵', video: '🎬', file: '📄' };
+function wsAttachCardEl(row) {
+  const v = row.att || {};
+  const kind = String(v.kind || 'file').toLowerCase();
+  const status = String(v.status || 'available').toLowerCase();
+  const ok = status === 'available' && !!v.url;   // url 있고 available 일 때만 미디어 로드(허용 목록 통과 가정)
+  const card = el('div', 'ws-att ' + kind + ' ' + (ok ? 'ok' : status));
+  const head = el('div', 'ws-att-h');
+  const ic = el('span', 'ws-att-ic'); ic.textContent = WS_ATT_ICON[kind] || '📄';
+  const nm = el('span', 'ws-att-name'); nm.textContent = (v.filename || v.attachmentId || 'attachment');
+  head.append(ic, nm);
+  if (v.mimeType) { const mt = el('span', 'ws-att-mime'); mt.textContent = v.mimeType; head.append(mt); }
+  if (!ok) { const st = el('span', 'ws-att-st ' + status); st.textContent = status === 'blocked' ? '🔒 차단됨' : status === 'failed' ? '⚠ 실패' : '대기'; head.append(st); }
+  card.append(head);
+  if (ok) {
+    const body = el('div', 'ws-att-body');
+    if (kind === 'image') { const img = el('img', 'ws-att-img'); img.src = v.url; img.alt = v.filename || ''; img.loading = 'lazy'; body.append(img); }
+    else if (kind === 'audio') { const a = el('audio'); a.controls = true; a.src = v.url; a.preload = 'none'; body.append(a); }
+    else if (kind === 'video') { const vd = el('video', 'ws-att-video'); vd.controls = true; vd.src = v.url; vd.preload = 'none'; body.append(vd); }
+    else { const lk = el('a', 'ws-att-link'); lk.href = v.url; lk.target = '_blank'; lk.rel = 'noopener noreferrer'; lk.textContent = '⬇ 열기 / 다운로드'; body.append(lk); }
+    card.append(body);
+  } else {
+    const safe = el('div', 'ws-att-safe'); safe.textContent = status === 'blocked' ? '허용 목록 밖 파일 — 미리보기 차단됨' : status === 'failed' ? '전송 실패' : '미리보기를 사용할 수 없어요';
+    card.append(safe);
+  }
+  if (v.caption) { const cap = el('div', 'ws-att-cap'); cap.textContent = v.caption; card.append(cap); }
+  return card;
+}
+
+// ---- A2A/대화 row hover 팝업 (커서 4분면 방향, full value 보기 좋게 렌더) ----
+let wsPopEl = null, wsPopPinned = false;
+function wsFullHtml(label, v, pinned) {
+  const xb = pinned ? '<button class="ws-pop-x" title="닫기" aria-label="닫기">✕</button>' : '';
+  const head = `<div class="ws-pop-h">${xb}${esc(label || '')}</div>`;
+  if (v == null) return head;
+  if (typeof v === 'string') return head + `<div class="ws-pop-v">${esc(v)}</div>`;
+  const rows = Object.entries(v).map(([k, val]) => {
+    const s = (val == null) ? '' : (typeof val === 'string' ? val : (Array.isArray(val) ? val.map(z => typeof z === 'string' ? z : JSON.stringify(z)).join('\n') : JSON.stringify(val, null, 2)));
+    return `<div class="ws-pop-row"><span class="ws-pop-k">${esc(k)}</span><span class="ws-pop-val">${esc(s)}</span></div>`;
+  }).join('');
+  return head + rows;
+}
+function wsHoverPop(label, full, x, y, pin) {
+  if (!wsPopEl) { wsPopEl = el('div', 'ws-hover-pop'); document.body.appendChild(wsPopEl); }
+  wsPopPinned = !!pin;
+  wsPopEl.classList.toggle('pinned', wsPopPinned);
+  wsPopEl.innerHTML = wsFullHtml(label, full, wsPopPinned);
+  if (wsPopPinned) { const xb = wsPopEl.querySelector('.ws-pop-x'); if (xb) xb.addEventListener('click', (ev) => { ev.stopPropagation(); wsHidePop(); }); const hh = wsPopEl.querySelector('.ws-pop-h'); if (hh) wsPopDragSetup(hh); }
+  wsPopEl.style.visibility = 'hidden'; wsPopEl.style.display = 'block'; wsPopEl.style.left = '0px'; wsPopEl.style.top = '0px';
+  const r = wsPopEl.getBoundingClientRect(), vw = innerWidth, vh = innerHeight;
+  const right = x > vw / 2, bottom = y > vh / 2;   // 커서 4분면 → 팝업을 반대 방향(가림 방지)
+  let px = right ? (x - r.width - 14) : (x + 14);
+  let py = bottom ? (y - r.height - 14) : (y + 14);
+  px = Math.max(6, Math.min(px, vw - r.width - 6));
+  py = Math.max(6, Math.min(py, vh - r.height - 6));
+  wsPopEl.style.left = px + 'px'; wsPopEl.style.top = py + 'px'; wsPopEl.style.visibility = 'visible';
+}
+function wsHidePop() { if (wsPopEl) { wsPopEl.style.display = 'none'; wsPopEl.classList.remove('pinned'); } wsPopPinned = false; }
+// 고정(창 상태) 팝업: 헤더 드래그로 이동 (닫기 ✕ 은 드래그 제외, 뷰포트 clamp)
+function wsPopDragSetup(handle) {
+  handle.addEventListener('mousedown', (ev) => {
+    if (ev.button !== 0 || (ev.target && ev.target.closest && ev.target.closest('.ws-pop-x'))) return;
+    ev.preventDefault();
+    const r = wsPopEl.getBoundingClientRect();
+    const offX = ev.clientX - r.left, offY = ev.clientY - r.top;
+    const move = (e) => {
+      let px = e.clientX - offX, py = e.clientY - offY;
+      px = Math.max(6, Math.min(px, innerWidth - wsPopEl.offsetWidth - 6));
+      py = Math.max(6, Math.min(py, innerHeight - wsPopEl.offsetHeight - 6));
+      wsPopEl.style.left = px + 'px'; wsPopEl.style.top = py + 'px';
+    };
+    const up = () => { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  });
+}
+function wsRowHover(e, row) {
+  e.classList.add('ws-has-pop');
+  e.addEventListener('mouseenter', (ev) => { if (!wsPopPinned) wsHoverPop(row.label, row.full, ev.clientX, ev.clientY, false); });   // hover: 미고정일 때만 미리보기
+  e.addEventListener('mouseleave', () => { if (!wsPopPinned) wsHidePop(); });   // 고정 상태면 mouseleave 무시
+  e.addEventListener('click', (ev) => { ev.stopPropagation(); wsHoverPop(row.label, row.full, ev.clientX, ev.clientY, true); });   // 클릭 = 고정(pin) — 닫기(✕) 로만 해제
+}
+
+// ---- row 렌더 (활성 채널만 DOM, 그 외 데이터+뱃지) ----
+// ---- ack 마킹: 별도 줄 대신 원 요청/메시지 줄에 ✓ + hover 툴팁(시각·agent) (§13.13 ack UX) ----
+function wsAckBadgeEl(info) {
+  const b = el('span', 'ws-ack'); b.textContent = ' ✓'; b.style.cursor = 'help';
+  const who = info && info.agent ? wsName(info.agent) : '(unknown)';
+  const when = info && info.at ? fmtDateTime(info.at) : '(unknown)';
+  const full = { '시각': when, 'agent': who };   // native title 대신 A2A 미리보기와 동일한 커서 4분면 팝업(자체 구현)
+  b.addEventListener('mouseenter', (ev) => { if (!wsPopPinned) wsHoverPop('✓ 수신 확인 (accepted)', full, ev.clientX, ev.clientY, false); });
+  b.addEventListener('mouseleave', () => { if (!wsPopPinned) wsHidePop(); });
+  b.addEventListener('click', (ev) => { ev.stopPropagation(); wsHoverPop('✓ 수신 확인 (accepted)', full, ev.clientX, ev.clientY, true); });   // 클릭 = 고정(pin)
+  return b;
+}
+// 원 요청/메시지 줄(promptId 또는 msgId 일치)에 ack 스탬프. 모든 채널 탐색(ack 와 원본이 다른 채널키일 수 있음).
+function wsMarkAck(key, info) {
+  if (!key) return false;
+  for (const ch of wsState.channels.values()) {
+    for (const row of ch.rows) {
+      if (row.promptId === key || row.msgId === key) {
+        row.ackedBy = info;
+        if (row._el && row._el.isConnected && !row._el.querySelector('.ws-ack')) row._el.appendChild(wsAckBadgeEl(info));
+        return true;
+      }
+    }
+  }
+  return false;
+}
+function wsRowEl(row, showChan = true) {   // showChan: 출처 뱃지 표시 여부(전체 보기=true, 개별 채널 필터=false)
+  if (row.kind === 'toolcard') {
+    const wrap = el('div', 'ws-ev ws-toolrow');
+    const t = el('span', 'ws-t'); t.textContent = row.t;
+    const c = wsToolCardEl(row); row._card = c;
+    wrap.append(t); if (row.src) wrap.append(wsSrcEl(row)); if (row.chan && showChan) wrap.append(wsChanEl(row)); wrap.append(c); return wrap;
+  }
+  if (row.kind === 'attach') {
+    const wrap = el('div', 'ws-ev ws-attrow');
+    const t = el('span', 'ws-t'); t.textContent = row.t;
+    wrap.append(t); if (row.src) wrap.append(wsSrcEl(row)); if (row.chan && showChan) wrap.append(wsChanEl(row)); wrap.append(wsAttachCardEl(row)); return wrap;
+  }
+  if (row.kind === 'a2acard') {   // A2A-intent CUSTOM 카드(Report·Blocker·PR*·Deadlock* — §13.16.9)
+    const wrap = el('div', 'ws-ev ws-a2arow');
+    const t = el('span', 'ws-t'); t.textContent = row.t;
+    wrap.append(t); if (row.src) wrap.append(wsSrcEl(row)); if (row.chan && showChan) wrap.append(wsChanEl(row)); wrap.append(wsA2aCardEl(row));
+    if (row.full) wsRowHover(wrap, row);   // 다른 A2A row 와 동일: hover→미리보기, 클릭→단독 플로팅 창(최우측 토글 버튼은 stopPropagation 으로 제외)
+    row._el = wrap; if (row.ackedBy) wrap.appendChild(wsAckBadgeEl(row.ackedBy));
+    return wrap;
+  }
+  if (row.kind === 'selection') {   // #406 UI6 SelectionPrompt chip 카드
+    const wrap = el('div', 'ws-ev ws-selrow');
+    const t = el('span', 'ws-t'); t.textContent = row.t;
+    wrap.append(t); if (row.chan && showChan) wrap.append(wsChanEl(row)); const c = wsSelectionCardEl(row); row._sel = c; wrap.append(c); return wrap;
+  }
+  const e = el('div', 'ws-ev' + (row.kind === 'user' ? ' ws-userline' : '') + (row.kind === 'status' ? ' ws-statusline' : ''));
+  const t = el('span', 'ws-t'); t.textContent = row.t;
+  const k = el('span', 'ws-k ' + row.kind); k.textContent = row.label;
+  const md = row.kind === 'text' || row.kind === 'user';   // 대화 내용만 마크다운 렌더
+  const b = el('span', 'ws-body' + (row.dim ? ' dim' : '') + (md ? ' ws-md' : ''));
+  if (md) { b.innerHTML = wsMd(row.body || ''); requestAnimationFrame(() => mdMount(b)); } else b.textContent = row.body || '';
+  e.append(t); if (row.src) e.append(wsSrcEl(row)); if (row.chan && showChan) e.append(wsChanEl(row)); e.append(k, b);
+  { const _atts = wsAttachments(row.full); if (_atts.length) { const ab = el('div', 'ws-att-row'); for (const a of _atts) ab.appendChild(wsAttChipEl(a)); e.append(ab); } }   // 일반 A2A row 첨부 칩
+  row._b = b; row._md = md;
+  if (row.full) wsRowHover(e, row);   // 요약 가능한 A2A 메시지(WorkerReport·Delegate 등): hover 시 커서 4분면 팝업에 전체 렌더
+  if (row.wfRunId) { e.classList.add('ws-wfstep'); e.title = 'workflow 종합 상태 열기 (' + row.wfRunId + ')'; e.onclick = () => wsWfPopOpen(row.wfRunId); }   // v2.4.61 🧵 STEP 클릭 → 인스펙터
+  row._el = e; if (row.ackedBy) e.appendChild(wsAckBadgeEl(row.ackedBy));
+  return e;
+}
+// ---- 날짜 변경선 (A2A 대화 stream 안 일자 구분, sticky top:0) ----
+function wsDayKey(ts) { if (!ts) return ''; const d = new Date(ts); return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate(); }
+function wsDayLabel(ts) {
+  if (!ts) return '';
+  const d = new Date(ts), now = new Date(), y = new Date(now); y.setDate(now.getDate() - 1);
+  const base = d.toLocaleDateString('ko-KR', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'short' });
+  return d.toDateString() === now.toDateString() ? base + ' · 오늘'
+       : d.toDateString() === y.toDateString()   ? base + ' · 어제'
+       : base;
+}
+function wsDatelineEl(ts) {
+  const dl = el('div', 'ws-dateline');
+  const dt = el('span', 'ws-dl-date'); dt.textContent = wsDayLabel(ts);
+  dl.append(el('span', 'ws-dl-wave'), dt, el('span', 'ws-dl-wave'));
+  return dl;
+}
+// ---- A2A row 안 첨부(value 의 attachments[]/atts/files/attachment/zip/file 추출 + 칩) — Attachment kind 와 별개(저건 단일 첨부 카드) ----
+function wsAttachments(v) {
+  if (!v || typeof v !== 'object') return [];
+  let list = v.attachments || v.atts || v.files || (v.attachment ? [v.attachment] : (v.zip ? [v.zip] : (v.file ? [v.file] : [])));
+  if (!Array.isArray(list)) list = [list];
+  return list.filter(a => a && typeof a === 'object' && (a.filename || a.name || a.url || a.dataUrl));
+}
+function wsAttIcon(mime, name) {
+  const m = (mime || '') + ' ' + (name || '');
+  if (/image\//.test(mime) || /\.(png|jpe?g|gif|webp|svg|bmp)$/i.test(name || '')) return '🖼';
+  if (/zip|tar|gz|7z|rar/i.test(m)) return '🗜';
+  if (/pdf/i.test(m)) return '📕';
+  if (/audio\//.test(mime)) return '🎵';
+  if (/video\//.test(mime)) return '🎬';
+  if (/json|javascript|text\/|\.(md|txt|js|ts|json|csv|log|cjs|mjs|html|css|ya?ml)$/i.test(m)) return '📄';
+  return '📎';
+}
+function wsAttChipEl(a) {
+  const name = a.filename || a.name || 'file';
+  const mime = a.mime || a.type || '';
+  const data = a.dataUrl || a.url || null;
+  const chip = el('div', 'ws-att-chip');
+  const ic = el('span', 'ws-att-ic'); ic.textContent = wsAttIcon(mime, name);
+  const info = el('span', 'ws-att-info'); info.textContent = name + (a.size != null ? ' · ' + fmtBytes(a.size) : '');
+  if (a.sha256) info.title = 'sha256: ' + a.sha256;
+  chip.append(ic, info);
+  const isImg = /image\//.test(mime) || /\.(png|jpe?g|gif|webp|svg|bmp)$/i.test(name);
+  const isText = /json|text\/|javascript/.test(mime) || /\.(md|txt|js|ts|json|csv|log|cjs|mjs|html|css|ya?ml)$/i.test(name);
+  if (data) {
+    if (isImg || isText) { const pv = el('button', 'ws-att-pv'); pv.type = 'button'; pv.textContent = '👁'; pv.title = '미리보기'; pv.onclick = (e) => { e.stopPropagation(); wsAttPreview(name, data, isImg ? 'image' : 'text'); }; chip.append(pv); }
+    const dl = el('a', 'ws-att-dl'); dl.textContent = '⬇'; dl.href = data; dl.download = name; dl.title = '다운로드'; dl.onclick = (e) => e.stopPropagation(); chip.append(dl);
+  } else { const no = el('span', 'ws-att-no'); no.textContent = a.localPath ? '메타만(원격)' : '데이터 없음'; no.title = a.localPath || '데이터(dataUrl/url) 미동봉'; chip.append(no); }
+  return chip;
+}
+function wsAttPreview(name, data, kind) {
+  let modal = document.getElementById('ws-att-modal');
+  if (!modal) { modal = document.createElement('div'); modal.id = 'ws-att-modal'; modal.className = 'ws-att-modal'; modal.onclick = (e) => { if (e.target === modal) modal.hidden = true; }; document.body.appendChild(modal); }
+  modal.innerHTML = ''; modal.hidden = false;
+  const box = el('div', 'ws-att-box');
+  const hd = el('div', 'ws-att-mhead'); const tt = el('b'); tt.textContent = name; const x = el('button', 'ws-att-mx'); x.type = 'button'; x.textContent = '✕'; x.onclick = () => { modal.hidden = true; }; hd.append(tt, x);
+  const body = el('div', 'ws-att-mbody');
+  if (kind === 'image') { const img = el('img'); img.src = data; img.alt = name; body.append(img); }
+  else { const pre = el('pre'); pre.textContent = '불러오는 중…'; fetch(data).then(r => r.text()).then(t => { pre.textContent = t.length > 40000 ? t.slice(0, 40000) + '\n…(생략)' : t; }).catch(() => { pre.textContent = '(미리보기 불가)'; }); body.append(pre); }
+  box.append(hd, body); modal.append(box);
+}
+// ---- #406 UI6 SelectionPrompt chip 카드 (에이전트 발 선택지 → 사용자 답/취소 → board→server) ----
+function wsSelectionCardEl(row) {
+  const s = row.sel || {};
+  const answered = s.state === 'ANSWERED', cancelled = s.state === 'CANCELLED', expired = s.state === 'EXPIRED';
+  const expiredLocked = expired && s.timeout && s.timeout.kind === 'approval';   // v2.4.74 승인 만료 = fail-closed 잠금; 분기 만료 = 늦은 스티어링 허용(칩 유지)
+  const done = answered || cancelled || expiredLocked;
+  const card = el('div', 'ws-sel ' + (answered ? 'answered' : cancelled ? 'cancelled' : expired ? 'expired' : 'issued'));
+  const head = el('div', 'ws-sel-h');
+  const ic = el('span', 'ws-sel-ic'); ic.textContent = answered ? '✅' : cancelled ? '✖️' : expired ? '⏱' : '❔';
+  const txt = el('span', 'ws-sel-text'); txt.textContent = s.text || '선택해 주세요';
+  head.append(ic, txt);
+  if (s.timeout && s.timeout.kind) {   // v2.4.74 극성 배지 + 만료 시각
+    const b = el('span', 'ws-sel-kind ' + s.timeout.kind);
+    b.textContent = s.timeout.kind === 'approval' ? '🔒 승인' : '⏳ 분기';
+    b.title = s.timeout.kind === 'approval' ? '위험 승인 게이트 — 시한 내 무응답이면 자동 거부(fail-closed)돼요' : '분기 질문 — 시한이 지나면 발신자가 기본값으로 스스로 진행하고, 늦은 선택은 방향 수정으로 반영돼요';
+    head.append(b);
+    if (s.expiresAt && !answered && !cancelled) {
+      const ex = el('span', 'ws-sel-exp');
+      ex.textContent = expired ? '만료됨' : ('~' + new Date(s.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+      head.append(ex);
+    }
+  }
+  card.append(head);
+  if (cancelled) { const note = el('div', 'ws-sel-note'); note.textContent = '취소됨' + (s.reason ? ' · ' + s.reason : ''); card.append(note); return card; }
+  if (expired) {
+    const note = el('div', 'ws-sel-note');
+    note.textContent = expiredLocked ? '시한 만료 — 자동 거부됐어요 (fail-closed). 이 액션은 실행되지 않아요.' : '시한 만료 — 발신자가 기본값으로 진행 중이에요. 지금 선택하면 방향 수정으로 전달돼요.';
+    card.append(note);
+    if (expiredLocked) return card;
+  }
+  const picked = new Set(s.picked || []);
+  const chips = el('div', 'ws-sel-chips');
+  for (const o of s.options) {
+    const label = o && typeof o === 'object' ? o.label : String(o);
+    const chip = el('button', 'ws-sel-chip' + (picked.has(label) ? ' sel' : '') + (answered && (s.picked || []).indexOf(label) >= 0 ? ' chosen' : ''));
+    chip.type = 'button'; chip.textContent = label;
+    if (o && o.description) chip.title = o.description;
+    chip.disabled = done;
+    if (!done) chip.onclick = () => {
+      if (s.multiSelect) { if (picked.has(label)) picked.delete(label); else picked.add(label); s.picked = [...picked]; const fresh = wsSelectionCardEl(row); row._sel.replaceWith(fresh); row._sel = fresh; }
+      else { wsAnswerSelection(row, [label], ''); }
+    };
+    chips.append(chip);
+  }
+  card.append(chips);
+  if (!done && (s.allowFreeText || s.multiSelect)) {
+    const foot = el('div', 'ws-sel-foot');
+    let ftInp = null;
+    if (s.allowFreeText) { ftInp = el('input', 'ws-sel-ft'); ftInp.placeholder = '직접 입력…'; ftInp.value = s.freeText || ''; ftInp.oninput = () => { s.freeText = ftInp.value; }; foot.append(ftInp); }
+    const submit = el('button', 'ws-sel-submit'); submit.type = 'button'; submit.textContent = '답변';
+    submit.onclick = () => wsAnswerSelection(row, [...picked], ftInp ? ftInp.value.trim() : '');
+    const dismiss = el('button', 'ws-sel-dismiss'); dismiss.type = 'button'; dismiss.textContent = '취소'; dismiss.title = '응답하지 않고 닫기';
+    dismiss.onclick = () => wsCancelSelection(row, 'user-dismiss');
+    foot.append(submit, dismiss); card.append(foot);
+  } else if (!done) {
+    const foot = el('div', 'ws-sel-foot');
+    const dismiss = el('button', 'ws-sel-dismiss'); dismiss.type = 'button'; dismiss.textContent = '취소';
+    dismiss.onclick = () => wsCancelSelection(row, 'user-dismiss');
+    foot.append(dismiss); card.append(foot);
+  }
+  return card;
+}
+function wsAnswerSelection(row, selectedLabels, freeText) {
+  const s = row.sel || {};
+  if ((!selectedLabels || !selectedLabels.length) && !(freeText && freeText.trim())) return;   // §3.2 빈 답 금지
+  const value = { promptId: s.promptId, selectedLabels: selectedLabels || [], answeredAt: Date.now() };
+  if (freeText && freeText.trim()) value.freeText = freeText.trim();
+  if (wsSendOrch({ type: 'CUSTOM', name: 'SelectionAnswer', value })) { s.state = 'ANSWERED'; s.picked = selectedLabels || []; wsRefreshSelectionCard(row); }
+}
+function wsCancelSelection(row, reason) {
+  const s = row.sel || {};
+  if (wsSendOrch({ type: 'CUSTOM', name: 'SelectionCancel', value: { promptId: s.promptId, reason: reason || 'user-dismiss' } })) { s.state = 'CANCELLED'; s.reason = reason; wsRefreshSelectionCard(row); }
+}
+function wsRefreshSelectionCard(row) {   // chip 카드 in-place 재렌더(현 DOM 에 있으면)
+  if (row._sel && row._sel.parentNode) { const fresh = wsSelectionCardEl(row); row._sel.replaceWith(fresh); row._sel = fresh; }
+}
+function wsResolveSelection(promptId, resolution, reason) {   // SelectionResolved(다른 board 답) → 모든 채널 row 검색해 해당 chip dim
+  if (!promptId) return;
+  for (const ch of wsState.channels.values()) {
+    for (const row of ch.rows) {
+      if (row.kind === 'selection' && row.sel && row.sel.promptId === promptId && row.sel.state === 'ISSUED') {
+        row.sel.state = (resolution === 'answered') ? 'ANSWERED' : 'CANCELLED';
+        if (reason) row.sel.reason = reason;
+        wsRefreshSelectionCard(row);
+      }
+    }
+  }
+}
+function wsExpireSelection(promptId, kind) {   // v2.4.74 SelectionExpired(서버 발) → EXPIRED 전이 (승인=잠금·분기=늦은 스티어링 유지)
+  if (!promptId) return;
+  for (const ch of wsState.channels.values()) {
+    for (const row of ch.rows) {
+      if (row.kind === 'selection' && row.sel && row.sel.promptId === promptId && row.sel.state === 'ISSUED') {
+        row.sel.state = 'EXPIRED';
+        if (kind && !row.sel.timeout) row.sel.timeout = { kind, seconds: 0 };
+        wsRefreshSelectionCard(row);
+      }
+    }
+  }
+}
+function wsRenderRow(row) {
+  const s = $('#ws-stream'); if (!s) return;
+  const empty = s.querySelector('.ws-empty'); if (empty) empty.remove();
+  const dk = wsDayKey(row.ts); if (dk && s._lastDay !== dk) { s.appendChild(wsDatelineEl(row.ts)); s._lastDay = dk; }   // 날짜 바뀌면 변경선 삽입
+  s.appendChild(wsRowEl(row));
+  while (s.children.length > 300) s.removeChild(s.firstChild);
+  s.scrollTop = s.scrollHeight;
+}
+function wsRenderActiveStream() {
+  wsRenderChanFilter();   // 대화 위 출처(채널) 필터 탭 동기 (활성 기준)
+  if (wsPagerOn()) { wsSyncPager(); return; }   // 모바일: 페이저가 그룹 페이지별로 렌더 (#ws-stream 숨김)
+  wsRenderStreamInto($('#ws-stream'), wsState.active);
+}
+// item = 채널 id 또는 group key. 지정 컨테이너에 스트림 렌더 (데스크탑=#ws-stream, 모바일 페이저=각 .ws-page-stream).
+// #3a (B): 페이지 재사용 위해 컨테이너 인자형. 출처 필터 탭(#ws-chan-filter)은 호출측에서 활성 기준으로만 동기.
+// v2.4.129 — 잘린 채널 위에 「이전 대화 더 보기」를 놓아요. 버튼 문구에 **남은 건수**를 적어요 —
+//   「더 보기」만 있으면 얼마나 남았는지 몰라서 누를지 말지를 못 정해요. 자동 로드는 안 해요(상한의 뜻).
+function wsMoreBar(s, item) {
+  const keys = wsIsGroup(item) ? wsGroupMembers(item) : [item];
+  const pend = keys.filter((k) => wsMoreState[k] && wsMoreState[k].remaining > 0);
+  if (!pend.length) return;
+  const total = pend.reduce((n, k) => n + wsMoreState[k].remaining, 0);
+  const bar = document.createElement('div');
+  bar.className = 'ws-more-bar';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = `↑ 이전 대화 더 보기 (${total}건 남음)`;   // textContent — 와이어 유래 숫자는 숫자로만 써요
+  btn.onclick = () => { btn.disabled = true; btn.textContent = '불러오는 중…'; for (const k of pend) wsRequestOlder(k); };
+  bar.appendChild(btn);
+  s.appendChild(bar);
+}
+function wsRenderStreamInto(s, item) {
+  if (!s) return;
+  s.innerHTML = ''; s._lastDay = null;
+  wsMoreBar(s, item);
+  if (wsIsGroup(item)) {   // §13.6 그룹 병합: 멤버 채널 rows 를 ts 정렬, 출처 라벨 (멤버 체크박스 필터 적용)
+    const merged = [];
+    const _hidden = wsGrpHidden(item);
+    for (const cid of wsGroupMembers(item)) { if (_hidden.has(cid)) continue; const c = wsState.channels.get(cid); if (c) for (const row of c.rows) merged.push({ row, src: c.name || cid }); }
+    merged.sort((a, b) => (a.row.ts || 0) - (b.row.ts || 0));
+    if (!merged.length) { s.innerHTML = '<div class="ws-empty">' + (_hidden.size ? '표시할 멤버를 선택하세요.' : '이 그룹에 아직 수신한 이벤트가 없어요.') + '</div>'; return; }
+    let lastDay = null;
+    for (const { row, src } of merged) {
+      const dk = wsDayKey(row.ts); if (dk && dk !== lastDay) { s.appendChild(wsDatelineEl(row.ts)); lastDay = dk; }
+      const e = wsRowEl(row); const sp = el('span', 'ws-src'); sp.textContent = src; e.insertBefore(sp, e.firstChild ? e.firstChild.nextSibling : null); s.appendChild(e);
+    }
+    s._lastDay = lastDay;
+    s.scrollTop = s.scrollHeight;
+    return;
+  }
+  const ch = item && wsState.channels.get(item);
+  const _pin = (typeof item === 'string' && item.indexOf('room:') === 0) ? wsRtPinnedEl(item.slice(5)) : null;   // §13.30.8 pinned header/digest 접이식
+  if (!ch || !ch.rows.length) { s.innerHTML = '<div class="ws-empty">아직 수신한 이벤트가 없어요. 에이전트가 연결되면 여기에 표시됩니다.</div>'; if (_pin) s.prepend(_pin); return; }
+  const f = ch._chanFilter || '*';            // 출처 필터 (* = 전체)
+  const showChan = (f === '*');               // 전체 보기일 때만 출처 뱃지(개별 채널은 이미 필터됨)
+  let n = 0, lastDay = null;
+  for (const row of ch.rows) {
+    if (f !== '*' && (row.chan || '') !== f) continue;
+    const dk = wsDayKey(row.ts); if (dk && dk !== lastDay) { s.appendChild(wsDatelineEl(row.ts)); lastDay = dk; }
+    s.appendChild(wsRowEl(row, showChan)); n++;
+  }
+  s._lastDay = lastDay;
+  if (!n) { s.innerHTML = '<div class="ws-empty">이 출처에 표시할 이벤트가 없어요.</div>'; if (_pin) s.prepend(_pin); return; }
+  if (_pin) s.prepend(_pin);
+  s.scrollTop = s.scrollHeight;
+}
+// §13.30.5/8 — room 고정 문서(개요·결정 장부·진행 요약) 접이식 블록. 동적 텍스트는 전부 textContent (§8.1 esc-only).
+function wsRtPinnedEl(roomId) {
+  let rt; try { rt = wsRtRooms.get(roomId); } catch { return null; }   // TDZ 가드 — 초기 applyPanes(load) 경로가 wsRtRooms(2639) 선언 실행 전 호출 가능 (v2.4.32 사고 클래스)
+  if (!rt) return null;
+  const a = rt.artifacts;
+  const d = document.createElement('details'); d.className = 'ws-rt-pin'; d.open = !!rt._pinOpen;
+  d.ontoggle = () => { rt._pinOpen = d.open; };
+  const sum = document.createElement('summary');
+  sum.textContent = '📌 고정 문서' + (rt.artVersion ? ' v' + rt.artVersion : '') + (a && a.summary && a.summary.covers_until ? ' · digest ≤ ' + a.summary.covers_until : '');
+  const rf = document.createElement('button'); rf.className = 'ws-rt-pin-refresh'; rf.textContent = '🔄';
+  rf.title = '서버에서 다시 가져오기 (RequestRoomArtifacts)';
+  rf.onclick = (e) => { e.preventDefault(); e.stopPropagation(); wsSendOrch({ type: 'CUSTOM', name: 'RequestRoomArtifacts', value: { roomId } }); };
+  sum.append(' '); sum.append(rf); d.append(sum);
+  const bd = el('div', 'ws-rt-pin-body');
+  if (!a || (!a.header && !(a.decisions && a.decisions.length) && !a.summary)) {
+    bd.textContent = '아직 고정 문서가 없어요 — RoomArtifactsUpdate 로 채워져요.';
+  } else {
+    if (a.header) { const h = el('div', 'ws-rt-pin-sec'); h.innerHTML = '<b>개요</b>'; const t = el('div', 'ws-rt-pin-txt'); t.textContent = a.header.text || ''; h.append(t); bd.append(h); }
+    if (a.decisions && a.decisions.length) { const h = el('div', 'ws-rt-pin-sec'); h.innerHTML = '<b>결정 장부</b>'; for (const dc of a.decisions) { const t = el('div', 'ws-rt-pin-dec'); t.textContent = (dc.id ? dc.id + ' · ' : '') + (dc.text || '') + (dc.supersedes ? ' (↩ ' + dc.supersedes + ' 대체)' : ''); h.append(t); } bd.append(h); }
+    if (a.summary) { const h = el('div', 'ws-rt-pin-sec'); h.innerHTML = '<b>진행 요약</b>'; const t = el('div', 'ws-rt-pin-txt'); t.textContent = a.summary.text || ''; h.append(t); bd.append(h); }
+  }
+  d.append(bd); return d;
+}
+// ---- 대화 위 출처(채널) 필터 탭 — 에이전트 통합 탭 안에서 channelId/threadId 출처별 필터. [전체]=모두+뱃지 ----
+function wsGrpHidden(gkey) { wsState.grpFilter = wsState.grpFilter || {}; if (!wsState.grpFilter[gkey]) wsState.grpFilter[gkey] = new Set(); return wsState.grpFilter[gkey]; }   // 그룹별 병합뷰에서 숨긴 멤버 id Set (기본 비어있음=전체 표시)
+function wsRenderChanFilter() {
+  const bar = $('#ws-chan-filter'); if (!bar) return;
+  const a = wsState.active;
+  if (wsIsGroup(a)) {   // 그룹 선택 시 멤버별 체크박스(기본 전체 표시) — 병합뷰 포함 멤버 필터 (데스크탑 공통, C)
+    const members = wsGroupMembers(a);
+    if (members.length < 2) { bar.hidden = true; bar.innerHTML = ''; return; }   // 멤버 1개면 필터 불필요
+    bar.hidden = false; bar.innerHTML = '';
+    const hidden = wsGrpHidden(a);
+    const lab = el('span', 'ws-cf-lab'); lab.textContent = '표시'; bar.appendChild(lab);
+    for (const cid of members) {
+      const on = !hidden.has(cid);
+      const t = el('button', 'ws-cf ws-cf-chk' + (on ? ' on' : '')); t.textContent = (on ? '☑ ' : '☐ ') + wsName(cid); t.title = cid;
+      t.onclick = () => { if (hidden.has(cid)) hidden.delete(cid); else hidden.add(cid); wsRenderActiveStream(); };
+      bar.appendChild(t);
+    }
+    return;
+  }
+  const ch = (a && !wsIsGroup(a) && !wsIsMon(a)) ? wsState.channels.get(a) : null;
+  if (!ch) { bar.hidden = true; bar.innerHTML = ''; return; }
+  const chans = []; const seen = new Set(); let hasEmpty = false;
+  for (const r of ch.rows) { const c = r.chan || ''; if (!c) { hasEmpty = true; continue; } if (!seen.has(c)) { seen.add(c); chans.push(c); } }
+  if (chans.length + (hasEmpty ? 1 : 0) < 2) { bar.hidden = true; bar.innerHTML = ''; return; }   // 출처 1개 이하면 필터 불필요
+  bar.hidden = false; bar.innerHTML = '';
+  const cur = ch._chanFilter || '*';
+  const mk = (key, label, title) => { const t = el('button', 'ws-cf' + (cur === key ? ' on' : '')); t.textContent = label; t.title = title || label; t.onclick = () => { ch._chanFilter = key; wsRenderActiveStream(); }; return t; };
+  bar.appendChild(mk('*', '전체', '모든 출처 + 출처 뱃지'));
+  if (hasEmpty) bar.appendChild(mk('', '기본', '출처(channelId/threadId) 없는 메시지'));
+  for (const c of chans) bar.appendChild(mk(c, c, c));
+}
+// ---- raw 이벤트 debug drawer (핸드오프 §1: 기본 timeline 엔 raw JSON 미노출, raw 는 여기서만) ----
+function wsPushDebug(agentId, m) {
+  const ch = wsChannel(agentId);
+  ch.debug.push({ t: nowHM(), seq: (typeof m.seq === 'number' ? m.seq : null), type: m.type, name: m.name || '', raw: m });
+  while (ch.debug.length > 200) ch.debug.shift();
+  if (!wsState.replaying && wsState.debugOpen && agentId === wsState.active) wsRenderDebug();
+}
+function wsDbgJson(o) { try { let s = JSON.stringify(o, null, 2); if (s.length > 4000) s = s.slice(0, 4000) + '\n… (잘림)'; return s; } catch { return String(o); } }
+function wsRenderDebug() {
+  const d = $('#ws-debug'); if (!d) return;
+  d.innerHTML = '';
+  const ch = wsState.active && wsState.channels.get(wsState.active);
+  if (!ch || !ch.debug.length) { d.innerHTML = '<div class="ws-empty">raw 이벤트 없음</div>'; return; }
+  for (const e of ch.debug) {
+    const row = el('div', 'ws-dbg-row');
+    const h = el('div', 'ws-dbg-h'); h.textContent = `${e.t} · ${e.type}${e.name ? ' / ' + e.name : ''}${e.seq != null ? ' · #' + e.seq : ''}`;
+    const pre = el('pre', 'ws-dbg-pre'); pre.textContent = wsDbgJson(e.raw);
+    row.append(h, pre); d.appendChild(row);
+  }
+  d.scrollTop = d.scrollHeight;
+}
+function wsToggleDebug() {
+  wsState.debugOpen = !wsState.debugOpen;
+  const s = $('#ws-stream'), d = $('#ws-debug'), btn = $('#ws-dbg-btn'), pg = $('#ws-pager');
+  if (s) s.hidden = wsState.debugOpen;
+  if (pg) pg.style.display = wsState.debugOpen ? 'none' : '';   // 모바일 페이저는 raw drawer 열면 숨김 (display='' → CSS 복귀)
+  if (d) { d.hidden = !wsState.debugOpen; if (wsState.debugOpen) wsRenderDebug(); }
+  if (btn) btn.classList.toggle('on', wsState.debugOpen);
+}
+function wsPushRow(agentId, row) {
+  const ch = wsChannel(agentId);
+  if (!row.ts) row.ts = Date.now();   // 그룹 병합 뷰 시간순 정렬용
+  ch.rows.push(row);
+  while (ch.rows.length > 300) ch.rows.shift();
+  if (wsState.replaying) return;   // 재생 중엔 데이터만 적재, 렌더·뱃지는 재생 끝나고 일괄
+  // tier-1 알림 (#3a) — 라이브 행만(재생 제외): a2acard=meaningful A2A, err=RUN_ERROR 중단·오류
+  if (row.kind === 'a2acard') wsNotify('a2a', 'A2A 수신: ' + (row.label || ''), (row.a2a && (row.a2a.summary || row.a2a.name)) || '');
+  else if (row.kind === 'err') wsNotify('abort', '작업 오류·중단', row.body || row.label || '');
+  const active = wsState.active;
+  const pagerOn = wsPagerOn();
+  const sameGroup = wsGroupKeyOf(agentId) === wsGroupKeyOf(active);
+  const inView = pagerOn ? sameGroup : (agentId === active || (wsIsGroup(active) && wsGroupMembers(active).indexOf(agentId) >= 0));
+  if (wsState.popOpen) {
+    if (pagerOn) { if (sameGroup) wsSyncPager(); else wsPagerEnsureSet(); }   // 모바일: active 그룹 행=갱신(하단 스크롤), 타 그룹 행=페이지 집합만 보장(active 페이지 안 흔듦)
+    else if (inView) { if (wsIsGroup(active)) wsRenderActiveStream(); else wsRenderRow(row); }   // 그룹 뷰면 병합 재렌더
+  }
+  if (!inView) ch.unseen++;
+  wsRenderTabs(); updateWsBadge();
+}
+
+function wsName(id) { const c = wsState.channels.get(id); return (c && c.name) || id; }
+// v0.3 오케스트레이션 — 모니터 3채널(Up↔Main / Main↔Local / Main↔Collab) + 탭 그룹
+const WS_MON_UP = '__mon_up__';        // 🔀 업스트림 ↔ 메인
+const WS_MON_LOCAL = '__mon_local__';  // 🔀 메인 ↔ 로컬
+const WS_MON_COLLAB = '__mon_collab__';  // 🔀 메인 ↔ 협업(collab peer, §13.9 — collab/upstream = peer not worker)
+const WS_MON_BOARD = '__mon_board__';  // 🔀 메인 ↔ 보드 (board-worker A2A 별도 모니터 — C1 backends.json overlay)
+const WS_MON_PEER = '__mon_peer__';    // 🔀 메인 ↔ 피어 (peer-main A2A — v2.4.52 §13.9.3; 메인 그룹에 취합)
+const WS_MON_PEER_PEER = '__mon_peer_peer__';      // 🔀 피어 ↔ 피어 (피어 그룹에 취합)
+const WS_MON_PEER_COLLAB = '__mon_peer_collab__';  // 🔀 피어 ↔ 협업 (피어 그룹에 취합)
+let wsBackends = {};   // C1 backend registry overlay (backends.json): agentId → {role, model, connection, board}. 부재 시 {} → graceful (board-worker 는 local 로 접힘, badge 없음)
+const wsEchoState = {};   // v2.4.58 §13.26.4 EchoModeState: agentId → {level, provenance}. off/부재 = 배지 없음
+// v2.4.67 — 주입행 슬래시 명령 자동완성: agentId → {commands[{name,desc}], updatedAt}.
+// 소스 = ① 대상 에이전트가 선언한 CommandManifest(최우선 — 하네스가 자기 명령을 스스로 선언하므로
+// Claude Code/Codex/Hermes/OpenClaw 무관 호환) ② 미선언 시 보수적 공통 후보(해석은 대상 하네스 몫).
+const wsCmdManifests = new Map();
+// v2.4.71 — 입력줄 상태 스트립: agentId → OpsState 선언 {model?, effort?, fast?, subscaler?, controls?, updatedAt}.
+// CommandManifest 와 같은 클래스(변경-트리거 선언·latest-wins·History 동봉). 미선언 시 backends 폴백.
+const wsOpsStates = new Map();
+const WS_CMD_COMMON = [
+  { name: '/help', desc: '도움말 — 대상 하네스가 해석' },
+  { name: '/status', desc: '상태 확인 — 대상 하네스가 해석' },
+  { name: '/compact', desc: '컨텍스트 압축 — 대상 하네스가 해석' },
+  { name: '/clear', desc: '대화 초기화 — 대상 하네스가 해석' },
+  { name: '/model', desc: '모델 선택 — 대상 하네스가 해석' },
+  { name: '/review', desc: '코드 리뷰 — 대상 하네스가 해석' },
+];
+
+// ---- v2.4.61 §13.26.6 Workflow-run 플로팅 인스펙터 ----
+// 미러 워처가 발신하는 WorkflowStatus CUSTOM(runId·name·status·phases·agents[{id,label?,state,preview?}]·done/started·totalTokens·durationMs·logsTail)
+// 을 구독해, 🧵 STEP 행 클릭 시 종합 상태를 실시간 플로팅 창으로 표시 (이동·폭조절·세로 자동·접기·닫기).
+const wsWfRuns = {};        // runId → 최신 WorkflowStatus value
+let wsWfSubs = null;        // v2.4.63 — 최신 SubagentStatus 스냅샷 {agents[], count, updatedAt}
+let wsWfPopState = null;    // { runId(focus, null=오버뷰), el, body, ttl, colBtn, collapsed }
+function wsWfIntake(v) {
+  if (!v || !v.runId) return;
+  wsWfRuns[v.runId] = v;
+  if (wsWfPopState) wsWfPopRender();
+  wsWfBtnSync();
+}
+function wsWfSubsIntake(v) {   // v2.4.63 — 단독 서브에이전트 모니터 스냅샷
+  wsWfSubs = v || null;
+  if (wsWfPopState) wsWfPopRender();
+  wsWfBtnSync();
+}
+// ── 좌석 계측 (§13.35.8, v2.4.129) ──────────────────────────────────────────
+// 하네스 기록에서 파생된 좌석 상태 — 모델·effort·문맥 점유·물린 도구. 값은 **와이어 유래**라
+//   신뢰하지 않아요: 숫자만 숫자로 쓰고 문자열은 텍스트 노드로만 넣어요(§8.1 esc-only, 위 둘과 동일).
+let wsSeats = {};   // seatId → 최신 스냅샷
+function wsSeatIntake(v) {
+  const id = typeof v.seat === 'string' ? v.seat.slice(0, 64) : '?';
+  wsSeats[id] = v || null;
+  wsSeatBtnSync();
+}
+// v2.4.145 — 얼굴에 **모델을 함께** 적고, 고르는 기준을 «사전순 첫 좌석» 에서 «지금 말 걸고
+//   있는 상대» 로 바꿔요.
+//
+//   왜 (2026-08-08 운영자 보고 + 실측): 종전엔 `ids[0]` — 사전순 첫 좌석이었어요. 좌석이 하나일
+//   때는 안 물었지만, 계측이 좌석마다 나오기 시작하면 **내가 보는 숫자와 내가 말하는 상대가
+//   갈려요.** 그리고 숫자만 있고 모델이 없어서, 값이 바뀌었을 때 「대화가 길어졌다」인지
+//   「다른 모델의 값으로 갈아탔다」인지 화면에서 구별할 수 없었어요 — 실제로 후자였어요.
+function wsSeatShortModel(m) { return String(m || '').replace(/^claude-/, ''); }
+function wsSeatBtnSync() {
+  const btn = document.getElementById('ws-seat-inbtn'); if (!btn) return;
+  const ids = Object.keys(wsSeats).sort();
+  if (!ids.length) { btn.textContent = '🪑 —'; btn.title = '좌석 계측 없음'; return; }
+  // ① 지금 유효 타깃이 계측을 내는 좌석이면 그 좌석 ② 아니면 main ③ 아니면 첫 좌석.
+  let pick = null;
+  try {
+    const eff = wsEffectiveTarget();
+    if (eff && eff.indexOf('room:') !== 0) {
+      const ch = wsState.channels.get(eff);
+      const route = (ch && ch.routeId) || eff;
+      if (wsSeats[route]) pick = route;
+    }
+  } catch {}
+  if (!pick) pick = ids.find((k) => wsSeats[k] && wsSeats[k].kind === 'main') || ids[0];
+  const s = wsSeats[pick] || {};
+  // 문맥은 «모르면 모른다» 예요 — 0 으로 적으면 「비어 있다」는 주장이 돼요 (§13.35.8).
+  const ctx = Number.isFinite(s.contextTokens) ? Math.round(s.contextTokens / 1000) + 'k' : '—';
+  const mdl = typeof s.model === 'string' && s.model ? wsSeatShortModel(s.model) : '?';
+  const busy = typeof s.inFlightTool === 'string' && s.inFlightTool ? ' ⚙' : '';
+  // 추측으로 묶인 값에는 `~` 를 붙여요 — 정확한 값과 같은 모양으로 두면 출처 이동이 안 보여요.
+  const approx = s.boundBy === 'mtime' ? '~' : '';
+  btn.textContent = `🪑 ${approx}${mdl} ${ctx}${busy}`;
+  const lines = [];
+  for (const k of ids) {
+    const t = wsSeats[k] || {};
+    const parts = [(k === pick ? '▸ ' : '  ') + k, t.status || 'unknown'];
+    if (typeof t.kind === 'string') parts.push(t.kind);
+    parts.push(typeof t.model === 'string' && t.model ? t.model : '(모델 미상)');
+    if (typeof t.effort === 'string' && t.effort) parts.push('effort=' + t.effort);
+    if (typeof t.declaredModel === 'string' && t.declaredModel && typeof t.model === 'string'
+        && t.model.indexOf(t.declaredModel) < 0) parts.push('선언=' + t.declaredModel + ' ≠ 실측');
+    if (Number.isFinite(t.contextTokens)) parts.push('ctx=' + t.contextTokens);
+    // 사다리 1칸이 아니면 «폴백으로 돌고 있다» 예요. 이게 안 보여서 폴백 주차가 정상처럼 보였어요.
+    if (Number.isFinite(t.rung) && t.rung > 0) parts.push('사다리 ' + t.rung + '칸(폴백)');
+    if (Array.isArray(t.quotaBlocked) && t.quotaBlocked.length) parts.push('할당량막힘=' + t.quotaBlocked.join(','));
+    if (typeof t.boundBy === 'string' && t.boundBy !== 'session-file') parts.push('결속=' + t.boundBy + (t.boundBy === 'mtime' ? '(추측)' : ''));
+    if (typeof t.inFlightTool === 'string' && t.inFlightTool) parts.push('▶' + t.inFlightTool);
+    lines.push(parts.join(' · '));
+  }
+  btn.title = lines.join('\n');   // title 은 텍스트 속성이라 마크업 해석 안 해요
+}
+// ── 실시간 활성 스트림 (Pantty §8 확장) — AgentActivity 프레임의 «지금 무엇을» 지표 ──────────────
+//   §8 규율: 하네스가 실제로 호출한 도구에서 파생돼요(자유서술 선언 아님). 값은 와이어 유래라
+//   텍스트 노드로만 넣어요(§8.1 esc-only). 관측 전용이라 대화 줄이 아니라 지표로만 렌더해요.
+//   나이를 함께 봐요: 오래된 활동을 «지금» 으로 보이면 «마지막으로 X 함» 을 «지금 X 중» 으로 오독해요.
+let wsActNow = null;   // {tool, summary, ts, agentId} — 최신 1건 latest-wins
+let wsActTimer = null;
+function wsActIntake(m) {
+  const v = (m && m.value) || {};
+  wsActNow = {
+    tool: typeof v.tool === 'string' ? v.tool.slice(0, 32) : '?',
+    summary: typeof v.summary === 'string' ? v.summary.slice(0, 120) : '',
+    ts: Number.isFinite(v.ts) ? v.ts : Date.now(),
+    agentId: typeof m.agentId === 'string' ? m.agentId : '',
+  };
+  wsActSync();
+}
+function wsActInit() {
+  if (document.getElementById('ws-act-now')) return;
+  const b = el('button', 'ws-act-now'); b.id = 'ws-act-now'; b.type = 'button'; b.hidden = true;
+  b.style.cssText = 'font-family:ui-monospace,monospace;font-size:11px;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+  const left = document.getElementById('ws-act-left');   // ⚙(prepend)·🧵·🪑 뒤 — row 방향이라 시각적으로 이들 오른쪽
+  if (left) left.appendChild(b);
+  wsActSync();
+}
+function wsActSync() {
+  const b = document.getElementById('ws-act-now'); if (!b) return;
+  if (!wsActNow) { b.hidden = true; return; }
+  const age = Date.now() - wsActNow.ts;
+  if (age > 90000) { b.hidden = true; wsActNow = null; return; }   // 90초 지나면 «지금» 아님 — 지워요
+  b.hidden = false;
+  b.style.opacity = age > 30000 ? '0.45' : '0.9';   // 30초 넘으면 흐리게 — 흐름이 멈췄다는 관측
+  b.textContent = '⚡ ' + wsActNow.tool + (wsActNow.summary ? ' ' + wsActNow.summary : '');
+  const who = wsActNow.agentId ? wsActNow.agentId + ' · ' : '';
+  b.title = who + '지금: ' + wsActNow.tool + (wsActNow.summary ? ' — ' + wsActNow.summary : '') + ' · ' + new Date(wsActNow.ts).toLocaleTimeString();
+  if (!wsActTimer) wsActTimer = setInterval(() => { try { wsActSync(); } catch {} }, 5000);   // 나이 흐름 반영 (단일 타이머)
+}
+// ── 터미널 중계 위젯 (Pantty §9 relay 모드) — xterm 으로 pty-host 에 char-mode 로 붙어요 ──────────
+//   §9: relay 바이트는 «세 번째 문» — 모델로 안 가고 pty-host 가 소비해요. 프레임은 targetAgentId=
+//   'pty-host' 로 보내면 서버가 그 에이전트로 릴레이하고, TerminalData 는 방송으로 돌아와 sessionId
+//   로 걸러 렌더해요. 버튼은 대시보드가 보이면(=이미 operator authed) 떠요 — 실제 문은 서버 operator-
+//   auth + pty-host 가 지켜요(§9 인간 문, 모델이 못 엶).
+let wsTermState = null;   // { sessionId, term, fit, el, onResize }
+function wsTermSend(name, value) {
+  const ws = wsState.ws; if (!ws || ws.readyState !== 1) return false;
+  try { ws.send(JSON.stringify({ ...wsCommon(), type: 'CUSTOM', name, targetAgentId: 'pty-host', value })); return true; } catch { return false; }
+}
+function wsTermClose() {
+  if (!wsTermState) return;
+  const s = wsTermState; wsTermState = null;
+  try { wsTermSend('PtyClose', { sessionId: s.sessionId }); } catch {}
+  try { if (s.onResize) window.removeEventListener('resize', s.onResize); } catch {}
+  try { if (s.el && s.el._dragCleanup) s.el._dragCleanup(); } catch {}
+  try { s.term.dispose(); } catch {}
+  try { s.el.remove(); } catch {}
+  const b = document.getElementById('ws-term-btn'); if (b) b.classList.remove('on');
+}
+function wsTermOpen() {
+  if (wsTermState) { wsTermClose(); return; }                 // 토글 닫기
+  if (typeof window.Terminal !== 'function') { wsLocalRow('err', '⚠ 터미널', 'xterm 미로드'); return; }
+  // v2.4.165 Pantty §9 — 세션 ID 는 128비트 난수예요. 종전 «시각 + 2^20 미만 Math.random» 은 추측 가능했어요.
+  //   서버가 모양(t- + 32 hex)을 검사해 다른 모양은 거절해요. 소유 검사가 주 방어이고, 이건 심층 방어예요.
+  const sessionId = 't-' + Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, '0')).join('');
+  const box = document.createElement('div');
+  box.style.cssText = 'position:fixed;right:24px;bottom:80px;width:680px;height:420px;z-index:270;background:#0b0e14;border:1px solid #2a3140;border-radius:8px;display:flex;flex-direction:column;box-shadow:0 8px 30px rgba(0,0,0,.5);resize:both;overflow:hidden';
+  const head = document.createElement('div');
+  head.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:4px 8px;background:#151a24;border-bottom:1px solid #2a3140;cursor:move;font-size:12px;color:#9aa4b2;user-select:none';
+  const title = document.createElement('span'); title.textContent = '🖥 terminal · pty-host'; head.appendChild(title);
+  const x = document.createElement('button'); x.textContent = '✕'; x.style.cssText = 'background:none;border:none;color:#9aa4b2;cursor:pointer;font-size:14px;line-height:1'; x.onclick = wsTermClose; head.appendChild(x);
+  const body = document.createElement('div'); body.style.cssText = 'flex:1;min-height:0;padding:4px 6px';
+  box.appendChild(head); box.appendChild(body); document.body.appendChild(box);
+  const term = new window.Terminal({ cursorBlink: true, fontSize: 13, fontFamily: 'ui-monospace,Consolas,monospace', scrollback: 5000, theme: { background: '#0b0e14', foreground: '#cdd3de' } });
+  let fit = null;
+  try { fit = new window.FitAddon.FitAddon(); term.loadAddon(fit); } catch {}
+  term.open(body);
+  try { if (fit) fit.fit(); } catch {}
+  term.onData((d) => wsTermSend('PtyData', { sessionId, data: d }));   // char-mode — 원격 셸이 에코해요
+  const onResize = () => { try { if (fit) fit.fit(); wsTermSend('PtyResize', { sessionId, cols: term.cols, rows: term.rows }); } catch {} };
+  window.addEventListener('resize', onResize);
+  wsTermState = { sessionId, term, fit, el: box, onResize };
+  wsTermSend('PtyOpen', { sessionId, cols: term.cols || 80, rows: term.rows || 24 });
+  term.write('\x1b[90m[opening terminal via pty-host…]\x1b[0m\r\n');
+  term.focus();
+  wsTermDrag(box, head);
+  const b = document.getElementById('ws-term-btn'); if (b) b.classList.add('on');
+}
+function wsTermDrag(box, handle) {   // 간단 드래그 — 헤더 잡고 이동
+  let sx, sy, ox, oy, on = false;
+  handle.addEventListener('mousedown', (e) => { if (e.target.tagName === 'BUTTON') return; on = true; sx = e.clientX; sy = e.clientY; const r = box.getBoundingClientRect(); ox = r.left; oy = r.top; box.style.right = 'auto'; box.style.bottom = 'auto'; box.style.left = ox + 'px'; box.style.top = oy + 'px'; e.preventDefault(); });
+  const mv = (e) => { if (!on) return; box.style.left = (ox + e.clientX - sx) + 'px'; box.style.top = (oy + e.clientY - sy) + 'px'; };
+  const up = () => { on = false; };
+  window.addEventListener('mousemove', mv); window.addEventListener('mouseup', up);
+  box._dragCleanup = () => { window.removeEventListener('mousemove', mv); window.removeEventListener('mouseup', up); };
+}
+function wsTermInit() {
+  if (document.getElementById('ws-term-btn')) return;
+  const b = el('button', 'ws-term-btn'); b.id = 'ws-term-btn'; b.type = 'button'; b.textContent = '🖥';
+  b.title = '터미널 — pty-host 에 붙어 셸/CLI 를 중계해요 (Pantty §9 relay). 좌석 CLI 에 들어가면 연결이 direct→relay 로 바뀌어요.';
+  b.onclick = (e) => { e.stopPropagation(); wsTermOpen(); };
+  const left = document.getElementById('ws-act-left');
+  if (left) left.appendChild(b);
+}
+function wsWfBtnSync() {   // v2.4.64 — 입력줄 인디케이터 토글 "Wn/n Sn" (최근 런 done/started + 활동 서브에이전트 수)
+  const btn = document.getElementById('ws-wf-inbtn'); if (!btn) return;
+  const ids = Object.keys(wsWfRuns).sort((a, b) => ((wsWfRuns[b].updatedAt || 0) - (wsWfRuns[a].updatedAt || 0)));
+  const r = ids.length ? wsWfRuns[ids[0]] : null;
+  const sc = (wsWfSubs && wsWfSubs.count) || 0;
+  btn.textContent = `🧵 W${r ? (r.done != null ? r.done : 0) : 0}/${r ? (r.started != null ? r.started : 0) : 0} S${sc}`;
+  btn.title = '에이전트 활동 모니터 토글' + (r ? ` — 최근: ${String(r.name || r.runId)} (${r.status || 'running'})` : '') + ` · 서브에이전트 ${sc}`;
+}
+function wsWfPopToggle() { if (wsWfPopState) { wsWfPopState.el.remove(); wsWfPopState = null; } else wsWfPopOpen(null); }   // v2.4.63 고정 fab 용
+function wsWfFabInit() {   // v2.4.63 — 플로팅 레이어 토글 고정 버튼
+  if (document.getElementById('ws-wf-fab')) return;
+  const f = el('button', 'ws-wf-fab'); f.id = 'ws-wf-fab'; f.textContent = '🧵'; f.title = '에이전트 활동 모니터 (workflow + 서브에이전트)';
+  f.onclick = wsWfPopToggle;
+  document.body.appendChild(f);
+}
+function wsWfPopOpen(runId) {
+  if (wsWfPopState) { const same = wsWfPopState.runId === runId; wsWfPopState.el.remove(); wsWfPopState = null; if (same) return; }   // 같은 행 재클릭 = 토글 닫기
+  const pop = el('div', 'ws-wf-pop');
+  let pos = null; try { pos = JSON.parse(localStorage.getItem('constellation-wf-pop') || 'null'); } catch {}
+  if (pos && pos.l != null) { pop.style.left = pos.l + 'px'; pop.style.top = pos.t + 'px'; if (pos.w) pop.style.width = pos.w + 'px'; }
+  const head = el('div', 'ws-wf-pop-head');
+  const ttl = el('span', 'ws-wf-pop-title');
+  const colBtn = el('button', 'ws-wf-pop-btn', '▾'); colBtn.title = '접기/펼치기';
+  const x = el('button', 'ws-wf-pop-btn', '✕'); x.title = '닫기';
+  head.append(ttl, colBtn, x);
+  const body = el('div', 'ws-wf-pop-body');
+  pop.append(head, body);
+  document.body.appendChild(pop);
+  wsWfPopState = { runId, el: pop, body, ttl, colBtn, collapsed: false };
+  colBtn.onclick = (ev) => { ev.stopPropagation(); const s = wsWfPopState; s.collapsed = !s.collapsed; s.body.hidden = s.collapsed; s.colBtn.textContent = s.collapsed ? '▸' : '▾'; };
+  x.onclick = (ev) => { ev.stopPropagation(); pop.remove(); wsWfPopState = null; };
+  let drag = null;   // 헤더 드래그 이동 (pointer capture) — 놓을 때 위치·폭 영속
+  // v2.4.85: 헤더 안의 드랍다운 패널·폼 컨트롤에서 시작한 pointerdown 은 드래그로 가로채지 않는다 — 가로채면 패널 안 키/URL 텍스트를 드래그 선택할 수 없어 수동 복사가 불가능(실사용 보고).
+  head.onpointerdown = (ev) => { if (ev.target === colBtn || ev.target === x) return; if (ev.target && ev.target.closest && ev.target.closest('.ws-collab-panel, button, input, textarea, select, label, a')) return; drag = { x: ev.clientX - pop.offsetLeft, y: ev.clientY - pop.offsetTop }; try { head.setPointerCapture(ev.pointerId); } catch {} };
+  head.onpointermove = (ev) => { if (!drag) return; pop.style.left = Math.max(0, ev.clientX - drag.x) + 'px'; pop.style.top = Math.max(0, ev.clientY - drag.y) + 'px'; };
+  head.onpointerup = () => { if (!drag) return; drag = null; try { localStorage.setItem('constellation-wf-pop', JSON.stringify({ l: pop.offsetLeft, t: pop.offsetTop, w: pop.offsetWidth })); } catch {} };
+  wsWfPopRender();
+}
+function wsWfPopRender() {
+  const s = wsWfPopState; if (!s) return;
+  // §8.1 esc-only — WorkflowStatus/SubagentStatus 값은 와이어-유래(임의 접속 에이전트 발신 가능) 신뢰불가 입력.
+  // el() 3번째 인자는 innerHTML 이므로 절대 사용 금지, 전부 textContent 로만 주입. state 는 화이트리스트.
+  const txt = (cls, text) => { const d = el('div', cls); d.textContent = text; return d; };
+  const runIds = Object.keys(wsWfRuns).sort((a, b2) => ((wsWfRuns[b2].updatedAt || 0) - (wsWfRuns[a].updatedAt || 0)));
+  const focus = s.runId || runIds[0] || null;   // fab 오버뷰(runId=null)면 최신 런에 포커스
+  const v = focus ? wsWfRuns[focus] : null;
+  s.ttl.textContent = '🧵 ' + (v ? (v.name || focus) : '에이전트 활동 모니터');
+  const b = s.body; b.textContent = '';
+  // ── 워크플로 섹션 ──
+  b.append(txt('ws-wf-sec', `워크플로 (${runIds.length})`));
+  if (!runIds.length) b.append(txt('ws-wf-empty', '알려진 워크플로 런 없음 — 런이 돌면 미러가 채워요'));
+  for (const rid of runIds.slice(0, 6)) {
+    if (rid === focus) continue;   // 포커스 런은 아래 상세로
+    const rv = wsWfRuns[rid];
+    const row = txt('ws-wf-runrow', `${rv.status === 'completed' ? '✓' : rv.status === 'failed' ? '⚠' : '▶'} ${String(rv.name || rid)} · ${rv.done != null ? rv.done : 0}/${rv.started != null ? rv.started : 0}`);
+    row.onclick = () => { s.runId = rid; wsWfPopRender(); };
+    b.append(row);
+  }
+  if (v) {
+    const stCls = v.status === 'completed' ? 'completed' : v.status === 'failed' ? 'failed' : 'running';
+    b.append(txt('ws-wf-status ' + stCls,
+      (stCls === 'completed' ? '✓ 완료' : stCls === 'failed' ? '⚠ 실패' : '▶ 진행 중')
+      + ` · agents ${v.done != null ? v.done : 0}/${v.started != null ? v.started : 0}`
+      + (v.totalTokens ? ` · ${Math.round(v.totalTokens / 1000)}k tok` : '')
+      + (v.durationMs ? ` · ${Math.round(v.durationMs / 1000)}s` : '')));
+    if (Array.isArray(v.phases) && v.phases.length) b.append(txt('ws-wf-phases', '단계: ' + v.phases.map(String).join(' → ')));
+    for (const g of wsWfByModel(v.agents)) {
+      if (g.header) b.append(txt('ws-wf-sec', g.header));
+      for (const a of g.items) {
+        const aCls = a.state === 'done' ? 'done' : a.state === 'running' ? 'running' : '';
+        b.append(txt('ws-wf-agent ' + aCls, (a.state === 'done' ? '✓ ' : '⏳ ') + String(a.label || a.id || '?') + (a.preview ? ' — ' + String(a.preview) : '')));
+      }
+    }
+    if (Array.isArray(v.logsTail) && v.logsTail.length) { const lg = el('div', 'ws-wf-logs'); for (const l of v.logsTail) lg.append(txt('ws-wf-log', '· ' + String(l))); b.append(lg); }
+  }
+  // ── 서브에이전트 섹션 (v2.4.63 — 단독 Agent 태스크 모니터) ──
+  const subs = (wsWfSubs && Array.isArray(wsWfSubs.agents)) ? wsWfSubs.agents : [];
+  b.append(txt('ws-wf-sec', `서브에이전트 (${subs.length})`));
+  if (!subs.length) b.append(txt('ws-wf-empty', '활동 중인 단독 서브에이전트 없음'));
+  for (const g of wsWfByModel(subs.slice(0, 12))) {
+    if (g.header) b.append(txt('ws-wf-sec', '  ' + g.header));
+    for (const a of g.items) {
+      b.append(txt('ws-wf-agent running', `⏳ ${String(a.id || '?')}${a.hint ? ' · ' + String(a.hint) : ''}${a.lastActivityS != null ? ' · ' + a.lastActivityS + 's 전 활동' : ''}${a.sizeKB != null ? ' · ' + a.sizeKB + 'KB' : ''}${a.effort ? ' · effort=' + String(a.effort) : ''}${Number.isFinite(a.contextTokens) ? ' · ctx=' + Math.round(a.contextTokens / 1000) + 'k' : ''}`));
+    }
+  }
+}
+// v2.4.145 — 배경 작업을 **모델별로 묶어요** (운영자 요청: 「백그라운드 작업 표시도 모델별로
+//   분리」). 모델이 하나뿐이거나 전부 미상이면 머리글을 만들지 않아요 — 한 종류인데 구분선을
+//   그리면 없는 구분을 있는 것처럼 보여줘요.
+//
+//   `null` 모델은 «모른다» 고 적어요, 빼지 않아요. 워크플로 journal 의 agentId 와 서브에이전트
+//   기록 파일명이 같은 id 공간인지는 발행 시점에 표본 0으로 **미검증**이라, 조회 실패가 실재해요.
+//   빼 버리면 「에이전트가 없다」로 읽히고, 채워 버리면 라벨이 그럴듯하게 틀려요.
+function wsWfByModel(list) {
+  const items = Array.isArray(list) ? list : [];
+  if (!items.length) return [];
+  const by = new Map();
+  for (const a of items) {
+    const k = (a && typeof a.model === 'string' && a.model) ? a.model : '';
+    if (!by.has(k)) by.set(k, []);
+    by.get(k).push(a);
+  }
+  if (by.size <= 1) return [{ header: null, items }];
+  const keys = [...by.keys()].sort((x, y) => (x === '' ? 1 : y === '' ? -1 : x.localeCompare(y)));   // 미상은 맨 뒤
+  return keys.map((k) => ({
+    header: (k ? wsSeatShortModel(k) : '모델 미상') + ` (${by.get(k).length})`,
+    items: by.get(k),
+  }));
+}
+function wsLoadBackends() {
+  fetch('backends.json', { cache: 'no-store' }).then(r => r.ok ? r.json() : null).then(reg => {
+    if (!reg) return;
+    if (reg.boardTitle) { const bn = $('#board-name'); if (bn) bn.textContent = reg.boardTitle; document.title = reg.boardTitle + ' 라이브 보드'; }   // 보드 타이틀 커스텀 (deployment 별)
+    if (!Array.isArray(reg.agents)) return;
+    const m = {}; for (const a of reg.agents) if (a && a.agentId) m[a.agentId] = a;
+    wsBackends = m;
+    for (const [id, c] of wsState.channels) { const b = m[id]; if (b && b.role) c.role = b.role; }   // 이미 연결된 채널 role 재분류
+    wsRenderTabs();
+  }).catch(() => {});   // 부재/오류 = graceful no-op
+}
+let WS_LOCAL = 'main-agent';           // placeholder; updated dynamically from AgentList (the agentId whose role==='main') — §2 role model
+function wsRoleOf(id) { const c = wsState.channels.get(id); return (c && c.role) || (id === WS_LOCAL ? 'main' : 'local'); }
+function wsMonChannel(src, dst) {
+  const sr = wsRoleOf(src), dr = wsRoleOf(dst);
+  if (sr === 'peer' || dr === 'peer') {   // v2.4.52 peer 우선 분기 — 피어 관여 A2A 는 피어 계열 모니터로
+    if (sr === 'peer' && dr === 'peer') return WS_MON_PEER_PEER;
+    if (sr === 'collab' || dr === 'collab') return WS_MON_PEER_COLLAB;
+    return WS_MON_PEER;   // main·local·board-worker·upstream ↔ peer → Main↔Peer 취합
+  }
+  if (sr === 'upstream' || dr === 'upstream') return WS_MON_UP;
+  if (sr === 'collab' || dr === 'collab') return WS_MON_COLLAB;   // §13.9 collab peer: Main↔Collab 별도 모니터
+  if (sr === 'board-worker' || dr === 'board-worker') return WS_MON_BOARD;   // C1: board-worker A2A → Main↔Board 별도 모니터
+  return WS_MON_LOCAL;
+}
+function wsMonName(id) { return id === WS_MON_UP ? '🔀 Up↔Main' : id === WS_MON_COLLAB ? '🔀 Main↔Collab' : id === WS_MON_BOARD ? '🔀 Main↔Board' : id === WS_MON_PEER ? '🔀 Main↔Peer' : id === WS_MON_PEER_PEER ? '🔀 Peer↔Peer' : id === WS_MON_PEER_COLLAB ? '🔀 Peer↔Collab' : '🔀 Main↔Local'; }
+function wsIsMon(id) { return id === WS_MON_UP || id === WS_MON_LOCAL || id === WS_MON_COLLAB || id === WS_MON_BOARD || id === WS_MON_PEER || id === WS_MON_PEER_PEER || id === WS_MON_PEER_COLLAB; }
+function wsIsGroup(id) { return typeof id === 'string' && id.indexOf('group:') === 0; }
+function wsGroupMembers(gkey) {
+  const r = gkey === 'group:up' ? 'upstream' : gkey === 'group:main' ? 'main' : gkey === 'group:collab' ? 'collab' : gkey === 'group:board-worker' ? 'board-worker' : gkey === 'group:peer' ? 'peer' : gkey === 'group:roundtable' ? 'roundtable' : 'local';
+  // ⚠ **`hidden` 을 빼요.** 종전엔 여기가 hidden 을 포함해서, 렌더러(byRole 은 `!c.hidden`)와
+  //   멤버십이 갈렸어요 — 그러면 **화면에 없는 채널이 그룹 «대표» 가 되어 전송 대상**이 돼요.
+  //   운영자가 보는 첫 탭과 실제로 글이 가는 곳이 다른 상태고, 증상이 「왜 대화 대상이 저 사람이냐」예요
+  //   (2026-08-08 운영자 관측). 같은 질문을 두 함수가 각자 답하면 그 둘은 반드시 갈라져요.
+  // v2.4.161 — 소속 판정은 `wsRoleOf`(실효 role) 로. 종전엔 raw `c.role === r` 이라 role 이 **없는** 채널은 어느
+  //   그룹의 멤버도 아니었는데, 반대 방향인 `wsGroupKeyOf` 는 그런 채널을 group:local 로 보냈어요. 같은 질문에
+  //   두 답 — 모바일에선 그 채널의 페이지가 「이 그룹에 아직 수신한 이벤트가 없어요」였고, 데스크탑은 채널을
+  //   직접 그려서 못 봤어요. 실효 role 로 맞추면 «모르는 role → 로컬에 보임» 이 양쪽에서 같은 답이에요
+  //   (오분류가 부재보다 낫다는 2026-08-08 결정 그대로).
+  const mem = [...wsState.channels.entries()].filter(([id, c]) => !wsIsMon(id) && !c.hidden && wsRoleOf(id) === r).map(([id]) => id);
+  if (gkey === 'group:up' && wsState.channels.has(WS_MON_UP)) mem.push(WS_MON_UP);
+  if (gkey === 'group:main' && wsState.channels.has(WS_MON_LOCAL)) mem.push(WS_MON_LOCAL);
+  if (gkey === 'group:main' && wsState.channels.has(WS_MON_COLLAB)) mem.push(WS_MON_COLLAB);   // group:main 병합에 Main↔Collab 취합(§13.9 collab peer)
+  if (gkey === 'group:main' && wsState.channels.has(WS_MON_PEER)) mem.push(WS_MON_PEER);   // v2.4.52: group:main 병합에 Main↔Peer 취합
+  if (gkey === 'group:board-worker' && wsState.channels.has(WS_MON_BOARD)) mem.push(WS_MON_BOARD);   // C1: board-worker 그룹 병합에 Main↔Board 취합
+  if (gkey === 'group:peer' && wsState.channels.has(WS_MON_PEER_PEER)) mem.push(WS_MON_PEER_PEER);   // v2.4.52: 피어 그룹 병합에 Peer↔Peer 취합
+  if (gkey === 'group:peer' && wsState.channels.has(WS_MON_PEER_COLLAB)) mem.push(WS_MON_PEER_COLLAB);   // v2.4.52: 피어 그룹 병합에 Peer↔Collab 취합
+  return mem;
+}
+function wsGroupRep(gkey) {
+  // 그룹 탭의 *대표 워커* — group:up→업스트림 / group:main→메인 으로 입력·라우팅 한 화면에서. group:main 이면 WS_LOCAL(메인) 우선, 그 외 그룹은 비-모니터 첫 멤버.
+  if (gkey === 'group:main' && wsState.channels.has(WS_LOCAL)) return WS_LOCAL;
+  // **운영자가 보는 순서로** 골라요. 종전엔 `wsState.channels` 의 **삽입 순서** 첫 멤버였는데, 렌더러는
+  //   사용자 지정 탭 순서(wsApplyOrder)를 적용해요 — 그래서 «맨 왼쪽 탭» 과 «대표» 가 서로 달랐어요.
+  //   탭을 끌어 옮겨도 전송 대상은 안 따라오는 상태였고, 그건 화면이 거짓말하는 부류예요.
+  const g = wsComputeGroups().find((x) => x.key === gkey);
+  const ordered = g ? g.tabs : wsGroupMembers(gkey);
+  for (const cid of ordered) { if (!wsIsMon(cid)) return cid; }
+  return null;
+}
+function onWsEvent(m) {
+  const t = m.type;
+  const _ts = wsMsgEpoch(m);   // 발신 시각 epoch ms (정렬·날짜변경선용·고정) — 없으면 null
+  const _t = wsRowTime(m);     // 발신 시각 HH:MM:SS (client 로컬 TZ·고정) — 없으면 nowHM() fallback
+  if (t === 'SERVER_HELLO') {
+    wsState.open = true; updateWsConn();
+    // post-handshake assertion (envelope-drift catch): 5s after SERVER_HELLO,
+    //   if an AgentList was seen but no channel populated → almost certainly an envelope mismatch
+    //   (e.g. a brewed server emitting bare-type instead of CUSTOM-wrapped).  Warn loudly — silence here is the foot-gun.
+    setTimeout(() => {
+      if (wsState.open && wsState._agentListSeen && wsState.channels.size === 0) {
+        try { console.warn('[Constellation] AgentList frame received but channels not populated — likely envelope mismatch. Expected CUSTOM/AgentList/value.agents per server.eux envelope_convention; if the server brew emits bare top-level, the compat shim below should have caught it. See constellation/server.eux @intent.'); } catch {}
+      }
+    }, 5000);
+    return;
+  }
+  // ── Envelope compat shim (transition-period safety net) ──────────────────────────
+  // server.cjs / server.eux v2.2.x onward pin CUSTOM-wrapped (envelope_convention).
+  // A brewed server from v2.1.0 (when the .eux did NOT pin envelope shape) may legitimately
+  // emit AgentList / History / ChannelHistory at bare top-level. Accept both shapes so a
+  // brewed-runtime drift never silently empties the dashboard. Remove once the ecosystem is on v2.2.x+.
+  if (t === 'AgentList' || (t === 'CUSTOM' && m.name === 'AgentList')) {
+    wsState._agentListSeen = true;
+    const agents = (t === 'AgentList') ? (m.agents || []) : ((m.value && m.value.agents) || []);
+    for (const a of agents) { if (a.role === 'main' && a.agentId) { WS_LOCAL = a.agentId; break; } }
+    wsSyncAgents(agents); return;
+  }
+  if (t === 'History' || (t === 'CUSTOM' && m.name === 'History')) {
+    // CUSTOM-wrapped (canonical): value.events is the flat per-event list, each event carrying its own agentId.
+    // bare top-level legacy: m.channels[] grouped by key — flatten and inject channel.key as agentId for any event that lacks one
+    //   (older brewed JSONL stored TEXT_MESSAGE without explicit agentId, relying on filename grouping).
+    const v = (t === 'History') ? m : (m.value || {});
+    let events;
+    if (Array.isArray(v.events)) {
+      events = v.events;
+    } else if (Array.isArray(v.channels)) {
+      events = [];
+      for (const ch of v.channels) {
+        if (!Array.isArray(ch.events)) continue;
+        for (const ev of ch.events) {
+          if (ch.key && !ev.agentId) ev.agentId = ch.key;
+          events.push(ev);
+        }
+      }
+    } else { events = []; }
+    if (v.manifests && typeof v.manifests === 'object') { for (const k of Object.keys(v.manifests)) wsCmdManifests.set(k, v.manifests[k]); }   // v2.4.67 자동완성 매니페스트 동봉분
+    if (v.seatTelemetry && typeof v.seatTelemetry === 'object') { for (const k of Object.keys(v.seatTelemetry)) { const t = v.seatTelemetry[k]; if (t && typeof t === 'object') wsSeatIntake(t); } }   // v2.4.153 §13.35.8 좌석 계측 동봉분 — 발신기가 변경-트리거라, 한가한 좌석은 이 경로로만 보여요
+    if (v.opsStates && typeof v.opsStates === 'object') { for (const k of Object.keys(v.opsStates)) wsOpsStates.set(k, v.opsStates[k]); }   // v2.4.71 운용상태 동봉분
+    if (v.corporateChart !== undefined || v.roleStates !== undefined) orgPayloadSeen = true;   // §13.33 서버 persist 동봉 여부 (재생 이벤트가 최신본을 덮지 않게 하는 표식)
+    if (v.corporateChart && typeof v.corporateChart === 'object') { orgChart = v.corporateChart; }   // §13.33 조직 구조 동봉분 (단일 객체·latest-wins)
+    if (v.roleStates && typeof v.roleStates === 'object') { for (const k of Object.keys(v.roleStates)) roleStates.set(k, v.roleStates[k]); }   // §13.33 좌석 상태 동봉분 (role → state)
+    wsReplayHistory(events, v.cold, v.archived, v.roles);   // v2.4.161 roles — events 로 온 채널의 role 도 서버가 실어요 (메인 부재 시 role=undefined 였던 자리)
+    // v2.4.129 — 서버가 «활성 채널도 최근분만» 보냈으면 그 사실이 scope.truncated 에 실려 와요.
+    //   기억해 뒀다가 스트림 위쪽 「이전 대화 더 보기」로 보여줘요. 이 신호를 안 쓰면 잘림이 조용해지고,
+    //   사용자는 옛 대화가 **사라졌다** 고 읽어요 (v2.4.89 가 겪은 그 오진과 같은 부류예요).
+    for (const tr of (((v.scope || {}).truncated) || [])) {
+      if (tr && tr.key) wsMoreNote(tr.key, tr.oldestSentTs || 0, Math.max(0, (tr.total || 0) - (tr.sent || 0)));
+    }
+    try { renderOrg(); } catch {}   // 조직도 탭은 재생이 끝난 뒤 한 번만 그려요 (선언 부재 시 빈 상태 유지)
+    return;
+  }
+  if (t === 'ChannelHistory' || (t === 'CUSTOM' && m.name === 'ChannelHistory')) {
+    const v = (t === 'ChannelHistory') ? m : (m.value || {});
+    const channelKey = v.channelKey || v.channel;
+    // v2.4.129 — `prepend` 면 **이어받기**예요: 기존 줄을 지우지 않고 앞에 붙여요. 종전 경로(cold 복원)는
+    //   채널을 통째로 갈아끼우니 그대로 두고, 새 형태만 갈라요 — 한 함수가 두 뜻을 갖게 하면 다음 사람이
+    //   «왜 내 줄이 사라지지» 를 겪어요.
+    if (v.prepend) { wsPrependChannelHistory(channelKey, v.events, v); return; }
+    wsReplayChannelHistory(channelKey, v.events); return;
+  }
+  if (t === 'CUSTOM' && m.name === 'ServerNotice') {   // 브릿지/서버 재시작 등 시스템 공지 → 활성 채널 status 카드
+    const v = m.value || {}; const icon = ({ restarting: '🔄', offline: '🔌', online: '🟢' })[v.kind] || 'ℹ️';
+    const a = wsState.active;
+    // v2.4.99 §13.25.11 (Ultrasafe it-1 se-04, 렌더 절반) — 라벨이 발신자와 무관하게 «서버 공지» 로 하드코딩돼
+    //   있었어요. 그래서 아무 에이전트가 보낸 공지도 시스템 권위 announcement 로 읽혔어요 — 서버 측에서 source
+    //   위조를 막아도, 렌더가 «누가» 를 아예 안 보여주면 그 수정이 화면까지 오지 않아요. 서버가 실어주는 인증된
+    //   value.agentId 로 귀속을 표시하고, «서버 공지» 라벨은 source==='server' 에만 남겨요.
+    const _sysNotice = m.source === 'server' || !v.agentId;
+    const _noticeLabel = _sysNotice ? (icon + ' 서버 공지') : (icon + ' 공지 · ' + v.agentId + (v.senderRole ? ' (' + v.senderRole + ')' : ''));
+    if (a && !wsIsGroup(a)) wsPushRow(a, { kind: 'status', label: _noticeLabel, body: v.text || ((v.target || 'server') + ' ' + (v.kind || '')), dim: false, t: _t, ts: _ts });
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'CloseChannel') {   // 다른 클라/✕ 로 채널 닫힘 → 동기
+    const id = m.value && m.value.agentId;
+    if (id && wsState.channels.has(id)) { wsState.channels.delete(id); if (wsState.active === id) wsState.active = wsState.channels.keys().next().value || null; if (!wsState.replaying) { wsRenderTabs(); wsRenderActiveStream(); updateWsConn(); updateWsBadge(); } }
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'DeleteChannelHistory') {   // 다른 board 가 채널 영구삭제(🗑) → 동기 제거 (EstreUF parity)
+    const id = m.value && m.value.agentId;
+    if (id && wsState.channels.has(id)) { if (wsState.active === id) wsState.active = wsState.channels.keys().next().value || null; wsState.channels.delete(id); wsSaveHidden(); if (!wsState.replaying) { wsRenderTabs(); wsRenderArchived(); wsRenderActiveStream(); updateWsConn(); updateWsBadge(); } }
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'HistoryCleared') {   // 다른 board 가 전체삭제 → 닫은 세션 동기 제거 (EstreUF #406 UI3 parity)
+    for (const [id, c] of [...wsState.channels.entries()]) if (c.hidden && !wsIsMon(id)) { if (wsState.active === id) wsState.active = null; wsState.channels.delete(id); }
+    wsSaveHidden(); if (!wsState.replaying) { wsRenderTabs(); wsRenderArchived(); updateWsConn(); updateWsBadge(); }
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'UpstreamKeyIssued') {   // transitional alias (RegisterUpstreamKey 응답) — UI 는 setupWsKeyMgmt 의 setIssued 로 통합
+    if (wsKeyMgmt) wsKeyMgmt.setIssued(m.value || {});
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'KeyIssued') {   // v2.4.0 canonical KeyIssue 응답 → 키 관리 패널 issued
+    if (wsKeyMgmt) wsKeyMgmt.setIssued(m.value || {});
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'KeyListResult') {   // v2.4.0 KeyList 응답 → 모달 목록 갱신
+    if (wsKeyMgmt) wsKeyMgmt.setList(m.value || {});   // §13.25.19 목록 수준 필드(서버 능력·정책)까지 넘겨요
+    return;
+  }
+  if (t === 'CUSTOM' && (m.name === 'KeyRevoked' || m.name === 'KeyLabeled' || m.name === 'KeyRevokePending' || m.name === 'KeyRenewed')) {   // v2.4.0 키 상태 변경 → 모달 목록 새로고침 (v2.4.103 KeyRenewed 포함)
+    if (wsKeyMgmt) wsKeyMgmt.onMutated();
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'KeyPurged') {   // §13.25.19 KeyPurge 응답 → 결과(또는 error) 표시 + 목록 새로고침
+    if (wsKeyMgmt && wsKeyMgmt.onPurged) wsKeyMgmt.onPurged(m.value || {});
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'KeyError') {   // v2.4.0 KEY-MGMT 에러 → 패널 표시
+    if (wsKeyMgmt) wsKeyMgmt.setError(m.value || {});
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'AgentNameChanged') {   // v2.4.0 §3.5 라벨 변경 broadcast
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'EchoModeState') {   // v2.4.58 §13.26.4 — 에코 상태 공지 → 탭 배지 (멱등 재공지 수용, 스트림 카드 미생성)
+    const v = m.value || {};
+    if (v.agentId) { wsEchoState[v.agentId] = { level: v.level || 'off', provenance: v.provenance }; wsRenderTabs(); try { wsOpsStripSync(); } catch {} }   // v2.4.81 — 스트립 echo 항목 동기
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'WorkflowStatus') {   // v2.4.61 — workflow 종합 상태 스냅샷 → 플로팅 인스펙터 (스트림 카드 미생성)
+    wsWfIntake(m.value || {});
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'SubagentStatus') {   // v2.4.63 — 단독 서브에이전트 모니터 스냅샷 → 인스펙터 섹션 (스트림 카드 미생성)
+    wsWfSubsIntake(m.value || {});
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'SeatTelemetry') {   // v2.4.129 — 좌석 계측 스냅샷 → 지표 (스트림 카드 미생성)
+    // 계측을 대화 줄로 렌더하면 지표가 아니라 소음이 돼요. 위 둘과 같은 부류라 같은 처리를 해요 —
+    //   운영자 보고(2026-08-01): 「주기적으로 SeatTelemetry row 가 뜨고 알림도 온다」. 값은 늘 바뀌니
+    //   변경-트리거로 줄여도 대화창에 있는 한 계속 쌓여요. 자리를 옮기는 게 답이지 빈도가 아니에요.
+    wsSeatIntake(m.value || {});
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'AgentActivity') {   // Pantty §8 확장 — 실시간 활성 스트림 «지금 무엇을» (telemetry, 스트림 카드 미생성, 도구 호출에서 파생)
+    wsActIntake(m);
+    return;
+  }
+  if (t === 'CUSTOM' && (m.name === 'TerminalData' || m.name === 'TerminalExit')) {   // Pantty §9 relay 바이트 → 터미널 위젯 (세 번째 문 — 모델로 안 감, 스트림 카드 미생성)
+    const v = m.value || {};
+    if (wsTermState && v.sessionId === wsTermState.sessionId) {
+      try {
+        if (m.name === 'TerminalData') wsTermState.term.write(v.data || '');
+        else wsTermState.term.write('\r\n\x1b[90m[exited ' + (v.code != null ? v.code : '') + ']\x1b[0m\r\n');
+      } catch {}
+    }
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'PtyRejected') {   // v2.4.165 — 서버가 중계를 거절했어요(소유 아님 · 세션 중복 · 모양 불일치). 조용히 막히지 않게 위젯에 적어요.
+    const v = m.value || {};
+    if (wsTermState && (!v.sessionId || v.sessionId === wsTermState.sessionId)) {
+      try { wsTermState.term.write('\r\n\x1b[31m[relay refused: ' + String(v.code || '?') + ']\x1b[0m\r\n'); } catch {}
+    }
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'CommandManifest') {   // v2.4.67 — 슬래시 자동완성 매니페스트 (스트림 카드 미생성, live 갱신)
+    const v = m.value || {};
+    if (m.agentId && Array.isArray(v.commands)) wsCmdManifests.set(m.agentId, v);
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'OpsState') {   // v2.4.71 — 입력줄 상태 스트립 선언 (스트림 카드 미생성, live 갱신)
+    const v = m.value || {};
+    if (m.agentId && v && typeof v === 'object') { wsOpsStates.set(m.agentId, v); try { wsOpsStripSync(); } catch {} }
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'CorporateChart') {   // §13.33 — 조직 구조 선언 (스트림 카드 미생성, live 갱신). 발신 권한(main 한정) 판정은 서버 몫
+    if (wsState.replaying && orgPayloadSeen) return;   // 페이로드 정본 보호 — 기록 재생분으로 최신 차트를 되돌리지 않아요
+    const v = m.value || {};
+    if (v && typeof v === 'object' && Array.isArray(v.roles)) { orgChart = v; if (!wsState.replaying) { try { renderOrg(); } catch {} } }
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'RoleState') {   // §13.33 — 좌석별 생사 선언 (role 별 latest-wins, 스트림 카드 미생성)
+    if (wsState.replaying && orgPayloadSeen) return;
+    const v = m.value || {};
+    if (v && typeof v === 'object' && v.role != null && String(v.role) !== '') { roleStates.set(String(v.role), v); if (!wsState.replaying) { try { renderOrg(); } catch {} } }
+    return;
+  }
+  if (t === 'CUSTOM' && m.name === 'CollabKeyIssued') {   // v2.4.2 통합: RegisterCollabKey transitional alias 응답 → wsKeyMgmt 로 통합 (kind=collab 명시 fallback)
+    if (wsKeyMgmt) { const v = m.value || {}; if (!v.kind) v.kind = 'collab'; wsKeyMgmt.setIssued(v); }
+    return;
+  }
+  // #406 UI6 SelectionResolved — 다른 board 가 답/취소 → 이 board 의 해당 chip dim. agentId 없는 라우팅-무관 서버 직접 reply 로 와도 처리(EstreUF parity — agent-outbound 가드 앞에서 조기 처리)
+  if (t === 'CUSTOM' && m.name === 'SelectionResolved') { const v = m.value || {}; wsResolveSelection(v.promptId, v.resolution, v.reason); return; }
+  if (t === 'CUSTOM' && m.name === 'SelectionExpired') { const v = m.value || {}; wsExpireSelection(v.promptId, v.kind); return; }   // v2.4.74 — 서버 만료 통지(라우팅-무관 조기 처리)
+  // §13.30 roundtable — room 트래픽(서버 이벤트·인간 발화·에이전트 발화 공통)은 room:<id> 채널로 조기 처리 (agentId 가드 앞 — 서버 room 이벤트는 agentId 가 없음)
+  if (t === 'CUSTOM' && m.roomId) { wsRtIntake(m, _t, _ts); return; }
+  // board/사용자 입력(에코 또는 History 재생) → 해당 채널에 user row (대화기록 복원)
+  if ((m.source === 'user' || m.source === 'board') && t === 'CUSTOM' && m.targetAgentId) {
+    const ukey = wsChanKey(m);   // §4: 사용자 입력도 channelId 우선 scoped 키
+    wsChannel(ukey, undefined, { routeId: m.targetAgentId, channelId: m.channelId, threadId: m.threadId });   // routeId(라우팅 agentId) 보장
+    wsPushDebug(ukey, m);
+    const nm = m.name, v = m.value || {};
+    const label = nm === 'UserPrompt' ? '🙋 UserPrompt' : nm === 'Command' ? '⌘ Command' : nm === 'Cancel' ? '⏹ Stop' : '✦ ' + (nm || 'CUSTOM');
+    // raw JSON 은 timeline 에 노출하지 않음(§1) — 의미 필드만, 전체 원본은 debug drawer 에서
+    const body = nm === 'UserPrompt' ? (v.text || '') : nm === 'Command' ? (v.name || '') : nm === 'Cancel' ? '작업 중단 요청' : (typeof v === 'string' ? v : (v.text || v.message || v.summary || v.label || ''));
+    wsPushRow(ukey, { kind: 'user', label, body, dim: false, promptId: (v && v.promptId) || undefined, msgId: m.msgId || m.id, t: _t, ts: _ts, chan: wsChanLabel(m), chanFull: wsChanFull(m) });
+    return;
+  }
+  const agentId = m.agentId; if (!agentId) return;       // agent outbound 는 agentId 필수
+  // A2A: 에이전트가 다른 에이전트에게 보낸 메시지(targetAgentId=타 agent) → 모니터 채널로 분리.
+  // ── source-stamp 죽은 조건 회피(upstream Report 2 Finding 1): server.cjs 의 wsToBoards 는 frame 에 source role 을
+  //    stamp 하지 않으므로 기존 `m.source === 'agent'` 조건은 항상 false → A2A 영구 미분류였음.
+  //    agentId(발신) + targetAgentId(수신) 만으로 판정하고, malformed sender(=value.targetAgentId 중첩, Finding 2 케이스)도 tolerate.
+  const _a2aTgt = m.targetAgentId || (m.value && m.value.targetAgentId) || null;
+  const a2a = !!(_a2aTgt && _a2aTgt !== agentId);
+  const chId = a2a ? wsMonChannel(agentId, _a2aTgt) : wsChanKey(m);   // §13.5 모니터 2채널(role 기반) / §4 channelId scoped 키
+  const _src = a2a ? { from: agentId, to: _a2aTgt } : null;   // A2A 방향(src→dst, 각 이름 role 색) — 본문이 아닌 별도 뱃지
+  // §6 project metadata: 공통 필드 또는 AgentHandoffStart/ProjectMetadata value 에서 추출
+  const meta = a2a ? null : { routeId: agentId, channelId: m.channelId, threadId: m.threadId };
+  if (meta) {
+    if (m.projectName) meta.projectName = m.projectName;
+    if (m.githubRepo) meta.githubRepo = m.githubRepo;
+    const pm = m.projectMetadata || ((m.type === 'CUSTOM' && (m.name === 'AgentHandoffStart' || m.name === 'ProjectMetadata')) ? m.value : null);
+    if (pm) { if (pm.projectName) meta.projectName = pm.projectName; if (pm.githubRepo) meta.githubRepo = pm.githubRepo; }
+  }
+  const ch = wsChannel(chId, a2a ? wsMonName(chId) : undefined, meta);
+  if (a2a) ch.role = 'monitor';
+  ch.agentSeen = true;
+  wsPushDebug(chId, m);   // 모든 agent outbound 원본을 debug drawer 에 적재(timeline 과 별도)
+  if (typeof m.seq === 'number') ch.seq = m.seq;
+  if (m.runId) ch.runId = m.runId;
+  const _chan = a2a ? '' : wsChanLabel(m), _chanFull = a2a ? '' : wsChanFull(m);   // 출처 뱃지(에이전트 통합 채널 내 대화 구분). 모니터(a2a)는 _src 뱃지
+  // 발신 시각(_t/_ts)은 onWsEvent 최상단에서 wsMsgEpoch/wsRowTime 로 도출 (m.timestamp → m.at ISO → fallback). replay 후에도 원본 고정.
+  const push = (kind, label, body, dim, full) => wsPushRow(chId, { kind, label, body: body || '', dim, t: _t, ts: _ts, chan: _chan, chanFull: _chanFull, src: _src, msgId: m.msgId || m.id, wfRunId: m.wfRunId || undefined, full: (full && typeof full === 'object') ? full : null });   // wfRunId: v2.4.61 워크플로 미러 STEP → 인스펙터 링크
+  switch (t) {
+    case 'RUN_STARTED': push('run', '▶ RUN_STARTED', m.runId || '', true); break;
+    case 'RUN_FINISHED': push('ok', '✓ RUN_FINISHED', wsOutcome(m.outcome), true); break;
+    case 'RUN_ERROR': push('err', '⚠ RUN_ERROR', (m.code ? `[${m.code}] ` : '') + (m.message || ''), false); break;
+    case 'STEP_STARTED': push('step', '◆ STEP', m.stepName || '', true); break;
+    case 'STEP_FINISHED': push('step', '◇ STEP done', m.stepName || '', true); break;
+    case 'TEXT_MESSAGE_START': { const row = { kind: 'text', label: '💬 TEXT', body: '', dim: false, t: _t, ts: _ts, chan: _chan, chanFull: _chanFull, src: _src }; ch.msgBuf[m.messageId || '_'] = row; wsPushRow(chId, row); break; }
+    case 'TEXT_MESSAGE_CONTENT': {
+      const row = ch.msgBuf[m.messageId || '_'];
+      if (row) { row.body = (row.body || '') + (m.delta || ''); if (row._b) { if (row._md) row._b.innerHTML = wsMd(row.body); else row._b.textContent = row.body; const s = $('#ws-stream'); if (s) s.scrollTop = s.scrollHeight; } }
+      else push('text', '💬 TEXT', m.delta || '', false);
+      break;
+    }
+    case 'TEXT_MESSAGE_END': delete ch.msgBuf[m.messageId || '_']; break;
+    case 'TEXT_MESSAGE': {   // History 재생: 압축 완성형 메시지 1건. §13.16.12 Pattern 7 — text 직렬화 A2A Report 면 a2acard 로 승격
+      const rep = wsExtractA2aReport(m.text);
+      if (rep) {
+        const spec = WS_A2A_INTENT[rep.name]; const v = rep.value;
+        const sum = (rep.prefix && rep.prefix.length <= 200 ? rep.prefix : '') || wsA2aSummary(spec, v);
+        wsPushRow(chId, { kind: 'a2acard', a2a: { name: rep.name, spec, value: v, summary: sum }, _expanded: false, label: (spec.label || rep.name), full: v, src: _src, chan: _chan, chanFull: _chanFull, t: _t, ts: _ts });
+      } else push('text', '💬 TEXT', m.text || '', false);
+      break;
+    }
+    case 'TOOL_CALL_START': {
+      const id = m.toolCallId || ('_t' + (ch.seq || 0));
+      const row = { kind: 'toolcard', toolCallId: id, src: _src, chan: _chan, chanFull: _chanFull, t: _t, ts: _ts, _expanded: false,
+        tool: { toolCallId: id, name: m.toolCallName || '', title: '', subtitle: '', summary: '', compact: false, dkind: '', status: 'running', args: undefined, argsPreview: m.argsPreview || '', result: undefined, resultPreview: '' } };
+      wsToolMergeDisplay(row.tool, m.display);
+      if (!row.tool.title) row.tool.title = m.toolCallName || id;
+      ch.toolBuf[id] = row;
+      wsPushRow(chId, row);
+      break;
+    }
+    case 'TOOL_CALL_ARGS': {
+      const row = ch.toolBuf[m.toolCallId];
+      if (row) {
+        if (m.argsPreview != null) row.tool.argsPreview = m.argsPreview;
+        if (m.args != null) row.tool.args = m.args;
+        else if (m.delta != null) row.tool.args = (typeof row.tool.args === 'string' ? row.tool.args : '') + m.delta;
+        wsToolMergeDisplay(row.tool, m.display);
+        wsUpdateTool(row);
+      }
+      break;
+    }
+    case 'TOOL_CALL_END': {
+      const row = ch.toolBuf[m.toolCallId];
+      if (row) { wsToolMergeDisplay(row.tool, m.display); if (!m.display || m.display.status == null) { if ((row.tool.status || '').toLowerCase() === 'running') row.tool.status = 'done'; } wsUpdateTool(row); }
+      break;
+    }
+    case 'TOOL_CALL_RESULT': {
+      const row = ch.toolBuf[m.toolCallId];
+      if (row) {
+        if (m.resultPreview != null) row.tool.resultPreview = m.resultPreview;
+        else if (m.content != null || m.delta != null) row.tool.result = m.content ?? m.delta;
+        wsToolMergeDisplay(row.tool, m.display);
+        if ((!m.display || m.display.status == null) && (row.tool.status || '').toLowerCase() === 'running') row.tool.status = 'done';
+        wsUpdateTool(row);
+        delete ch.toolBuf[m.toolCallId];
+      } else push('tool', '🔧 result', wsTrunc(m.content ?? m.delta), true);   // START 못 본 경우 폴백
+      break;
+    }
+    case 'TOOL_CALL': {   // History 재생: 압축 완성형 tool 1건 → aggregate 카드
+      const id = m.toolCallId || ('_t' + (ch.seq || 0));
+      const row = { kind: 'toolcard', toolCallId: id, src: _src, chan: _chan, chanFull: _chanFull, t: _t, ts: _ts, _expanded: false,
+        tool: { toolCallId: id, name: m.toolCallName || '', title: '', subtitle: '', summary: '', compact: false, dkind: '', status: 'done', args: m.args, argsPreview: '', result: m.result, resultPreview: '' } };
+      wsToolMergeDisplay(row.tool, m.display);
+      if (!row.tool.title) row.tool.title = m.toolCallName || id;
+      wsPushRow(chId, row);
+      break;
+    }
+    case 'CUSTOM':
+      if (m.name === 'UserPromptAccepted') { const v = m.value || {}; if (!wsMarkAck(v.promptId, { at: _ts, agent: agentId })) push('ok', '✓ Accepted', v.promptId ? `queued · ${v.promptId}` : 'queued', true); }   // 원 요청 줄에 ✓ 스탬프(상관 실패 시만 별도 dim 줄)
+      else if (m.name === 'UserPrompt') wsPushRow(chId, { kind: 'user', label: '🙋 발화', body: (m.value && m.value.text) || '', dim: false, promptId: (m.value && m.value.promptId) || undefined, msgId: m.msgId || m.id, t: _t, ts: _ts, chan: _chan, chanFull: _chanFull, src: _src });   // A2A 발화 — 대화로 렌더 + promptId(ack 상관)
+      else if (m.name === 'Command') push('user', '⌘ Command', (m.value && m.value.name) || '', false);
+      else if (m.name === 'Cancel') push('user', '⏹ Stop', '작업 중단 요청', false);
+      // AgentHello·OnboardAck·Delegate·WorkerReport·WorkerAck 는 WS_A2A_INTENT 카드 분기로 통일 (전용 text/user/ok row 제거 — 카드 미표시 항목 카드화)
+      else if (m.name === 'Ack') { const v = m.value || {}; if (!wsMarkAck(v.ackFor, { at: _ts, agent: agentId })) push('ok', '✅ delivered', [v.kind, v.ackFor].filter(Boolean).join(' · ') || (v.re || v.summary || v.notice || ''), true, v); }   // §13.13 delivered ack → 원 메시지 줄에 ✓(상관 실패 시만 dim 줄)
+      else if (m.name === 'AckProcessed') { const v = m.value || {}; if (!wsMarkAck(v.ackFor, { at: _ts, agent: agentId })) push('ok', '✅ processed', [v.kind || 'processed', v.ackFor].filter(Boolean).join(' · ') || (v.re || v.summary || v.notice || ''), true, v); }   // §13.13 processed ack → 원 메시지 줄에 ✓(상관 실패 시만 dim 줄)
+      else if (m.name === 'AckCumulative') { const v = m.value || {}; push('ok', '✅ cumulative', 'upToSeq=' + (v.upToSeq != null ? v.upToSeq : '?'), true, v); }   // §13.13 telemetry 누적 ack — board 미표시
+      else if (m.name === 'Ping') { const v = m.value || {}; push('text', '🛰 ping', (v.re ? 're=' + v.re : '') + (v.ttl != null ? ' · ttl=' + v.ttl : '') + (v.notice ? ' · ' + v.notice : ''), true, v); }   // §13.13 liveness probe(RFC1122 보수적 multi-probe, 재전송 도구 아님) — board 미표시
+      else if (m.name === 'Pong') { const v = m.value || {}; push('text', '🛰 pong', (v.re ? 're=' + v.re : '') + (v.notice ? ' · ' + v.notice : ''), true, v); }   // §13.13 liveness 응답(application-layer, transport keepalive 아님) — board 미표시
+      else if (m.name === 'ConnectionRestored') {   // /restart 후 게이트웨이 재연결 공지(§5) — dedup 후 status 카드
+        const v = m.value || {};
+        const key = String(v.sessionId || v.session || v.at || m.timestamp || '');
+        if (!(key && ch._lastRestoreKey === key)) {   // 같은 복원 중복(broadcast·재수신) 무시
+          ch._lastRestoreKey = key;
+          ch.connStatus = 'restored';
+          const info = v.sessionId ? `세션 ${String(v.sessionId).slice(0, 8)} 재연결` : (v.reason || v.text || '게이트웨이 재연결');
+          push('status', '🔄 연결 복원됨', info, false);
+        }
+      }
+      else if (m.name === 'Attachment') { wsPushRow(chId, { kind: 'attach', src: _src, att: m.value || {}, t: _t, ts: _ts, chan: _chan, chanFull: _chanFull }); }   // §6 첨부 카드(image/audio/video/file)
+      else if (m.name === 'SelectionPrompt') {   // #406 UI6 — 에이전트 발 선택지 → 인라인 chip 카드(답/취소 시 board→server)
+        const v = m.value || {};
+        wsPushRow(chId, { kind: 'selection', sel: { promptId: v.promptId, text: v.text || '', options: Array.isArray(v.options) ? v.options : [], allowFreeText: !!v.allowFreeText, multiSelect: !!v.multiSelect, timeout: (v.timeout && v.timeout.kind) ? { kind: v.timeout.kind === 'approval' ? 'approval' : 'clarify', seconds: Number(v.timeout.seconds) || 0 } : null, expiresAt: Number(v.expiresAt) || 0, state: 'ISSUED', routeId: agentId }, t: _t, ts: _ts, chan: _chan, chanFull: _chanFull });   // v2.4.74 timeout 동반
+      }
+      // SelectionResolved 는 onWsEvent 상단에서 라우팅-무관 조기 처리 (agent-outbound 가드 앞) — 여기 중복 분기 제거
+      else if (WS_A2A_INTENT[m.name]) {   // §13.16.9 A2A-intent allowlist(Report·BlockerManifest·ReviewSLAAck·PR* / Deadlock* family) → 카드 form(아이콘+요약+펼침 details), NOT raw/TEXT fallback
+        // v2.4.155 — **반복 합류는 소음이에요.** 한 번은 정보(누가 들어왔나)지만, 다리가 재접속할
+        //   때마다 같은 카드가 쌓여요 — 실측 2026-08-09: 두 보드 이력에 486건(한 어댑터가 200건).
+        //   카드 자체를 없애면 «첫 합류» 도 안 보이니, **같은 이름은 10분에 한 번만** 카드로 만들어요.
+        //   현재 접속 여부는 명부·점이 이미 말해 주니 이 카드가 유일한 표면도 아니에요.
+        if (m.name === 'AgentHello') {
+          const _hk = String(m.agentId || m.threadId || '?');
+          const _ht = _t || Date.now();
+          if (_helloCardAt.has(_hk) && Math.abs(_ht - _helloCardAt.get(_hk)) < 600000) return;
+          _helloCardAt.set(_hk, _ht);
+        }
+        const spec = WS_A2A_INTENT[m.name]; const v = m.value || {};
+        wsPushRow(chId, { kind: 'a2acard', a2a: { name: m.name, spec, value: v, summary: wsA2aSummary(spec, v) }, _expanded: false, label: (spec.label || m.name || 'CUSTOM'), full: (v && typeof v === 'object') ? v : (v != null ? { value: v } : null), src: _src, chan: _chan, chanFull: _chanFull, msgId: m.msgId || m.id, t: _t, ts: _ts });
+      }
+      else {   // 미분류 CUSTOM 도 카드로 통일 (카드 미표시 항목 카드화). 객체값 → a2acard(generic spec, re > summary 우선 fallback), 비-객체 → text row.
+        const v = m.value;
+        if (v != null && typeof v === 'object') {
+          const spec = { icon: '✦', label: m.name || 'CUSTOM', sum: [] };   // v2.4.137 — 고유 순서 없음: 공용 꼬리 + 방언 수집이 담당
+          wsPushRow(chId, { kind: 'a2acard', a2a: { name: m.name, spec, value: v, summary: wsA2aSummary(spec, v) }, _expanded: false, label: (m.name || 'CUSTOM'), full: v, src: _src, chan: _chan, chanFull: _chanFull, msgId: m.msgId || m.id, t: _t, ts: _ts });
+        } else {
+          push('text', `✦ ${m.name || 'CUSTOM'}`, (v == null ? '' : String(v)), true, v);
+        }
+      }
+      break;
+    case 'STATE_SNAPSHOT': case 'STATE_DELTA': push('step', `≡ ${t}`, m.scope || '', true); break;
+    default: push('text', t || '?', '', true);
+  }
+  updateWsConn();
+}
+
+// ---- 탭 편집 모드 (드래그 순서 변경 + 초기화) ----
+const WS_TABORDER_KEY = 'constellation-ws-taborder';
+let wsTabEdit = false;
+let wsTabOrder = (() => { try { return JSON.parse(localStorage.getItem(WS_TABORDER_KEY) || '{}') || {}; } catch { return {}; } })();   // { groups:[key], tabs:{ [groupKey]:[id] } }
+let wsLastGroupKeys = [], wsLastTabKeys = {};   // 직전 렌더 순서 — reorder 기준
+function wsSaveTabOrder() { try { localStorage.setItem(WS_TABORDER_KEY, JSON.stringify(wsTabOrder)); } catch {} }
+function wsResetTabOrder() { wsTabOrder = {}; try { localStorage.removeItem(WS_TABORDER_KEY); } catch {} wsRenderTabs(); }
+// 저장 순서 우선 + 미저장 항목은 원순서 유지(decorate-sort-undecorate 안정정렬)
+function wsApplyOrder(items, saved, keyFn) {
+  if (!saved || !saved.length) return items;
+  const idx = new Map(saved.map((k, i) => [k, i]));
+  return items.map((it, i) => [it, i]).sort((a, b) => {
+    const ka = idx.has(keyFn(a[0])) ? idx.get(keyFn(a[0])) : 1e9 + a[1];
+    const kb = idx.has(keyFn(b[0])) ? idx.get(keyFn(b[0])) : 1e9 + b[1];
+    return ka - kb;
+  }).map((x) => x[0]);
+}
+function wsMakeDraggable(node, kind, id, groupKey) {   // kind='grp'(헤더) | 'tab' — MIME 분리로 그룹/탭 드래그 충돌 차단
+  node.draggable = true; node.classList.add('ws-draggable');
+  const vis = () => (kind === 'grp' ? (node.closest('.grp') || node) : node);   // 삽입 인디케이터 대상 (그룹=.grp, 탭=.ws-tab)
+  const clearAll = () => { const bar = $('#ws-tabs'); if (bar) bar.querySelectorAll('.ws-drop-before, .ws-drop-after').forEach((n) => { n.classList.remove('ws-drop-before', 'ws-drop-after'); delete n.dataset.dropSide; }); };
+  node.addEventListener('dragstart', (e) => { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/x-ws-' + kind, JSON.stringify({ id, groupKey })); node.classList.add('ws-dragging'); });
+  node.addEventListener('dragend', () => { node.classList.remove('ws-dragging'); clearAll(); });
+  node.addEventListener('dragover', (e) => {
+    if (![...e.dataTransfer.types].includes('text/x-ws-' + kind)) return;
+    e.preventDefault(); clearAll();   // flicker 방지 — 매 dragover 전체 클리어 후 현재 대상에만 삽입바 표시
+    const v = vis(); const r = v.getBoundingClientRect();
+    const after = e.clientX > r.left + r.width / 2;   // 커서가 대상 오른쪽 절반 = 뒤에 삽입
+    v.classList.add(after ? 'ws-drop-after' : 'ws-drop-before'); v.dataset.dropSide = after ? 'after' : 'before';
+  });
+  node.addEventListener('drop', (e) => {
+    const v = vis(); const side = v.dataset.dropSide || 'before'; clearAll();
+    if (![...e.dataTransfer.types].includes('text/x-ws-' + kind)) return;
+    e.preventDefault();
+    let src; try { src = JSON.parse(e.dataTransfer.getData('text/x-ws-' + kind)); } catch { return; }
+    if (kind === 'grp') wsReorderGroup(src.id, id, side);
+    else wsReorderTab(src.groupKey, src.id, id, side);   // 탭은 같은 그룹 내에서만 (다른 그룹 드롭 = no-op)
+  });
+}
+function wsReorderGroup(srcKey, dstKey, side) {
+  if (srcKey === dstKey) return;
+  const order = (wsTabOrder.groups && wsTabOrder.groups.length ? wsTabOrder.groups.slice() : wsLastGroupKeys.slice());
+  for (const k of wsLastGroupKeys) if (!order.includes(k)) order.push(k);   // 신규 그룹 보강
+  if (order.indexOf(srcKey) < 0 || order.indexOf(dstKey) < 0) return;
+  order.splice(order.indexOf(srcKey), 1);
+  let to = order.indexOf(dstKey); if (side === 'after') to += 1;   // 커서 위치 따라 앞/뒤
+  order.splice(to, 0, srcKey);
+  wsTabOrder.groups = order; wsSaveTabOrder(); wsRenderTabs();
+}
+function wsReorderTab(groupKey, srcId, dstId, side) {
+  if (srcId === dstId) return;
+  wsTabOrder.tabs = wsTabOrder.tabs || {};
+  const cur = (wsLastTabKeys[groupKey] || []).slice();
+  const base = (wsTabOrder.tabs[groupKey] && wsTabOrder.tabs[groupKey].length ? wsTabOrder.tabs[groupKey].slice() : cur);
+  for (const k of cur) if (!base.includes(k)) base.push(k);
+  if (base.indexOf(srcId) < 0 || base.indexOf(dstId) < 0) return;   // 다른 그룹 탭에 드롭 = 무시
+  base.splice(base.indexOf(srcId), 1);
+  let to = base.indexOf(dstId); if (side === 'after') to += 1;   // 커서 위치 따라 앞/뒤
+  base.splice(to, 0, srcId);
+  wsTabOrder.tabs[groupKey] = base; wsSaveTabOrder(); wsRenderTabs();
+}
+function wsToggleTabEdit() {
+  wsTabEdit = !wsTabEdit;
+  const tb = $('#ws-tabedit-btn'), rb = $('#ws-tabreset-btn');
+  if (tb) tb.classList.toggle('on', wsTabEdit);
+  if (rb) rb.hidden = !wsTabEdit;
+  wsRenderTabs();
+}
+
+// ---- 채널 탭 ----
+// §13.6 계층 탭 그룹 (업스트림/메인/보드워커/로컬/협업). 그룹 헤더=병합 토글, 탭=단독. 편집 모드 시 드래그 재정렬.
+// §13.6 그룹 계산 (업스트림/메인/보드워커/로컬/협업) — 탭바·모바일 페이저(#3a B)가 동일 집합·순서 사용. 빈 그룹 포함(호출측 필터).
+function wsComputeGroups() {
+  const byRole = (r) => [...wsState.channels.entries()].filter(([id, c]) => !wsIsMon(id) && !c.hidden && wsRoleOf(id) === r).map(([id]) => id);   // v2.4.161 실효 role — wsGroupMembers 와 같은 답 (role 없는 채널도 탭에 보여요)
+  const has = (id) => wsState.channels.has(id);
+  let groups = [
+    { key: 'group:up', cls: 'up', label: '업스트림', tabs: byRole('upstream').concat(has(WS_MON_UP) ? [WS_MON_UP] : []) },
+    { key: 'group:main', cls: 'main', label: '메인', tabs: byRole('main').concat(has(WS_MON_LOCAL) ? [WS_MON_LOCAL] : []).concat(has(WS_MON_COLLAB) ? [WS_MON_COLLAB] : []).concat(has(WS_MON_PEER) ? [WS_MON_PEER] : []) },
+    { key: 'group:board-worker', cls: 'board-worker', label: '보드워커', tabs: byRole('board-worker').concat(has(WS_MON_BOARD) ? [WS_MON_BOARD] : []) },
+    { key: 'group:local', cls: 'local', label: '로컬', tabs: byRole('local') },
+    { key: 'group:peer', cls: 'peer', label: '피어', tabs: byRole('peer').concat(has(WS_MON_PEER_PEER) ? [WS_MON_PEER_PEER] : []).concat(has(WS_MON_PEER_COLLAB) ? [WS_MON_PEER_COLLAB] : []) },   // v2.4.52 peer-main 그룹 (로컬↔협업 사이; §13.9.3)
+    { key: 'group:roundtable', cls: 'rt', label: '라운드테이블', tabs: byRole('roundtable') },   // §13.30 다자간 topic room (v2.4.55) — lazy: 방 이벤트가 있어야 탭 생성
+    { key: 'group:collab', cls: 'collab', label: '협업', tabs: byRole('collab') },
+  ];
+  groups = wsApplyOrder(groups, wsTabOrder.groups, (g) => g.key);   // 사용자 지정 그룹 순서
+  for (const g of groups) g.tabs = wsApplyOrder(g.tabs, (wsTabOrder.tabs || {})[g.key], (id) => id);   // 그룹 내 탭 순서
+  return groups;
+}
+function wsRenderTabs() {
+  const bar = $('#ws-tabs'); if (!bar) return;
+  bar.innerHTML = '';
+  bar.classList.toggle('tab-edit', wsTabEdit);
+  const groups = wsComputeGroups();
+  wsLastGroupKeys = groups.map((g) => g.key);
+  wsLastTabKeys = {};
+  for (const g of groups) {
+    if (!g.tabs.length) continue;   // 빈 그룹 숨김
+    wsLastTabKeys[g.key] = g.tabs.slice();
+    const grp = el('div', 'grp ' + g.cls + (wsState.active === g.key ? ' sel' : '')); grp.dataset.gkey = g.key;
+    const gh = el('div', 'ghead' + (wsState.active === g.key ? ' sel' : ''));
+    gh.innerHTML = `<span class="gmerge">▦</span>${esc(g.label)}<span class="gcnt">${g.tabs.length}</span>`;
+    if (wsTabEdit) { gh.title = g.label + ' 그룹 — 드래그하여 그룹 순서 변경'; wsMakeDraggable(gh, 'grp', g.key, g.key); }
+    else { gh.title = g.label + ' 그룹 — 클릭 시 그룹 전체 시간순 병합 보기'; gh.onclick = () => wsSetActive(g.key); }
+    grp.append(gh);
+    const tabs = el('div', 'tabs');
+    const grpSel = wsState.active === g.key;   // 그룹 탭 선택 시 멤버 이름에 그룹 색상 (EstreUF UI2 parity)
+    for (const id of g.tabs) {
+      const ch = wsState.channels.get(id);
+      const mon = wsIsMon(id);
+      const present = mon ? true : wsState.present.has(ch.routeId || id);
+      const tab = el('div', 'ws-tab ' + g.cls + (id === wsState.active ? ' active' : '') + (present ? ' on' : ''));
+      tab.title = (ch.routeId || id) + (present ? '' : ' · 연결 끊김');
+      const dot = el('span', 'tdot' + (present ? '' : ' off'));
+      const nm = el('span', 'nm' + (grpSel ? ' ' + g.cls : '')); nm.textContent = ch.name || id;   // 그룹 선택 시 이름에 그룹 색상
+      const bg = el('span', 'ubadge'); bg.textContent = ch.unseen > 99 ? '99+' : String(ch.unseen); bg.hidden = !ch.unseen || id === wsState.active;
+      tab.append(dot, nm);
+      const bk = wsBackends[id]; if (bk && bk.model && !mon) { const mb = el('span', 'mbadge ' + g.cls); mb.textContent = bk.model; mb.title = '선언 모델 · backends.json (C1)'; tab.append(mb); }   // C1 role/model badge
+      const ec = wsEchoState[ch.routeId || id]; if (ec && ec.level && ec.level !== 'off' && !mon) { const eb = el('span', 'ebadge' + (ec.level === 'mirror' ? ' mirror' : '')); eb.textContent = '📡'; eb.title = '에코 모드 ' + ec.level + (ec.provenance ? ' · ' + ec.provenance : '') + ' — 로컬 대화가 이 채널에 미러됨 (§13.26)'; tab.append(eb); }   // v2.4.58 echo badge
+      tab.append(bg);
+      if (!mon && !wsTabEdit) { const x = el('span', 'ws-tab-x', '✕'); x.title = '탭 닫기'; x.onclick = (e) => { e.stopPropagation(); wsCloseChannel(id); }; tab.append(x); }
+      if (wsTabEdit) wsMakeDraggable(tab, 'tab', id, g.key); else tab.onclick = () => wsSetActive(id);
+      tabs.append(tab);
+    }
+    grp.append(tabs);
+    bar.appendChild(grp);
+  }
+  wsRenderArchived();   // 닫은 세션 버튼·드롭다운 동기
+  wsRenderTargetSel();   // v2.4.52 타깃 셀렉터 — 채널/role 변동을 즉시 반영
+}
+const WS_ACTIVE_KEY = 'constellation-ws-active';   // 새로고침 시 마지막 선택 탭 복원용 (탭별 입력 draft 와 별개; §13.14 generic key)
+function wsSetActive(id) {
+  wsState.active = id;
+  wsTargetOverride = null;   // v2.4.52 탭/그룹 전환 = 타깃 오버라이드 리셋 → 자동 타깃이 즉시 셀렉터에 인디케이팅
+  try { localStorage.setItem(WS_ACTIVE_KEY, id || ''); } catch {}   // 영속 — wsReplayHistory 초기 active 결정부에서 복원
+  if (wsIsGroup(id)) { for (const cid of wsGroupMembers(id)) { const c = wsState.channels.get(cid); if (c) c.unseen = 0; wsMaybeRequestHistory(cid); } }
+  else { const ch = wsState.channels.get(id); if (ch) ch.unseen = 0; wsMaybeRequestHistory(id); }   // C: cold stub 이면 내용 on-demand 로드
+  wsRenderTabs(); wsRenderActiveStream(); updateWsConn(); updateWsBadge();
+  if (wsState.debugOpen) wsRenderDebug();
+  if (typeof id === 'string' && id.indexOf('room:') === 0) {   // §13.30.5 — 방 탭 진입 시 고정 문서 1회 자동 fetch (미보유 시)
+    try { const _rt = wsRtRooms.get(id.slice(5)); if (_rt && !_rt.closed && !_rt.artifacts) wsSendOrch({ type: 'CUSTOM', name: 'RequestRoomArtifacts', value: { roomId: id.slice(5) } }); } catch {}
+  }
+  wsShowTextarea(id);   // 채널별 입력란 스위칭(활성만 표시·포커스, 높이 통일)
+  if (wsPagerOn()) wsScrollToActive(true);   // #3a B: 탭 탭 → 페이저 내용영역 자동 수평 스크롤 + 탭바 동기
+}
+
+// ---- 모바일 그룹 페이저 (#3a B) — 실시간 내용영역을 그룹별 가로 scroll-snap 페이지로. swipe=그룹전환(탭선택·탭바스크롤 동기), 탭=페이저 자동 스크롤. 데스크탑 미사용(#ws-stream 그대로). ----
+const WS_MOBILE_MQ = matchMedia('(max-width: 560px)');
+let wsPagerKeys = [];        // 현재 페이저 그룹 key 순서 (집합 변경 감지)
+let wsPagerProg = false;     // 프로그램 스크롤 중 — settle 핸들러가 재선택 안 하게
+let wsPagerSettleT = null;
+function wsPagerOn() { try { return !!wsState.popOpen && WS_MOBILE_MQ.matches; } catch { return false; } }   // TDZ/부재 가드 (v2.4.32 교훈)
+function wsGroupKeyOf(id) {   // 채널/모니터 id → 소속 그룹 key (또는 group key 그대로)
+  if (wsIsGroup(id)) return id;
+  if (id === WS_MON_UP) return 'group:up';
+  if (id === WS_MON_LOCAL || id === WS_MON_COLLAB || id === WS_MON_PEER) return 'group:main';
+  if (id === WS_MON_BOARD) return 'group:board-worker';
+  if (id === WS_MON_PEER_PEER || id === WS_MON_PEER_COLLAB) return 'group:peer';
+  const role = wsRoleOf(id);   // v2.4.161 실효 role (wsGroupMembers/byRole 과 같은 함수) — 메인은 WS_LOCAL 이면 role 없이도 main
+  return role === 'upstream' ? 'group:up' : role === 'main' ? 'group:main' : role === 'board-worker' ? 'group:board-worker' : role === 'collab' ? 'group:collab' : role === 'peer' ? 'group:peer' : role === 'roundtable' ? 'group:roundtable' : 'group:local';
+}
+function wsPagerGroupKeys() { return wsComputeGroups().filter((g) => g.tabs.length).map((g) => g.key); }   // 비어있지 않은 그룹 = 탭바와 동일 집합
+function wsBuildPager() {
+  const pager = $('#ws-pager'); if (!pager) return;
+  const groups = wsComputeGroups().filter((g) => g.tabs.length);
+  wsPagerKeys = groups.map((g) => g.key);
+  pager.innerHTML = '';
+  for (const g of groups) {
+    const page = el('div', 'ws-page ' + g.cls); page.dataset.gkey = g.key;
+    const ind = el('div', 'ws-page-ind ' + g.cls); ind.innerHTML = `<span class="gmerge">▦</span>${esc(g.label)}<span class="gcnt">${g.tabs.length}</span>`;
+    const st = el('div', 'ws-stream ws-page-stream'); st.dataset.gkey = g.key;
+    page.append(ind, st);
+    pager.appendChild(page);
+    wsRenderStreamInto(st, g.key);   // eager 초기 렌더 (≤5 그룹 — drag 중 이웃 그룹 내용 보이도록)
+  }
+  if (!pager._wired) {   // settle 감지 (debounced scroll) — 1회만 등록
+    pager.addEventListener('scroll', () => { if (wsPagerSettleT) clearTimeout(wsPagerSettleT); wsPagerSettleT = setTimeout(wsPagerSettle, 120); }, { passive: true });
+    pager._wired = true;
+  }
+  wsMarkPagerSel(); wsRenderPageDots();
+}
+function wsPagerEnsureSet() {   // 그룹 집합 변경 시에만 재빌드. 반환: 재빌드 여부
+  const pager = $('#ws-pager'); if (!pager) return false;
+  const keys = wsPagerGroupKeys();
+  if (keys.join('|') !== wsPagerKeys.join('|') || pager.children.length !== keys.length) { wsBuildPager(); return true; }
+  return false;
+}
+function wsRenderActivePageFresh() {   // active 그룹 페이지만 state 로 재렌더 (라이브 catch-up)
+  const gkey = wsGroupKeyOf(wsState.active);
+  const sel = (window.CSS && CSS.escape) ? CSS.escape(gkey) : gkey;
+  const st = document.querySelector('#ws-pager .ws-page-stream[data-gkey="' + sel + '"]');
+  if (st) wsRenderStreamInto(st, gkey);
+}
+function wsSyncPager() {   // 페이저 빌드/갱신 — 스크롤은 안 함 (라이브 행이 페이저 위치 안 흔들도록)
+  if (!wsPagerEnsureSet()) wsRenderActivePageFresh();   // 재빌드면 전체 렌더됨, 아니면 active 만 갱신
+  wsMarkPagerSel(); wsRenderPageDots();
+}
+function wsMarkPagerSel() {
+  const pager = $('#ws-pager'); if (!pager) return;
+  const gk = wsGroupKeyOf(wsState.active);
+  pager.querySelectorAll('.ws-page').forEach((p) => p.classList.toggle('sel', p.dataset.gkey === gk));
+}
+function wsPagerSettle() {   // 사용자 swipe 종료 → 정착 그룹 활성화
+  const pager = $('#ws-pager'); if (!pager || !wsPagerOn()) return;
+  if (wsPagerProg) { wsPagerProg = false; return; }   // 프로그램 스크롤 = 이미 active 설정됨
+  const w = pager.clientWidth || 1; const idx = Math.round(pager.scrollLeft / w);
+  const gkey = wsPagerKeys[Math.max(0, Math.min(wsPagerKeys.length - 1, idx))];
+  if (gkey) wsActivateFromSwipe(gkey);
+}
+function wsActivateFromSwipe(gkey) {   // swipe=그룹단위 전환: 그룹 병합 active + 탭선택·탭바스크롤 동기 (페이저는 이미 그 위치라 스크롤 안 함)
+  if (wsGroupKeyOf(wsState.active) === gkey) { wsScrollTabToActive(); wsMarkPagerSel(); wsRenderPageDots(); return; }
+  wsState.active = gkey;
+  try { localStorage.setItem(WS_ACTIVE_KEY, gkey); } catch {}
+  for (const cid of wsGroupMembers(gkey)) { const c = wsState.channels.get(cid); if (c) c.unseen = 0; wsMaybeRequestHistory(cid); }
+  wsRenderTabs(); wsRenderChanFilter(); updateWsConn(); updateWsBadge(); wsShowTextarea(gkey);
+  if (wsState.debugOpen) wsRenderDebug();
+  wsRenderActivePageFresh(); wsMarkPagerSel(); wsScrollTabToActive(); wsRenderPageDots();
+}
+function wsScrollToActive(smooth) {   // 탭 탭/열기 → 페이저를 active 그룹 페이지로 + 탭바 동기
+  const pager = $('#ws-pager'); if (!pager) return;
+  const idx = wsPagerKeys.indexOf(wsGroupKeyOf(wsState.active));
+  if (idx >= 0) {
+    wsPagerProg = true;
+    pager.scrollTo({ left: idx * (pager.clientWidth || 0), behavior: smooth ? 'smooth' : 'auto' });
+    if (!smooth) setTimeout(() => { wsPagerProg = false; }, 60);   // instant 스크롤은 scroll 이벤트 안 날 수도 → 플래그 안전 해제
+  }
+  wsScrollTabToActive(); wsMarkPagerSel(); wsRenderPageDots();
+}
+function wsScrollTabToActive() {   // 탭바를 active 탭/그룹헤더가 보이게 가로 스크롤 (바만 — 조상 스크롤 영향 없음)
+  const bar = $('#ws-tabs'); if (!bar) return;
+  const gk = wsGroupKeyOf(wsState.active);
+  const sel = (window.CSS && CSS.escape) ? CSS.escape(gk) : gk;
+  const target = bar.querySelector('.ws-tab.active') || bar.querySelector('.grp[data-gkey="' + sel + '"]');
+  if (!target) return;
+  const r = target.getBoundingClientRect(), br = bar.getBoundingClientRect();
+  const delta = (r.left + r.width / 2) - (br.left + br.width / 2);
+  if (Math.abs(delta) > 4) { try { bar.scrollBy({ left: delta, behavior: 'smooth' }); } catch { bar.scrollLeft += delta; } }
+}
+function wsRenderPageDots() {   // 그룹 위치 인디케이터 (점 strip) — 현재 그룹 강조
+  const strip = $('#ws-page-dots'); if (!strip) return;
+  if (!wsPagerOn() || wsPagerKeys.length < 2) { strip.hidden = true; strip.innerHTML = ''; return; }
+  const gk = wsGroupKeyOf(wsState.active);
+  strip.hidden = false; strip.innerHTML = '';
+  wsPagerKeys.forEach((k) => { const d = el('span', 'ws-pd' + (k === gk ? ' on' : '')); strip.appendChild(d); });
+}
+
+// ---- 입력 송신 (활성 채널 targetAgentId) ----
+function wsCommon() { return { id: 'b-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), source: 'board', timestamp: Date.now() }; }
+// §13.13.2 회수 열쇠 — 운영자가 여기서 보내는 프롬프트도 targeted A2A 라, 열쇠가 없으면 상대가
+//   재시작하는 창에서 무증상으로 사라지고 화면엔 «보냈다» 만 남아요. 이 파일은 모듈 로더 없이
+//   <script> 로 실려서 relay-key.cjs 를 require 할 수 없어요 — 그래서 **여기만** 같은 규칙의
+//   사본을 둬요(자격 조건은 relay-key.cjs 가 정본: targeted + ack/ping 아님 + 열쇠 없음).
+function makeMsgId() { return 'b-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6); }
+const WS_ACK_KINDS = new Set(['Ack', 'AckProcessed', 'AckCumulative', 'Ping', 'Pong']);
+function wsStampRelayKey(m) { if (m && m.targetAgentId && !WS_ACK_KINDS.has(m.name) && !m.msgId) m.msgId = makeMsgId(); return m; }
+// v2.4.52 프롬프트 타깃 셀렉터 — 주입 행 우측 셀렉터가 유효 전달 대상을 상시 인디케이팅; 변경 시 현재 선택에 한해 오버라이드 (탭 전환 시 자동으로 리셋)
+let wsTargetOverride = null;
+function wsEffectiveTarget() {   // 유효 전달 대상 채널 키 — 오버라이드 > 활성 탭(그룹이면 대표 워커)
+  if (wsTargetOverride && wsState.channels.has(wsTargetOverride) && !wsIsMon(wsTargetOverride)) return wsTargetOverride;
+  let k = wsState.active;
+  if (!k || wsIsMon(k)) return null;
+  if (wsIsGroup(k)) k = wsGroupRep(k);
+  return k;
+}
+function wsRenderTargetSel() {
+  const sel = $('#ws-target-sel'), dot = $('#ws-target-dot'); if (!sel) return;
+  const eff = wsEffectiveTarget();
+  sel.innerHTML = '';
+  for (const g of wsComputeGroups()) {   // 그룹별 optgroup — "어떤 그룹의 어떤 에이전트인지" 한 눈에
+    const members = g.tabs.filter((id) => !wsIsMon(id));
+    if (!members.length) continue;
+    const og = document.createElement('optgroup'); og.label = g.label;
+    for (const id of members) {
+      const o = document.createElement('option'); o.value = id; o.textContent = wsName(id);
+      if (id === eff) o.selected = true;
+      og.appendChild(o);
+    }
+    sel.appendChild(og);
+  }
+  const monView = !!(wsState.active && wsIsMon(wsState.active));
+  sel.disabled = monView || !sel.options.length;
+  if (dot) {
+    const gk = eff ? wsGroupKeyOf(eff) : null;
+    dot.className = 'ws-target-dot' + (gk ? ' ' + gk.slice('group:'.length) : '') + (wsTargetOverride ? ' ovr' : '');
+    dot.title = monView ? '모니터 탭 = 읽기 전용 (전달 불가)' : wsTargetOverride ? '오버라이드 중 — 탭 전환 시 자동으로 돌아감' : '자동 (활성 탭/그룹 대표 기준)';
+  }
+  { const o = document.createElement('option'); o.value = '__rt_new'; o.textContent = '➕ 라운드테이블…'; sel.appendChild(o); if (sel.disabled && !monView) sel.disabled = false; }   // §13.30 방 생성 진입점 — 대상이 없어도 생성은 가능
+  sel.onchange = () => { if (sel.value === '__rt_new') { wsRenderTargetSel(); wsRtCreateDialog(); return; } wsTargetOverride = sel.value || null; wsRenderTargetSel(); };
+  try { wsOpsStripSync(); } catch {}   // v2.4.71 — 유효 타깃 변경 시 상태 스트립 동기
+}
+// ---- §13.30 roundtable — room 채널 인테이크 + 생성 다이얼로그 (v2.4.55 R3) ----
+const wsRtRooms = new Map();                          // roomId → { topic, mode, participants[], closed }
+let _wsRtJustCreated = 0;                             // 이 board 가 방금 생성 요청 → RoomCreated 수신 시 자동 활성화 창(ms epoch)
+function wsRtIntake(m, _t, _ts) {
+  const roomId = String(m.roomId), key = 'room:' + roomId;
+  const v = m.value || {};
+  if (m.name === 'RoomCreated') { wsRtRooms.set(roomId, { topic: v.topic || roomId, mode: v.mode, participants: v.participants || [], closed: false }); }
+  const rt = wsRtRooms.get(roomId);
+  const ch = wsChannel(key, '🪑 ' + ((rt && rt.topic) || roomId));
+  ch.role = 'roundtable'; ch.agentSeen = true;
+  wsPushDebug(key, m);
+  const who = m.speakerClass === 'human-operator' ? '👤' : (m.agentId ? wsName(m.agentId) : '서버');
+  let kind = 'note', label = '✦ ' + (m.name || 'CUSTOM'), body = typeof v === 'string' ? v : (v.text || v.message || v.summary || v.re || '');
+  if (m.name === 'RoomCreated') { label = '🪑 방 개설'; body = (v.topic || '') + ' · 참여 ' + (v.participants || []).join(', '); }
+  else if (m.name === 'RoomJoined') { label = '➕ 합류'; body = wsName(v.agentId); if (rt && rt.participants.indexOf(v.agentId) < 0) rt.participants.push(v.agentId); }
+  else if (m.name === 'RoomLeft') { label = '➖ 퇴장'; body = wsName(v.agentId); if (rt) rt.participants = rt.participants.filter((x) => x !== v.agentId); }
+  else if (m.name === 'RoomClosed') { label = '🚪 방 종결'; body = v.reason || ''; if (rt) rt.closed = true; }
+  else if (m.name === 'RoomStall') { kind = 'err'; label = '⏸ RoomStall'; body = (v.reason || '') + (v.hint ? ' — ' + v.hint : ''); }
+  else if (m.name === 'RoomGuard') { kind = 'err'; label = '🛡 RoomGuard'; body = (v.rule || '') + ' → ' + (v.action || '') + (v.agentId ? ' (' + wsName(v.agentId) + ')' : ''); }
+  else if (m.name === 'RoomYield') { label = '✋ soft-yield'; body = '사람 발화 — 에이전트는 현재 턴 완결 후 반영'; }
+  else if (m.name === 'RoomFloor') { label = '🎤 발언권 큐'; body = (v.queue || []).map((q) => wsName(q.agentId) + (q.bid ? '(' + q.bid + ')' : '')).join(' → ') || '(비어 있음)'; }
+  else if (m.name === 'RoomArtifacts') {   // §13.30.5 — fetch 회신(full) + 변경 브로드캐스트(delta) 공통 인테이크
+    if (rt) {
+      const a = rt.artifacts = rt.artifacts || { header: null, decisions: [], summary: null };
+      const src = v.artifacts || v.delta || {};
+      if (v.artifacts) { a.header = src.header || null; a.decisions = Array.isArray(src.decisions) ? src.decisions : []; a.summary = src.summary || null; }
+      else { if (src.header) a.header = src.header; if (src.decision) a.decisions.push(src.decision); if (src.summary) a.summary = src.summary; }
+      rt.artVersion = v.version || 0;
+    }
+    label = '📌 고정 문서'; body = 'v' + (v.version || 0) + (v.delta ? ' — ' + Object.keys(v.delta).join('·') + ' 갱신' : ' 수신');
+    if (!wsState.replaying) { try { wsRenderActiveStream(); } catch {} }   // pinned 블록 즉시 갱신
+  }
+  else { kind = m.speakerClass === 'human-operator' ? 'user' : 'agent'; label = (m.speakerClass === 'human-operator' ? '👤 ' : '') + (m.name === 'UserPrompt' ? '🙋 ' + who : who) + (m.autoHop ? ' · hop ' + m.autoHop : ''); }
+  wsPushRow(key, { kind, label, body, dim: kind === 'note', t: _t, ts: _ts, msgId: m.msgId || m.id, promptId: (v && v.promptId) || undefined });
+  if (m.name === 'RoomCreated' && !wsState.replaying && Date.now() - _wsRtJustCreated < 15000) { _wsRtJustCreated = 0; wsSetActive(key); }
+}
+function wsRtCreateDialog() {
+  const old = $('#ws-rt-dlg'); if (old) old.remove();
+  const cand = [...wsState.channels.entries()].filter(([id, c]) => !wsIsMon(id) && !wsIsGroup(id) && !c.hidden && c.role !== 'roundtable' && c.role !== 'monitor' && id.indexOf('room:') !== 0);
+  const wrap = el('div', 'ws-rt-dlg'); wrap.id = 'ws-rt-dlg';
+  const box = el('div', 'ws-rt-box');
+  box.innerHTML = '<div class="ws-rt-title">🪑 라운드테이블 만들기</div>';
+  const topic = document.createElement('input'); topic.type = 'text'; topic.placeholder = '주제 (필수)'; topic.className = 'ws-rt-topic'; box.append(topic);
+  const list = el('div', 'ws-rt-list');
+  for (const [id, c] of cand) {
+    const lb = el('label', 'ws-rt-cand'); const cb = document.createElement('input'); cb.type = 'checkbox'; cb.value = c.routeId || id;
+    cb.checked = wsState.present.has(c.routeId || id);
+    lb.append(cb, document.createTextNode(' ' + (c.name || id) + ' (' + (c.role || 'local') + ')'));
+    list.append(lb);
+  }
+  box.append(list);
+  const modeRow = el('div', 'ws-rt-mode');
+  modeRow.innerHTML = '<label><input type="radio" name="ws-rt-m" value="temporary" checked> 단기(temporary)</label> <label><input type="radio" name="ws-rt-m" value="persistent"> 고정(persistent)</label>';
+  box.append(modeRow);
+  const adv = el('details', 'ws-rt-adv'); adv.innerHTML = '<summary>고급 — 가드 예산 (피어 리뷰: 방마다 오버라이드 상용 예상)</summary>';
+  const bud = el('div', 'ws-rt-bud');
+  const mk = (k, lbl, defv) => { const l = el('label'); l.append(document.createTextNode(lbl + ' ')); const i = document.createElement('input'); i.type = 'number'; i.min = '1'; i.value = String(defv); i.dataset.k = k; l.append(i); return l; };
+  bud.append(mk('maxConsecutive', '연속 발화', 2), mk('ratePerMin', '분당 발신', 10), mk('maxAutoHop', '체인 깊이', 6), mk('stallRounds', '정체 라운드', 3));
+  adv.append(bud); box.append(adv);
+  const btns = el('div', 'ws-rt-btns');
+  const ok = el('button', 'ws-rt-ok'); ok.textContent = '방 만들기'; const cancel = el('button', 'ws-rt-cancel'); cancel.textContent = '취소';
+  btns.append(ok, cancel); box.append(btns); wrap.append(box); document.body.append(wrap);
+  cancel.onclick = () => wrap.remove();
+  wrap.onclick = (e) => { if (e.target === wrap) wrap.remove(); };
+  ok.onclick = () => {
+    const tp = topic.value.trim(); if (!tp) { topic.focus(); return; }
+    const parts = [...list.querySelectorAll('input:checked')].map((c) => c.value);
+    if (!parts.length) { list.classList.add('ws-rt-need'); return; }
+    const mode = (modeRow.querySelector('input:checked') || {}).value || 'temporary';
+    const budgets = {}; for (const i of bud.querySelectorAll('input')) { const n = Number(i.value); if (n >= 1) budgets[i.dataset.k] = n; }
+    if (wsSendOrch({ type: 'CUSTOM', name: 'RoomCreate', value: { topic: tp, mode, participants: parts, budgets } })) { _wsRtJustCreated = Date.now(); wrap.remove(); }
+  };
+  topic.focus();
+}
+function wsSend(obj) {
+  const ws = wsState.ws; if (!ws || ws.readyState !== 1 || !wsState.active) return false;
+  if (wsIsMon(wsState.active)) return false;   // 모니터 = 읽기 전용
+  const routeKey = wsEffectiveTarget();   // v2.4.52 셀렉터 오버라이드 우선 (기본 = 활성 탭/그룹 대표)
+  if (!routeKey) return false;
+  if (routeKey.indexOf('room:') === 0) {   // §13.30 room 발신 — targetAgentId 없이 roomId 로 (서버가 fan-out + human-operator 스탬프)
+    try { ws.send(JSON.stringify({ ...wsCommon(), roomId: routeKey.slice(5), ...obj })); return true; } catch { return false; }
+  }
+  const ch = wsState.channels.get(routeKey);
+  const route = (ch && ch.routeId) || routeKey;   // §4: 채널 키가 channelId 여도 라우팅은 routeId(agentId)
+  const extra = {};
+  if (ch && ch.channelId) extra.channelId = ch.channelId;   // 에코·history 가 같은 채널키로 복원되도록
+  if (ch && ch.threadId) extra.threadId = ch.threadId;
+  try { ws.send(JSON.stringify(wsStampRelayKey({ ...wsCommon(), targetAgentId: route, ...extra, ...obj }))); return true; } catch { return false; }
+}
+function wsLocalRow(kind, label, body, extra) {
+  const a = wsState.active; if (!a || wsIsMon(a)) return;
+  const pushKey = wsEffectiveTarget();   // v2.4.52 에코도 실제 전달 대상 채널에 — 셀렉터 오버라이드와 일치
+  if (!pushKey) return;
+  wsPushRow(pushKey, { kind, label, body, dim: false, t: nowHM(), ...(extra || {}) });   // extra: promptId 등(ack 상관 — live 로컬 에코가 replay History 처럼 promptId 보유)
+}
+function wsSendPrompt() {
+  wsCmdAcClose();   // v2.4.67 전송 시 후보 닫기
+  const ta = wsActiveTextarea(); if (!ta) return;
+  const text = ta.value.trim(); if (!text && !wsAtts.length) return;
+  const promptId = 'p-' + Date.now().toString(36);
+  const atts = wsAtts.map(a => ({ ...a }));
+  if (wsSend({ type: 'CUSTOM', name: 'UserPrompt', value: { promptId, text, atts } })) {
+    wsLocalRow('user', '🙋 UserPrompt', text + (atts.length ? `  📎${atts.length}` : ''), { promptId });
+    ta.value = ''; ta._h = WS_TA_MIN; wsRecalcTaH(); wsSaveDrafts(); wsAtts.length = 0; renderComposeAtts($('#ws-atts'), wsAtts, () => {}, null);
+  } else wsLocalRow('err', '⚠ 미전송', wsState.active ? 'WS 연결 안 됨' : '채널(에이전트) 없음');
+}
+function wsSendCommand(name) { if (wsSend({ type: 'CUSTOM', name: 'Command', value: { name } })) wsLocalRow('user', '⌘ Command', name); else wsLocalRow('err', '⚠ 미전송', `command ${name}`); }
+// stop 버튼 → 프로토콜상 표준 Cancel(cooperative). 표시만 Stop.
+function wsSendCancel() { if (wsSend({ type: 'CUSTOM', name: 'Cancel', value: { reason: '사용자 중단(stop)' } })) wsLocalRow('user', '⏹ Stop', '작업 중단 요청'); else wsLocalRow('err', '⚠ 미전송', 'stop'); }
+// 오케스트레이션 CUSTOM — 서버가 직접 처리(wsHandleOrch)하는 라우팅 무관 메시지. 활성 채널·그룹 상태에 비의존. #168 RegisterCollabKey 등.
+function wsSendOrch(obj) { const ws = wsState.ws; if (!ws || ws.readyState !== 1) return false; try { ws.send(JSON.stringify({ ...wsCommon(), ...obj })); return true; } catch { return false; } }
+
+// ---- #168 외부 협업 초대 (ws-collab-invite.eux 인라인 구현) — RegisterCollabKey 송신 / CollabKeyIssued 수신 → 키·접속 URL ----
+// @machine status: idle → issuing → issued (→ reset → idle). 컨트롤러는 onWsEvent 가 setIssued 로 깨운다.
+let wsInvite = null;
+let wsKeyMgmt = null;   // v2.4.0 — 업스트림 키 발급(UI4) + 키 관리 모달(UI5) 통합 컨트롤러 (RegisterUpstreamKey transitional alias + canonical KeyIssue 둘 다 수용)
+// setupWsCollab 제거됨 (v2.4.22 가지치기) — v2.4.2 에서 setupWsKeyMgmt 로 통합된 뒤 미호출 dead code 였음 (E2b 146-심볼 검증에서 확인).
+
+// ---- v2.4.0 #406 UI4/UI5 업스트림 키 관리 (WS-PROTOCOL-KEY-MGMT.md v0.2) ----
+// UI4: 🔑 발행 버튼 (협업 🔗 왼쪽) → KeyIssue → KeyIssued{key, joinUrl} 패널 (협업과 동일 패턴)
+// UI5: 키 관리 모달 — KeyList 테이블 (라벨 · 연결 상태 · 마지막 에이전트), 폐기 (즉시 / 세션 유지), 라벨 수정 (KeyLabel), 연장+기간 (KeyRenew ttlDays), 폐기 키 정리 (KeyPurge)
+// 호환: 발급 패널은 transitional alias RegisterUpstreamKey/UpstreamKeyIssued 와 canonical KeyIssue/KeyIssued 둘 다 setIssued() 수용
+
+// ---- §13.25.19 키 수명 단계 — 탭 필터·배지·기간 표시의 순수 함수 (DOM 없음) ----
+// 아래 표지 사이는 DOM·전역 상태를 건드리지 않아요 — 검사(pw-key-renew.cjs --unit)가 이 구간만 잘라 node 에서 돌려요.
+// 단계(phase)는 서버가 KeyList 행에 실어 주는 값이 권위예요. 옛 서버(phase 없음)와 붙어도 깨지지 않게 여기서
+// 같은 규칙(계약 §1)으로 추정해요 — 만료는 폐기가 아니고, 폐기는 revokedAt 이 있을 때만이에요.
+// @keylife-pure:begin
+const WS_KEY_DAY_MS = 86400000;
+const WS_KEY_TTL_CHOICES = [15, 30, 90];
+const WS_KEY_TTL_DEFAULT = { local: 90, peer: 30, collab: 30, upstream: 30 };
+const WS_KEY_GRACE_MS = 3 * WS_KEY_DAY_MS;   // 서버 KEY_GRACE_MS 기본값 — 옛 서버 추정에만 써요(새 서버는 graceUntil 을 실어요)
+// 서버 능력 — KeyListResult 의 **목록 수준** 필드(ttlChoices·ttlDefaults·graceRenew·ttlAny)가 있으면 수명 개편을 아는 서버예요.
+//   없으면(옛 서버) 대기 자동 연장·기간 선택·정리(KeyPurge)가 없고, 만료 키에 폐기·라벨을 보내면 거부돼요. 그래서 그 버튼과
+//   문구를 안 그려요 — 모르는 동사를 옛 서버에 보내면 거부가 아니라 main 에이전트에게 중계돼요(보드→에이전트 라우팅).
+//   목록을 아직 못 받았으면(known=false) 옛 서버와 똑같이 다뤄요: 확인 전에는 새 동작을 약속하지 않아요.
+function wsKeyServerCaps(v) {
+  const o = (v && typeof v === 'object' && !Array.isArray(v)) ? v : null;
+  const has = (f) => !!o && Object.prototype.hasOwnProperty.call(o, f) && o[f] != null;
+  const v2 = has('ttlChoices') || has('ttlDefaults') || has('graceRenew') || has('ttlAny');
+  const choices = (o && Array.isArray(o.ttlChoices) && o.ttlChoices.length && o.ttlChoices.every((d) => Number.isFinite(d) && d > 0)) ? o.ttlChoices.slice() : WS_KEY_TTL_CHOICES.slice();
+  const defaults = Object.assign({}, WS_KEY_TTL_DEFAULT);
+  if (o && o.ttlDefaults && typeof o.ttlDefaults === 'object') for (const kd of Object.keys(o.ttlDefaults)) { const d = Number(o.ttlDefaults[kd]); if (choices.indexOf(d) >= 0) defaults[kd] = d; }
+  return {
+    known: !!o, v2,
+    graceRenew: v2 ? (o.graceRenew === true) : false,   // 새 서버가 안 실었으면 «켜짐» 으로 짐작하지 않아요(대기 배지는 약속이라서)
+    graceRenewKnown: v2 && typeof o.graceRenew === 'boolean',
+    ttlAny: v2 && o.ttlAny === true,
+    ttlChoices: choices, ttlDefaults: defaults,
+    graceMs: (o && Number(o.graceMs) > 0) ? Number(o.graceMs) : WS_KEY_GRACE_MS,
+  };
+}
+const WS_KEY_CAPS_UNKNOWN = wsKeyServerCaps(null);
+function wsKeyCaps(c) { return c || WS_KEY_CAPS_UNKNOWN; }
+function wsKeyTtlChoices(k, caps) { if (caps && caps.v2) return caps.ttlChoices.slice(); return (k && Array.isArray(k.ttlChoices) && k.ttlChoices.length) ? k.ttlChoices.slice() : WS_KEY_TTL_CHOICES.slice(); }
+// 발급 기본값 — 서버 ttlDefaults 가 권위, 하드코딩은 폴백.
+function wsKeyDefaultDays(kind, caps) { const t = (caps && caps.ttlDefaults) || WS_KEY_TTL_DEFAULT; return t[kind] || t.upstream || WS_KEY_TTL_DEFAULT.upstream; }
+function wsKeyPhase(k, now, caps) {
+  if (!k) return 'deleted';
+  if (k.phase) return k.phase;
+  if (k.state === 'DELETED' || k.deletedAt) return 'deleted';
+  if (k.state === 'REVOKED_PENDING') return 'revoking';
+  if (k.revokedAt) return 'revoked';
+  const t = now == null ? Date.now() : now;
+  const lapsed = !!k.lapsed || (k.expiresAt > 0 && k.expiresAt <= t);
+  // 옛 서버에는 «대기» 가 없어요(보유자 재접속으로 저절로 연장되지 않아요) — 만료는 곧 운영자 연장이 필요한 상태예요.
+  if (lapsed && caps && caps.known && !caps.v2) return 'dormant';
+  // 옛 서버는 만료를 REVOKED 로 적었어요(revokedAt 없이) — 그건 폐기가 아니라 만료예요.
+  if (lapsed) return t < wsKeyGraceUntil(k) ? 'standby' : 'dormant';
+  // 그 흔적이 연장 뒤에도 남은 행(REVOKED · revokedAt 없음 · 기간 남음)은 옛 서버가 접속을 거절해요 — 사람 손이
+  //   필요한 쪽(휴면)으로 보여요. 새 서버는 적재 때 이 흔적을 되돌려서 이 갈래에 오지 않아요(계약 §2).
+  if (k.state === 'REVOKED') return 'dormant';
+  return 'active';
+}
+function wsKeyGraceUntil(k) {
+  if (!k) return 0;
+  if (k.graceUntil) return k.graceUntil;
+  if (!(k.expiresAt > 0)) return 0;
+  return Math.max(k.expiresAt, k.lastSeenAt || 0) + WS_KEY_GRACE_MS;
+}
+// 탭: 종류 탭과 «전체» 는 폐기 제외(active·standby·dormant·revoking) · sleep = 대기+휴면 · revoked = 폐기. deleted(정리된 묘비)는 어디에도 안 보여요.
+const WS_KEY_LIVE_PHASES = ['active', 'standby', 'dormant', 'revoking'];
+function wsKeyTabMatch(tab, k, now, caps) {
+  const ph = wsKeyPhase(k, now, caps);
+  if (tab === 'revoked') return ph === 'revoked';
+  if (tab === 'sleep') return ph === 'standby' || ph === 'dormant';
+  if (WS_KEY_LIVE_PHASES.indexOf(ph) < 0) return false;
+  if (tab === 'all') return true;
+  return (k.kind || 'upstream') === tab;
+}
+function wsKeyPhaseBadge(k, now, caps) {
+  const ph = wsKeyPhase(k, now, caps);
+  if (ph === 'active') return { cls: 'active', text: '활성', title: k && k.state === 'ISSUED' ? '발급됨 · 아직 접속 전' : '접속할 수 있어요' };
+  if (ph === 'standby') {
+    const g = wsKeyGraceUntil(k);
+    const until = g ? (' (~' + new Date(g).toLocaleString() + ')') : '';
+    // 대기 자동 연장은 서버 정책(graceRenew)이 켜져 있을 때만의 약속이에요 — 꺼져 있으면 운영자가 연장해야 해요.
+    if (!(caps && caps.v2 && caps.graceRenew)) return { cls: 'standby', text: '대기 · 운영자 연장 필요', title: '기간이 지났어요 — 대기 자동 연장 정책이 꺼져 있어서 «연장» 을 눌러야 다시 붙어요' + until, graceUntil: g };
+    return { cls: 'standby', text: '대기 · 자동 연장 가능', title: '기간이 지났지만 보유자가 다시 붙으면 서버가 저절로 연장해요' + until, graceUntil: g };
+  }
+  if (ph === 'dormant') {
+    if (caps && caps.known && !caps.v2) return { cls: 'dormant', text: '만료 · 운영자 연장', title: '기간이 지났어요 — 이 서버는 «연장» 을 눌러야 다시 붙어요' };
+    return { cls: 'dormant', text: '휴면 · 연장 필요', title: '대기 기간도 지났어요 — «연장» 을 누르면 같은 키로 다시 붙어요' };
+  }
+  if (ph === 'revoking') return { cls: 'revoking', text: '폐기 예정(세션 종료 시)', title: '지금 세션이 끝나면 폐기돼요' };
+  if (ph === 'revoked') return { cls: 'revoked', text: '폐기됨', title: '명시적으로 폐기된 키 — 되살릴 수 없어요' };
+  return { cls: 'deleted', text: '정리됨', title: '' };
+}
+// 기간 표시: 허용 집합이면 «30일», 아니면 «14일(이전 기준)», ttl 0 = 무기한. 서버 ttlDays 가 권위(허용 집합일 때만 실려요).
+function wsKeyTtlView(k, caps) {
+  if (!k) return { days: null, text: '', legacy: false };
+  const choices = wsKeyTtlChoices(k, caps);
+  if (k.ttlDays != null && choices.indexOf(k.ttlDays) >= 0) return { days: k.ttlDays, text: k.ttlDays + '일', legacy: false };
+  if (!(k.ttl > 0)) return { days: null, text: '무기한', legacy: false };
+  const d = Math.round(k.ttl / WS_KEY_DAY_MS * 10) / 10;
+  if (choices.indexOf(d) >= 0) return { days: d, text: d + '일', legacy: false };
+  return { days: null, text: (d < 0.1 ? '1일 미만' : d + '일') + '(이전 기준)', legacy: true };
+}
+// 연장 창의 기본 선택: 키의 기간이 허용 집합이면 그 값, 아니면 종류 기본값.
+function wsKeyRenewDefaultDays(k, caps) { const v = wsKeyTtlView(k, caps); return v.days != null ? v.days : wsKeyDefaultDays(k && k.kind, caps); }
+// 행 동작 — 서버가 실제로 받는 동작과 정확히 같아야 해요(거부될 버튼은 안 그려요).
+//   새 서버: 연장(+기간) = 기간 있는 active·standby·dormant · 폐기 = 그 셋 + 폐기 예정(재기동으로 고아가 된 행을 끝낼 수 있게,
+//     서버는 revoking 행의 즉시 폐기를 받아요) · 세션 유지 폐기 = 그 셋 중 연결된 것 · 라벨 = 그 셋 + 폐기 예정.
+//   옛 서버: 만료 키는 REVOKED 로 읽혀서 폐기(ALREADY_REVOKED)·라벨(key terminal)이 거부돼요 — 연장만 남기고(기간 선택 없이,
+//     옛 서버는 ttlDays 를 모르고 키의 지금 기간으로 연장해요), 폐기·라벨은 활성·폐기 예정 행에만 둬요.
+function wsKeyRowActions(k, now, caps) {
+  const ph = wsKeyPhase(k, now, caps);
+  const v2 = !!(caps && caps.v2);
+  const hasTtl = !!k && k.expiresAt > 0;
+  if (!v2) {
+    const expiredTrace = !!k && k.state === 'REVOKED' && !k.revokedAt;   // 옛 서버가 REVOKED 로 읽는 행 — 거기선 연장만 받아요
+    const usable = ph === 'active' && !expiredTrace;
+    return { renew: (ph === 'active' || ph === 'dormant' || ph === 'standby') && hasTtl, ttlSelect: false,
+      revoke: usable || ph === 'revoking', revokeAtSessionEnd: usable && k.connectionStatus === 'connected', relabel: usable || ph === 'revoking' };
+  }
+  const live = ph === 'active' || ph === 'standby' || ph === 'dormant';
+  return { renew: live && hasTtl, ttlSelect: live && hasTtl, revoke: live || ph === 'revoking', revokeAtSessionEnd: live && k.connectionStatus === 'connected', relabel: live || ph === 'revoking' };
+}
+// 정리(KeyPurge) 계획 — 새 서버일 때만, 그리고 **언제나 보이는 행의 keyRefs 배열로만** 보내요(«전부» 를 암묵적으로 보내지 않아요 —
+//   목록을 받은 뒤 새로 폐기된 키까지 쓸려 나가면 안 돼요). keyRef 가 없는 옛 행은 지목할 수 없으니 대상에서 빼고 개수를 알려요.
+function wsKeyPurgePlan(rows, caps) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (!(caps && caps.v2)) return { send: false, reason: 'unsupported', keyRefs: [], skipped: 0 };
+  const keyRefs = [], seen = {};
+  let skipped = 0;
+  for (const k of list) { const r = k && typeof k.keyRef === 'string' && k.keyRef ? k.keyRef : null; if (r) { if (!seen[r]) { seen[r] = 1; keyRefs.push(r); } } else skipped++; }
+  return { send: keyRefs.length > 0, reason: keyRefs.length ? null : 'no-refs', keyRefs, skipped, value: keyRefs.length ? { keyRefs } : null };
+}
+// 대기 자동 연장 정책 스위치의 저장 본문 — /api/access POST 는 expose·ui·agent·mcp 를 **본문 값으로 덮어써요**(keys 만 보존).
+//   그래서 keys 만 담아 보내면 노출·허용목록·키 요구가 기본값으로 되돌아가요. 지금 값(GET)을 그대로 싣고 keys.graceRenew 만 바꿔요.
+function wsKeyAccessPayload(access, graceRenew) {
+  const a = (access && typeof access === 'object') ? access : null;
+  if (!a) return null;   // 지금 값을 모르면 저장하지 않아요(모르는 채 덮어쓰면 다른 설정을 지워요)
+  const cp = (x) => (x && typeof x === 'object') ? JSON.parse(JSON.stringify(x)) : x;
+  return { expose: !!a.expose, ui: cp(a.ui) || { allowlist: null }, agent: cp(a.agent) || { allowlist: null, requireKey: false }, mcp: cp(a.mcp) || { allowlist: null }, keys: Object.assign({}, cp(a.keys) || {}, { graceRenew: !!graceRenew }) };
+}
+// @keylife-pure:end
+
+function setupWsKeyMgmt() {
+  const head = $('#ws-pop-head'); if (!head || $('#ws-key-wrap')) return;
+  const wrap = document.createElement('span'); wrap.id = 'ws-key-wrap'; wrap.className = 'ws-collab-wrap';
+  const btn = document.createElement('button'); btn.id = 'ws-key-btn'; btn.className = 'ws-arch-btn'; btn.type = 'button';
+  btn.title = '키 발행 + 관리 (업스트림 / 로컬워커 / 외부협업 통합)'; btn.textContent = '🔑';   // v2.4.2: 통합 버튼은 열쇠 이모지, 모달 안 업스트림 선택 항목은 ⬆ 화살표로 차별화
+  const panel = document.createElement('div'); panel.id = 'ws-key-panel'; panel.className = 'ws-collab-panel'; panel.hidden = true;
+  wrap.appendChild(btn); wrap.appendChild(panel);
+  const collabWrap = head.querySelector('#ws-collab-wrap');
+  if (collabWrap) head.insertBefore(wrap, collabWrap); else { const archWrap = head.querySelector('.ws-arch-wrap'); if (archWrap) head.insertBefore(wrap, archWrap); else head.appendChild(wrap); }
+
+  let status = 'idle', key = '', joinUrl = '', label = '', kind = 'local', roleDescription = '', joinHint = '', joinFile = '';   // v2.4.2: 기본값 local
+  let joinUrls = [], exposed = false, bindAddr = '';   // v2.4.85 §13.25.8 — 주소별 접속 URL 전수 + bind 실측(도달 가능성 표시용)
+  let caps = WS_KEY_CAPS_UNKNOWN;   // §13.25.19 서버 능력 — KeyListResult 목록 수준 필드로 정해요(받기 전엔 옛 서버와 같이 다뤄요)
+  let ttlDays = wsKeyDefaultDays(kind, caps);   // §13.25.19 유효기간 15/30/90 — 종류를 바꾸면 그 종류의 기본값으로 옮겨요(서버 ttlDefaults 우선)
+  let ttlPicked = false;   // 사람이 기간을 직접 골랐는가 — 안 골랐으면 서버 기본값이 도착할 때 그 값으로 옮겨요
+  function render() {
+    panel.textContent = '';
+    const h = document.createElement('div'); h.className = 'ws-invite-h'; h.textContent = '🔑 키 발행 (UI4)'; panel.appendChild(h);
+    if (status === 'idle' || status === 'error') {
+      // v2.4.2 kind 선택 순서: 업스트림 (⬆) / 로컬워커 (🏠) / 피어메인 (🤝) / 외부협업 (🔗) + 기본값 local + 선택 시 label input 포커스
+      const kindRow = document.createElement('div'); kindRow.className = 'ws-invite-kindrow';
+      const KIND_DEFS = [
+        { v: 'upstream', icon: '⬆', label: '업스트림' },
+        { v: 'local',    icon: '🏠', label: '로컬워커' },
+        { v: 'peer',     icon: '🤝', label: '피어메인' },   // v2.4.52 — 타 프로젝트 main 의 피어 합류 (§13.9.3; 자율 upstream 과 구분)
+        { v: 'collab',   icon: '🔗', label: '외부협업' },
+      ];
+      KIND_DEFS.forEach((kd) => {
+        const lab = document.createElement('label'); lab.className = 'ws-invite-kindopt' + (kind === kd.v ? ' active' : '');
+        const rd = document.createElement('input'); rd.type = 'radio'; rd.name = 'ws-key-kind'; rd.value = kd.v; rd.checked = kind === kd.v;
+        rd.onchange = () => { kind = kd.v; ttlPicked = false; ttlDays = wsKeyDefaultDays(kind, caps); render(); setTimeout(() => { const li = panel.querySelector('.ws-invite-label'); if (li) li.focus(); }, 0); };
+        const txt = document.createElement('span'); txt.className = 'ws-invite-kindopt-txt'; txt.textContent = kd.icon + ' ' + kd.label;
+        lab.append(rd, txt); kindRow.append(lab);
+      });
+      panel.appendChild(kindRow);
+      // §13.25.19 유효기간 선택 — 기간이 지나도 곧바로 폐기되지 않아요(대기 3일 → 휴면). 그래서 길게 잡아도 위험이 작아요.
+      //   서버가 수명 개편을 안다고 확인됐을 때만 그려요 — 옛 서버는 ttlDays 를 무시하고 자기 기본값으로 발급해서, 고른 기간이 조용히 버려져요.
+      if (caps.ttlAny) panel.appendChild(ttlAnyBand());
+      if (caps.v2) {
+      const ttlRow = document.createElement('div'); ttlRow.className = 'ws-invite-kindrow ws-invite-ttlrow';
+      const ttlLab = document.createElement('span'); ttlLab.className = 'ws-invite-ttllab'; ttlLab.textContent = '유효기간'; ttlRow.append(ttlLab);
+      if (caps.ttlChoices.indexOf(ttlDays) < 0) ttlDays = wsKeyDefaultDays(kind, caps);
+      caps.ttlChoices.forEach((d) => {
+        const lab = document.createElement('label'); lab.className = 'ws-invite-kindopt ws-invite-ttlopt' + (ttlDays === d ? ' active' : '');
+        const rd = document.createElement('input'); rd.type = 'radio'; rd.name = 'ws-key-ttl'; rd.value = String(d); rd.checked = ttlDays === d;
+        rd.onchange = () => { ttlDays = d; ttlPicked = true; panel.querySelectorAll('.ws-invite-ttlopt').forEach((x) => x.classList.toggle('active', x.querySelector('input').value === String(d))); };
+        const txt = document.createElement('span'); txt.className = 'ws-invite-kindopt-txt'; txt.textContent = d + '일' + (d === wsKeyDefaultDays(kind, caps) ? ' (기본)' : '');
+        lab.append(rd, txt); ttlRow.append(lab);
+      });
+      panel.appendChild(ttlRow);
+      }
+      const inp = document.createElement('input'); inp.className = 'ws-invite-label';
+      inp.placeholder = kind === 'local' ? '워커 라벨 (alphanumeric, 예: worker-1)' : '키 라벨 (예: phone-claude)';
+      inp.value = label;
+      panel.appendChild(inp);
+      const rdInp = document.createElement('textarea'); rdInp.className = 'ws-invite-roledesc'; rdInp.placeholder = '역할 설명 — 합류할 에이전트에게 전달 (선택)'; rdInp.rows = 2; rdInp.value = roleDescription;
+      panel.appendChild(rdInp);
+      const b = document.createElement('button'); b.className = 'ws-invite-btn'; b.type = 'button'; b.textContent = '키 발급';
+      b.onclick = () => { label = inp.value.trim(); roleDescription = rdInp.value.trim(); issue(); };
+      inp.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); label = inp.value.trim(); roleDescription = rdInp.value.trim(); issue(); } });
+      panel.appendChild(b);
+      if (status === 'error') { const e = document.createElement('div'); e.className = 'ws-invite-meta'; e.style.color = '#e0455e'; e.textContent = '⚠ ' + (key || '발급 실패'); panel.appendChild(e); }
+      const mg = document.createElement('button'); mg.className = 'ws-invite-new'; mg.type = 'button'; mg.textContent = '🔐 키 관리'; mg.onclick = () => { panel.hidden = true; openManager(); };
+      panel.appendChild(mg);
+    } else if (status === 'issuing') {
+      const b = document.createElement('button'); b.className = 'ws-invite-btn'; b.type = 'button'; b.textContent = '발급 중…'; b.disabled = true;
+      panel.appendChild(b);
+    } else {   // issued
+      const kindIcon = kind === 'collab' ? '🔗' : kind === 'local' ? '🏠' : '🔑';
+      const meta = document.createElement('div'); meta.className = 'ws-invite-meta'; meta.textContent = kindIcon + ' ' + (label || kind) + (kind === 'local' ? '' : ' · ' + key.slice(0, 14) + '…');
+      panel.appendChild(meta);
+      if (roleDescription) { const rdEl = document.createElement('div'); rdEl.className = 'ws-invite-roledesc-show'; rdEl.textContent = '🎭 ' + roleDescription; panel.appendChild(rdEl); }
+      if (kind === 'local') {
+        const hintEl = document.createElement('div'); hintEl.className = 'ws-invite-url'; hintEl.textContent = joinHint || ('LOCAL_KEY_FILE=' + joinFile + ' WS_AGENT_ID=' + label + ' node scripts/join-local.cjs'); panel.appendChild(hintEl);
+        const note = document.createElement('div'); note.className = 'ws-invite-meta'; note.style.fontSize = '.7rem'; note.style.color = 'var(--muted)'; note.textContent = '키는 ' + joinFile + ' 파일에 저장됨 (외부 wire 미전달).'; panel.appendChild(note);
+        const row = document.createElement('div'); row.className = 'ws-invite-row';
+        const cpHint = document.createElement('button'); cpHint.className = 'ws-invite-copy'; cpHint.type = 'button'; cpHint.textContent = '명령 복사'; cpHint.onclick = () => copy(cpHint, joinHint);
+        const nw = document.createElement('button'); nw.className = 'ws-invite-new'; nw.type = 'button'; nw.textContent = '새 키'; nw.onclick = () => { status = 'idle'; key = ''; joinUrl = ''; joinHint = ''; joinFile = ''; roleDescription = ''; render(); };
+        const mg = document.createElement('button'); mg.className = 'ws-invite-new'; mg.type = 'button'; mg.textContent = '🔐 관리'; mg.onclick = () => { panel.hidden = true; openManager(); };
+        row.appendChild(cpHint); row.appendChild(nw); row.appendChild(mg);
+        panel.appendChild(row);
+      } else {
+        // v2.4.85 §13.25.8 — 주소별 접속 URL 전수 렌더 (다중 NIC/IP). 서버가 joinUrls 를 안 싣는 구버전이면 단일 joinUrl 로 폴백.
+        const urls = (Array.isArray(joinUrls) && joinUrls.length) ? joinUrls
+          : (joinUrl ? [{ host: '', scope: 'loopback', url: joinUrl, reachable: true }] : []);
+        const scopeIcon = (s) => s === 'public' ? '☁' : s === 'loopback' ? '🖥' : '🌐';
+        const scopeText = (u) => u.scope === 'public' ? '공개 호스트' : u.scope === 'loopback' ? '로컬 (이 PC)' : ((u.iface || 'LAN') + (u.scope === 'lan6' ? ' · IPv6' : ''));
+        if (!urls.length) { const only = document.createElement('div'); only.className = 'ws-invite-url'; only.textContent = key; panel.appendChild(only); }
+        urls.forEach((u) => {
+          const box = document.createElement('div'); box.className = 'ws-invite-urlbox' + (u.reachable === false ? ' unreach' : '');
+          const hd = document.createElement('div'); hd.className = 'ws-invite-urlhead';
+          const tag = document.createElement('span'); tag.className = 'ws-invite-urltag'; tag.textContent = scopeIcon(u.scope) + ' ' + scopeText(u);
+          if (u.reachable === false) tag.title = '서버가 loopback 에만 bind 돼 있어 이 주소로는 아직 도달할 수 없어요 — 설정 ▸ 접속 제어에서 노출을 켜고 재시작하면 열려요.';
+          const cp = document.createElement('button'); cp.className = 'ws-invite-copy'; cp.type = 'button'; cp.textContent = '복사'; cp.onclick = () => copy(cp, u.url);
+          hd.appendChild(tag); hd.appendChild(cp);
+          const urlEl = document.createElement('div'); urlEl.className = 'ws-invite-url'; urlEl.textContent = u.url;
+          box.appendChild(hd); box.appendChild(urlEl); panel.appendChild(box);
+        });
+        if (!exposed && urls.some((u) => u.reachable === false)) {
+          const note = document.createElement('div'); note.className = 'ws-invite-meta'; note.style.fontSize = '.68rem';
+          note.textContent = 'ℹ 회색 주소는 노출이 꺼져 있어(bind ' + (bindAddr || '127.0.0.1') + ') 지금은 도달 불가 — 설정 ▸ 접속 제어에서 켠 뒤 재시작하면 활성화돼요.';
+          panel.appendChild(note);
+        }
+        const row = document.createElement('div'); row.className = 'ws-invite-row';
+        const cpKey = document.createElement('button'); cpKey.className = 'ws-invite-copy'; cpKey.type = 'button'; cpKey.textContent = '키만 복사'; cpKey.onclick = () => copy(cpKey, key);
+        const nw = document.createElement('button'); nw.className = 'ws-invite-new'; nw.type = 'button'; nw.textContent = '새 키'; nw.onclick = () => { status = 'idle'; key = ''; joinUrl = ''; joinUrls = []; roleDescription = ''; render(); };
+        const mg = document.createElement('button'); mg.className = 'ws-invite-new'; mg.type = 'button'; mg.textContent = '🔐 관리'; mg.onclick = () => { panel.hidden = true; openManager(); };
+        row.appendChild(cpKey); row.appendChild(nw); row.appendChild(mg);
+        panel.appendChild(row);
+      }
+    }
+  }
+  function issue() {   // v2.4.0 canonical KeyIssue + v2.4.1 kind + roleDescription
+    // §13.25.19 ttlDays 는 새 서버로 확인됐을 때만 실어요(옛 서버는 무시하고 자기 기본값으로 발급해요 — 그래서 선택 자체를 안 그려요).
+    const value = { label: label || undefined, kind, roleDescription: roleDescription || undefined, ttlDays: caps.v2 ? ttlDays : undefined };
+    if (wsSendOrch({ type: 'CUSTOM', name: 'KeyIssue', value })) { status = 'issuing'; render(); }
+    else { status = 'error'; key = 'WS 연결 안 됨 — 잠시 후 다시'; render(); }
+  }
+  function copy(b, text) {
+    const done = () => { const o = b.textContent; b.textContent = '복사됨 ✓'; setTimeout(() => { b.textContent = o; }, 1500); };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done).catch(() => { b.textContent = '복사 실패'; });
+    else b.textContent = '복사 실패';
+  }
+  // 발급 패널을 열 때 서버 능력을 아직 모르면 목록을 한 번 물어요 — 응답(setList)이 오면 패널을 다시 그려요.
+  btn.onclick = (e) => { e.stopPropagation(); panel.hidden = !panel.hidden; if (!panel.hidden) { render(); if (!caps.known) requestList(); } };
+  panel.addEventListener('click', (e) => e.stopPropagation());   // 패널 내부 클릭은 아래 «바깥 클릭 닫기» 로 버블 안 시켜요 — render() 가 클릭한 버튼(예: 「새 키」)을 제거하면 e.target 이 detached 돼 closest() 가 null → «바깥» 으로 오판해 패널이 닫히던 버그(경계에서 한 번 막아 내부 위젯 추가에도 견고).
+  document.addEventListener('click', (e) => { if (!panel.hidden && !e.target.closest('#ws-key-wrap')) panel.hidden = true; });
+
+  // ---- UI5 키 관리 모달 ----
+  let modal = null, modalKeys = [], activeTab = 'all';   // v2.4.2 탭 필터
+  let purgeTimer = null;
+  const TAB_DEFS = [
+    { v: 'all',      label: '전체' },
+    { v: 'upstream', label: '⬆ 업스트림' },
+    { v: 'local',    label: '🏠 로컬워커' },
+    { v: 'peer',     label: '🤝 피어메인' },
+    { v: 'collab',   label: '🔗 외부협업' },
+    { v: 'sleep',    label: '💤 대기/휴면' },
+    { v: 'revoked',  label: '🗑 폐기' },
+  ];
+  function showNote(text, isErr) {   // 모달 안 한 줄 알림 — 정리 결과·오류(발급 패널과 따로 보여요)
+    const n = $('#ws-key-note'); if (!n) return;
+    n.hidden = !text; n.textContent = text || ''; n.classList.toggle('err', !!isErr);
+  }
+  function buildModal() {
+    if (modal) return modal;
+    modal = document.createElement('div'); modal.id = 'ws-key-modal'; modal.className = 'ws-key-modal'; modal.hidden = true;
+    const box = document.createElement('div'); box.className = 'ws-key-box';
+    const head2 = document.createElement('div'); head2.className = 'ws-key-mhead';
+    const title = document.createElement('b'); title.textContent = '🔐 키 관리';
+    const refresh = document.createElement('button'); refresh.className = 'ws-key-refresh'; refresh.type = 'button'; refresh.textContent = '↻'; refresh.title = '새로고침'; refresh.onclick = () => requestList();
+    const x = document.createElement('button'); x.className = 'ws-key-mx'; x.type = 'button'; x.textContent = '✕'; x.onclick = () => closeManager();
+    head2.append(title, refresh, x);
+    // v2.4.2 종류 탭 + §13.25.19 상태 탭 — 종류 탭·«전체» 는 폐기 제외, 💤 = 대기+휴면, 🗑 = 폐기. 좁은 화면에선 줄바꿈(style.css).
+    const tabs = document.createElement('div'); tabs.id = 'ws-key-tabs'; tabs.className = 'ws-key-tabs';
+    TAB_DEFS.forEach((td) => {
+      const tb = document.createElement('button'); tb.className = 'ws-key-tab' + (activeTab === td.v ? ' active' : ''); tb.type = 'button'; tb.dataset.tab = td.v;
+      const tl = document.createElement('span'); tl.className = 'ws-key-tablab'; tl.textContent = td.label;
+      const tc = document.createElement('span'); tc.className = 'ws-key-tabcnt';
+      tb.append(tl, tc);
+      tb.onclick = () => { activeTab = td.v; modal.querySelectorAll('.ws-key-tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === activeTab)); renderTable(); };
+      tabs.appendChild(tb);
+    });
+    const note = document.createElement('div'); note.id = 'ws-key-note'; note.className = 'ws-key-note'; note.hidden = true;
+    // §13.25.19 정책 줄 — 시험용 기간 우회 경고 띠 + «대기 자동 연장» 현재 값·스위치. 새 서버로 확인됐을 때만 채워요.
+    const pol = document.createElement('div'); pol.id = 'ws-key-policy'; pol.className = 'ws-key-policy'; pol.hidden = true;
+    const tbl = document.createElement('div'); tbl.id = 'ws-key-tbl'; tbl.className = 'ws-key-tbl';
+    box.append(head2, pol, tabs, note, tbl); modal.append(box);
+    modal.addEventListener('click', (e) => { if (e.target === modal) closeManager(); });
+    document.body.appendChild(modal);
+    return modal;
+  }
+  const CONN_DOT = { connected: ['on', '연결됨'], disconnected: ['off', '끊김'], never: ['never', '미사용'] };
+  // v2.4.103 §13.25.12 — 남은 기간 배지. 서버가 실어주는 expiresAt 을 **그대로** 써요. `issuedAt + ttl` 로 다시
+  //   계산하면 연장된 키에서 틀린 값이 나와요(갱신은 issuedAt 을 건드리지 않고 renewedAt 을 씁니다) — 파생
+  //   계산이 원본과 조용히 갈라지는 부류라, 권위값을 실어 보내고 여기선 읽기만 해요.
+  // §13.25.19 — 폐기·폐기 예정·정리된 키는 기간이 무의미해서 배지를 안 그려요(만료된 대기·휴면 키는 그려요).
+  function expiryBadge(k) {
+    if (!k.expiresAt) return null;                             // ttl=0 = 만료 없음
+    const ph = wsKeyPhase(k, undefined, caps);
+    if (ph !== 'active' && ph !== 'standby' && ph !== 'dormant') return null;
+    const rem = k.expiresAt - Date.now();
+    const days = Math.round(Math.abs(rem) / 86400000 * 10) / 10;
+    const el = document.createElement('span');
+    el.className = 'ws-key-exp' + (rem < 0 ? ' lapsed' : (rem <= 259200000 ? ' soon' : ''));
+    el.textContent = rem < 0 ? ('⛔ ' + days + '일 지남') : ((rem <= 259200000 ? '⚠ ' : '⏳ ') + days + '일 남음');
+    el.title = '만료 ' + new Date(k.expiresAt).toLocaleString() + (k.renewCount ? (' · 연장 ' + k.renewCount + '회') : '');
+    return el;
+  }
+  function renderTabCounts() {
+    if (!modal) return;
+    modal.querySelectorAll('.ws-key-tab').forEach((b) => {
+      const n = modalKeys.filter((k) => wsKeyTabMatch(b.dataset.tab, k, undefined, caps)).length;
+      const c = b.querySelector('.ws-key-tabcnt'); if (c) c.textContent = n ? String(n) : '';
+    });
+  }
+  // 시험용 기간 우회(WS_KEY_TTL_ANY)가 켜진 서버 — 운영 보드에서 켜져 있으면 무기한·임의 기간 발급이 열려 있어요.
+  function ttlAnyBand() {
+    const b = document.createElement('div'); b.className = 'ws-key-warnband';
+    b.textContent = '⚠ 시험용 기간 우회가 켜져 있어요(WS_KEY_TTL_ANY) — 허용 기간 밖의 발급이 열려 있어요. 운영 보드라면 빼고 재기동하세요.';
+    return b;
+  }
+  let policyBusy = false, policyMsg = '', policyErr = false;
+  function renderPolicy() {
+    const pol = $('#ws-key-policy'); if (!pol) return;
+    pol.textContent = '';
+    if (!caps.v2) { pol.hidden = true; return; }   // 옛 서버: 이 정책이 없어요
+    pol.hidden = false;
+    if (caps.ttlAny) pol.append(ttlAnyBand());
+    const row = document.createElement('div'); row.className = 'ws-key-polrow';
+    const lab = document.createElement('span'); lab.className = 'ws-key-pollab';
+    const on = caps.graceRenew;
+    lab.textContent = '대기 자동 연장: ' + (caps.graceRenewKnown ? (on ? '켜짐' : '꺼짐') : '알 수 없음');
+    lab.title = '켜져 있으면 기간이 지난 뒤 대기(3일) 안에 보유자가 갱신 요청 표지와 함께 다시 붙을 때 서버가 저절로 연장해요. 꺼져 있으면 운영자가 «연장» 을 눌러야 해요.';
+    const sw = document.createElement('button'); sw.type = 'button'; sw.className = 'ws-key-act ws-key-polsw' + (on ? ' on' : '');
+    sw.setAttribute('role', 'switch'); sw.setAttribute('aria-checked', on ? 'true' : 'false');
+    sw.textContent = policyBusy ? '저장 중…' : (on ? '끄기' : '켜기'); sw.disabled = policyBusy || !caps.graceRenewKnown;
+    sw.onclick = () => setGraceRenew(!on);
+    row.append(lab, sw);
+    if (policyMsg) { const m = document.createElement('span'); m.className = 'ws-key-polmsg' + (policyErr ? ' err' : ''); m.textContent = policyMsg; row.append(m); }
+    pol.append(row);
+  }
+  // /api/access 의 기존 저장 경로를 써요(adminGate: 로컬 + 운영자 세션 · 같은 출처). 그 POST 는 expose·ui·agent·mcp 를 본문 값으로
+  //   덮어써서, 지금 값을 먼저 읽고(GET) keys.graceRenew 만 바꿔 되돌려 보내요 — keys 만 보내면 노출·허용목록이 기본값으로 돌아가요.
+  async function setGraceRenew(next) {
+    if (policyBusy) return;
+    if (next && !(await wsConfirm('대기 자동 연장을 켤까요? 기간이 지난 키도 대기(3일) 안에 보유자가 다시 붙으면 운영자 확인 없이 연장돼요.', { title: '대기 자동 연장', okLabel: '켜기' }))) return;
+    policyBusy = true; policyMsg = ''; policyErr = false; renderPolicy();
+    let msg = '', err = false;
+    try {
+      const g = await fetch('/api/access', { cache: 'no-store' });
+      const gd = await g.json().catch(() => null);
+      const body = wsKeyAccessPayload(gd && gd.ok ? gd.access : null, next);
+      if (!body) { msg = '✗ 지금 설정을 읽지 못해 저장하지 않았어요'; err = true; }
+      else {
+        const r = await fetch('/api/access', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const d = await r.json().catch(() => ({}));
+        if (r.status === 200 && d && d.ok) msg = '✓ 저장됐어요';
+        else { err = true; msg = r.status === 403 ? '✗ 이 컴퓨터(로컬)에서만 바꿀 수 있어요' : r.status === 401 ? '✗ 운영자 로그인이 필요해요' : ('✗ 저장 실패: ' + ((d && d.error) || r.status)); }
+      }
+    } catch { msg = '✗ 저장 실패 (네트워크)'; err = true; }
+    policyBusy = false; policyMsg = msg; policyErr = err; renderPolicy();
+    if (!err) requestList();   // 서버가 실어 주는 값으로 다시 그려요(화면이 먼저 바꾸지 않아요)
+  }
+  function renderTable() {
+    const tbl = $('#ws-key-tbl'); if (!tbl) return;
+    tbl.innerHTML = '';
+    renderPolicy();
+    renderTabCounts();
+    const filtered = modalKeys.filter((k) => wsKeyTabMatch(activeTab, k, undefined, caps));
+    // 🗑 폐기 탭 — 정리(KeyPurge) 버튼. 정리된 행은 서버에 묘비로 남고(키 문자열 제거) 목록에서 빠져요.
+    //   새 서버로 확인됐고 지목할 keyRef 가 하나라도 있을 때만 그려요. keyRef 없는 옛 행은 대상에서 빠지고 한 줄로 알려요.
+    const plan = activeTab === 'revoked' ? wsKeyPurgePlan(filtered, caps) : null;
+    if (plan && plan.send) {
+      const bar = document.createElement('div'); bar.className = 'ws-key-toolbar';
+      const pb = document.createElement('button'); pb.className = 'ws-key-act danger ws-key-purge'; pb.type = 'button'; pb.textContent = '🧹 폐기 키 정리하기';
+      pb.title = '폐기된 키 ' + plan.keyRefs.length + '개를 목록에서 치워요 — 키 문자열은 지워지고 기록만 남아요';
+      pb.onclick = () => purge(filtered);
+      bar.append(pb); tbl.append(bar);
+    }
+    if (plan && plan.skipped && caps.v2) {
+      const sk = document.createElement('div'); sk.className = 'ws-key-skipnote';
+      sk.textContent = 'ℹ 지목 번호(keyRef)가 없는 옛 행 ' + plan.skipped + '개는 정리 대상에서 빠져요 — 서버가 다음에 키 저장소를 쓸 때 번호가 붙어요.';
+      tbl.append(sk);
+    }
+    if (!filtered.length) {
+      const msg = activeTab === 'all' ? (modalKeys.length ? '쓰고 있는 키가 없어요 — 폐기된 키는 🗑 폐기 탭에 있어요.' : '발행된 키가 없어요. 🔑 발행 버튼으로 키를 만들어 보세요.')
+        : activeTab === 'sleep' ? '대기·휴면 중인 키가 없어요.'
+        : activeTab === 'revoked' ? '폐기된 키가 없어요.'
+        : '이 탭에 해당하는 키가 없어요.';
+      const e = document.createElement('div'); e.className = 'ws-key-empty'; e.textContent = msg; tbl.append(e); return;
+    }
+    const now = Date.now();
+    for (const k of filtered) {
+      const ph = wsKeyPhase(k, now, caps);
+      const rowEl = document.createElement('div'); rowEl.className = 'ws-key-row state-' + (k.state || '').toLowerCase() + ' phase-' + ph; rowEl.dataset.phase = ph;
+      const top = document.createElement('div'); top.className = 'ws-key-rtop';
+      const [dotCls, connTxt] = CONN_DOT[k.connectionStatus] || CONN_DOT.never;
+      const dot = document.createElement('span'); dot.className = 'ws-key-dot ' + dotCls; dot.title = connTxt;
+      // v2.4.2 이모지 통일 — 발행 창 선택 항목과 동일 (⬆ 업스트림 / 🏠 로컬워커 / 🤝 피어메인 / 🔗 외부협업)
+      const kindIcon = document.createElement('span'); kindIcon.className = 'ws-key-kind'; kindIcon.textContent = k.kind === 'collab' ? '🔗' : k.kind === 'local' ? '🏠' : k.kind === 'peer' ? '🤝' : '⬆'; kindIcon.title = k.kind === 'collab' ? '외부협업 키' : k.kind === 'local' ? '로컬워커 키 (파일 경로 등록)' : k.kind === 'peer' ? '피어메인 키 (§13.9.3 peer-main)' : '업스트림 키';
+      const lab = document.createElement('span'); lab.className = 'ws-key-label'; lab.textContent = k.label || '(무라벨)';
+      const bd = wsKeyPhaseBadge(k, now, caps);
+      const st = document.createElement('span'); st.className = 'ws-key-state ' + bd.cls; st.textContent = bd.text; st.title = bd.title;
+      if (ph === 'standby' && bd.graceUntil) st.textContent = bd.text + ' · ~' + new Date(bd.graceUntil).toLocaleDateString();
+      top.append(dot, kindIcon, lab, st);
+      if (ph !== 'revoked' && ph !== 'deleted') {
+        const tv = wsKeyTtlView(k, caps);
+        if (tv.text) { const te = document.createElement('span'); te.className = 'ws-key-ttl' + (tv.legacy ? ' legacy' : ''); te.textContent = '📅 ' + tv.text; te.title = tv.legacy ? '허용 기간(15/30/90일) 밖의 이전 기준이에요 — 다음 연장 때 고른 기간으로 바뀌어요' : '유효기간'; top.append(te); }
+      }
+      const expEl = expiryBadge(k); if (expEl) top.append(expEl);
+      const sub = document.createElement('div'); sub.className = 'ws-key-sub';
+      const ag = k.lastAgent ? ('에이전트: ' + k.lastAgent) : '미접속';
+      const seen = k.lastSeenAt ? (' · ' + new Date(k.lastSeenAt).toLocaleString()) : '';
+      // 폐기된 키의 문자열은 보여 주지 않아요 — 쓸모는 없고 새어 나갈 표면만 남아요.
+      const keyDisp = (ph === 'revoked' || ph === 'deleted') ? '(폐기된 키 — 문자열 숨김)'
+        : k.key ? (k.key.slice(0, 14) + '…') : (k.kind === 'local' ? 'local-keys/' + k.label + '.key (파일)' : '(no key)');
+      sub.textContent = keyDisp + ' · ' + connTxt + ' · ' + ag + seen;
+      if (k.roleDescription) { const rd = document.createElement('div'); rd.className = 'ws-key-roledesc'; rd.textContent = '🎭 ' + k.roleDescription; rowEl.append(top, sub, rd); }
+      else { rowEl.append(top, sub); }
+      const acts = document.createElement('div'); acts.className = 'ws-key-acts';
+      // 버튼 구성은 서버가 실제로 받는 동작과 정확히 같아야 해요 — 눌렀는데 거부되는 버튼은 없는 버튼보다 나빠요.
+      //   규칙은 wsKeyRowActions 한 곳(서버 능력별) — 새 서버: 연장(+기간)·폐기·라벨 = active·standby·dormant, 폐기·라벨은 폐기 예정에도.
+      const A = wsKeyRowActions(k, now, caps);
+      if (A.renew) {
+        const grp = document.createElement('span'); grp.className = 'ws-key-renewgrp';
+        let sel = null;
+        if (A.ttlSelect) {   // 옛 서버는 ttlDays 를 몰라서 기간 선택을 안 그려요(키의 지금 기간으로 연장돼요)
+          sel = document.createElement('select'); sel.className = 'ws-key-ttlsel'; sel.title = '연장할 기간 — 지금부터 새로 시작해요';
+          const def = wsKeyRenewDefaultDays(k, caps);
+          wsKeyTtlChoices(k, caps).forEach((d) => { const o = document.createElement('option'); o.value = String(d); o.textContent = d + '일'; if (d === def) o.selected = true; sel.append(o); });
+          grp.append(sel);
+        }
+        const rw = document.createElement('button'); rw.className = 'ws-key-act' + (ph === 'dormant' ? ' primary' : ''); rw.type = 'button'; rw.textContent = '🔄 연장'; rw.title = sel ? '유효기간을 지금부터 고른 기간으로 다시 시작해요 (열쇠 문자열은 그대로 — 상대에게 다시 전달할 필요 없어요)' : '유효기간을 지금부터 같은 기간으로 다시 시작해요 (열쇠 문자열은 그대로)'; rw.onclick = () => renew(k, sel ? Number(sel.value) : null);
+        grp.append(rw); acts.append(grp);
+      }
+      if (A.relabel) { const ren = document.createElement('button'); ren.className = 'ws-key-act'; ren.type = 'button'; ren.textContent = '✏️ 라벨'; ren.onclick = () => relabel(k); acts.append(ren); }
+      if (A.revoke) { const rvImm = document.createElement('button'); rvImm.className = 'ws-key-act danger'; rvImm.type = 'button'; rvImm.textContent = '🗑 즉시 폐기'; rvImm.title = '폐기하면 되살릴 수 없어요 — 연결된 에이전트도 바로 끊겨요'; rvImm.onclick = () => revoke(k, 'immediate'); acts.append(rvImm); }
+      if (A.revokeAtSessionEnd) { const rvEnd = document.createElement('button'); rvEnd.className = 'ws-key-act'; rvEnd.type = 'button'; rvEnd.textContent = '⏳ 세션 유지 폐기'; rvEnd.title = '현재 세션은 유지, 세션이 끝나면 폐기'; rvEnd.onclick = () => revoke(k, 'sessionEnd'); acts.append(rvEnd); }
+      if (!acts.childNodes.length) { const t = document.createElement('span'); t.className = 'ws-key-term'; t.textContent = bd.text; acts.append(t); }
+      rowEl.append(acts); tbl.append(rowEl);
+    }
+  }
+  function keyName(k) { return k.label || (k.key ? k.key.slice(0, 12) : (k.keyRef || '무라벨')); }
+  // v2.4.103 §13.25.12 — 연장. keyRef 로 지목해요: local 종 키는 목록 응답에 열쇠 문자열이 안 실려서(§3.6)
+  //   key 로는 애초에 가리킬 수 없었어요 — 그게 유효기간이 35일 지난 워커 키에 손이 닿지 않던 이유예요.
+  // §13.25.19 — 기간을 골라 연장해요(«기간 변경» 도 같은 동작). 와이어는 ttlDays.
+  async function renew(k, days) {
+    const ph = wsKeyPhase(k, undefined, caps);
+    const ago = Math.round(Math.abs(k.expiresAt - Date.now()) / 86400000 * 10) / 10;
+    const legacy = !caps.v2;
+    // 대기 문구(«저절로 연장») 는 새 서버 + 정책 켜짐일 때만 — 그 밖에는 사실이 아니에요.
+    const head = (ph === 'dormant' && legacy) ? ("'" + keyName(k) + "' 열쇠는 기간이 " + ago + "일 지났어요. ")
+      : ph === 'dormant' ? ("'" + keyName(k) + "' 열쇠는 휴면 중이에요(기간이 " + ago + "일 지났어요). ")
+      : (ph === 'standby' && caps.v2 && caps.graceRenew) ? ("'" + keyName(k) + "' 열쇠는 대기 중이에요 — 보유자가 다시 붙으면 저절로 연장되지만 지금 연장해도 돼요. ")
+      : ph === 'standby' ? ("'" + keyName(k) + "' 열쇠는 기간이 지났어요(대기 자동 연장은 꺼져 있어요). ")
+      : ("'" + keyName(k) + "' 열쇠의 ");
+    const msg = head + (days ? ('유효기간을 지금부터 ' + days + '일로 연장할까요?') : '유효기간을 지금부터 같은 기간으로 연장할까요?') + ' 열쇠 문자열은 그대로라 상대에게 다시 전달하지 않아도 돼요.';
+    if (!(await wsConfirm(msg, { title: '유효기간 연장', okLabel: '연장' }))) return;
+    const value = { keyRef: k.keyRef, key: k.key };
+    if (days && caps.v2) value.ttlDays = days;
+    wsSendOrch({ type: 'CUSTOM', name: 'KeyRenew', value });
+  }
+  async function relabel(k) {
+    const nv = await wsPrompt('새 라벨 (1~64자):', k.label || '', { title: '키 라벨 변경' }); if (nv == null) return;
+    const v = nv.trim(); if (!v || v === k.label) return;
+    wsSendOrch({ type: 'CUSTOM', name: 'KeyLabel', value: { keyRef: k.keyRef, key: k.key, newLabel: v } });
+  }
+  async function revoke(k, mode) {
+    const msg = mode === 'immediate' ? `'${keyName(k)}' 키를 지금 폐기할까요? 연결된 에이전트가 바로 끊기고, 폐기한 키는 되살릴 수 없어요.` : `'${keyName(k)}' 키를 세션 유지 폐기할까요? 현재 세션은 끝까지 유지되고, 세션이 끝나면 폐기돼요. 폐기한 키는 되살릴 수 없어요.`;
+    if (!(await wsConfirm(msg, { title: '키 폐기 확인', danger: true, okLabel: '폐기' }))) return;
+    wsSendOrch({ type: 'CUSTOM', name: 'KeyRevoke', value: { keyRef: k.keyRef, key: k.key, mode } });
+  }
+  // §13.25.19 KeyPurge — 폐기 탭에 보이는 키만, **언제나 keyRefs 배열로** 지목해요(보이는 것 = 정리되는 것). «전부» 는 보내지 않아요.
+  //   서버 능력(새 서버)이 확인되지 않았으면 보내지 않아요 — 옛 서버는 이 동사를 몰라서 main 에이전트에게 중계해요.
+  async function purge(rows) {
+    const plan = wsKeyPurgePlan(rows, caps);
+    if (!plan.send) { showNote(plan.reason === 'unsupported' ? '⚠ 이 서버는 폐기 키 정리를 지원하지 않아요' : '⚠ 정리할 수 있는(지목 번호가 있는) 키가 없어요', true); return; }
+    const msg = '폐기된 키 ' + plan.keyRefs.length + '개를 정리할까요? 목록에서 사라지고 키 문자열이 지워져요(기록만 남아요). 되돌릴 수 없어요.' + (plan.skipped ? (' (지목 번호가 없는 옛 행 ' + plan.skipped + '개는 빠져요)') : '');
+    if (!(await wsConfirm(msg, { title: '폐기 키 정리', danger: true, okLabel: '정리' }))) return;
+    if (!(caps && caps.v2)) { showNote('⚠ 이 서버는 폐기 키 정리를 지원하지 않아요', true); return; }   // 확인 창 사이에 서버가 바뀌었을 수 있어요
+    if (!wsSendOrch({ type: 'CUSTOM', name: 'KeyPurge', value: plan.value })) { showNote('⚠ WS 연결 안 됨 — 잠시 후 다시', true); return; }
+    showNote('🧹 정리 요청을 보냈어요…', false);
+    clearTimeout(purgeTimer);
+    purgeTimer = setTimeout(() => showNote('⚠ 정리 응답이 없어요 — 이 서버가 KeyPurge 를 모르는 이전 판일 수 있어요', true), 6000);
+  }
+  function requestList() { wsSendOrch({ type: 'CUSTOM', name: 'KeyList', value: { includeRevoked: true } }); }
+  function openManager() { buildModal(); modal.hidden = false; showNote(''); renderTable(); requestList(); }   // v2.4.2 즉시 placeholder 렌더 (응답 대기 동안 빈 화면 방지)
+  function closeManager() { if (modal) modal.hidden = true; }
+
+  wsKeyMgmt = {
+    openManager,
+    openIssuePanel() { panel.hidden = false; render(); if (!caps.known) requestList(); },   // 키 발행 패널 직접 열기 (우클릭 컨텍스트 메뉴용)
+    setIssued(p) { p = p || {}; key = p.key || ''; joinUrl = p.joinUrl || ''; joinUrls = Array.isArray(p.joinUrls) ? p.joinUrls : []; exposed = !!p.exposed; bindAddr = p.bind ? String(p.bind) : ''; joinHint = p.joinHint || ''; joinFile = p.joinFile || ''; if (p.label != null) label = p.label; if (p.kind != null) kind = p.kind; if (p.roleDescription != null) roleDescription = p.roleDescription; status = 'issued'; panel.hidden = false; render(); },
+    setError(p) {
+      const txt = (p && (p.message || p.code)) || '발급 실패';
+      if (modal && !modal.hidden) { showNote('⚠ ' + txt, true); return; }   // 관리 창에서 낸 요청(연장·폐기·정리)의 오류는 그 창에 보여요
+      status = 'error'; key = txt; render();
+    },
+    // KeyListResult 의 value 전체를 받아요(목록 수준 필드 = 서버 능력·정책). 배열만 오면 목록만 바꾸고 능력은 그대로 둬요.
+    setList(v) {
+      if (Array.isArray(v)) modalKeys = v;
+      else { modalKeys = (v && Array.isArray(v.keys)) ? v.keys : []; caps = wsKeyServerCaps(v || {}); if (!ttlPicked) ttlDays = wsKeyDefaultDays(kind, caps); }
+      if (modal && !modal.hidden) renderTable();
+      if (!panel.hidden && (status === 'idle' || status === 'error')) render();   // 발급 패널의 기간 선택·경고 띠도 능력에 따라 다시 그려요
+    },
+    caps() { return caps; },
+    onMutated() { if (modal && !modal.hidden) requestList(); },
+    onPurged(v) {   // KeyPurged{count, keyRefs, error?}
+      clearTimeout(purgeTimer); v = v || {};
+      if (v.error) showNote('⚠ 정리 실패: ' + (typeof v.error === 'string' ? v.error : (v.error.message || v.error.code || JSON.stringify(v.error))), true);
+      else showNote('🧹 폐기 키 ' + (v.count || 0) + '개를 정리했어요', false);
+      if (modal && !modal.hidden) requestList();
+    },
+  };
+  render();
+}
+
+// ---- 상태 표시 ----
+function updateWsBadge() {
+  const b = $('#ws-badge'); if (!b) return;
+  let total = 0; for (const ch of wsState.channels.values()) total += ch.unseen;
+  b.textContent = total > 99 ? '99+' : String(total);
+  b.hidden = total === 0 || wsState.popOpen;
+}
+function updateWsConn() {
+  const active = wsState.active;
+  const grp = wsIsGroup(active), mon = wsIsMon(active);
+  const ch = (!grp && active) ? wsState.channels.get(active) : null;
+  const present = mon || grp || (!!ch && wsState.present.has(ch.routeId || active));   // §4: routeId 연결로 판정
+  const connected = wsState.open && (grp || !!ch) && present;
+  const dot = $('#ws-conn-dot'), txt = $('#ws-conn-text'), agent = $('#ws-agent'), seq = $('#ws-seq'), hdot = $('#ws-head-dot'), meta = $('#ws-pop-meta');
+  if (dot) dot.classList.toggle('on', connected);
+  if (hdot) hdot.classList.toggle('off', !connected);
+  const grpName = active === 'group:up' ? '업스트림 그룹' : active === 'group:main' ? '메인 그룹' : active === 'group:board-worker' ? '보드워커 그룹' : active === 'group:collab' ? '협업 그룹' : '로컬 그룹';
+  if (agent) agent.textContent = grp ? grpName : ((ch && ch.name) || '에이전트');
+  if (txt) txt.textContent = (!wsState.open && wsState.authGate) ? '로그인 필요 — 보드는 살아 있어요' : !wsState.open ? '서버 연결 끊김' : grp ? '그룹 병합 뷰(시간순)' : mon ? '모니터 (읽기 전용)' : (!ch ? '에이전트 없음' : (ch.connStatus === 'restored' ? '연결 복원됨' : (present ? '연결됨' : '연결 끊김')));
+  if (seq) seq.textContent = (ch && ch.seq != null) ? `· seq ${ch.seq}` : '';
+  // §6 project metadata: 프로젝트명 + GitHub repo 링크(없으면 채널키·runId)
+  if (meta) {
+    let html = '';
+    if (ch && ch.projectName) html += `<span class="ws-proj">📁 ${esc(ch.projectName)}</span>`;
+    if (ch && ch.githubRepo) { const r = String(ch.githubRepo).replace(/^https?:\/\/github\.com\//, ''); html += ` <a class="ws-repo" href="https://github.com/${encodeURI(r)}" target="_blank" rel="noopener noreferrer">⎇ ${esc(r)}</a>`; }
+    if (!html && ch) html = [active, ch.runId].filter(Boolean).map(v => '· ' + esc(v)).join(' ');
+    meta.innerHTML = html;
+  }
+  // 그룹/모니터 읽기 전용 입력란 전환은 wsShowTextarea(wsSetActive) 가 처리
+}
+// ---- 팝업 UI 상태(위치·크기·열림) 영속 — 클라별 UI 선호라 localStorage ----
+// 위치 표현: 활성 anchor (preset) 기준 모서리 거리로 inline 4 좌표 표현. 화면/창 resize 시 그 모서리 거리 유지.
+const WS_UI = 'constellation-ws-ui';
+const WS_POS = 'constellation-ws-position';   // 'tl' | 'tr' | 'bl' | 'br' — 위치 anchor (기본 'br')
+const WS_POS_VALID = ['tl', 'tr', 'bl', 'br'];
+function wsCurrentAnchor() {
+  const pop = $('#ws-pop'); if (!pop) return wsLoadPositionPref();
+  for (const c of WS_POS_VALID) if (pop.classList.contains('pos-' + c)) return c;
+  return wsLoadPositionPref();
+}
+function wsRectToAnchorPos(rect, anchor) {   // viewport rect → anchor 모서리 거리 (inline 4 좌표)
+  const o = { left: 'auto', right: 'auto', top: 'auto', bottom: 'auto' };
+  if (anchor === 'tl')      { o.left  = Math.round(rect.left) + 'px';                  o.top    = Math.round(rect.top) + 'px'; }
+  else if (anchor === 'tr') { o.right = Math.round(innerWidth - rect.right) + 'px';    o.top    = Math.round(rect.top) + 'px'; }
+  else if (anchor === 'bl') { o.left  = Math.round(rect.left) + 'px';                  o.bottom = Math.round(innerHeight - rect.bottom) + 'px'; }
+  else                      { o.right = Math.round(innerWidth - rect.right) + 'px';    o.bottom = Math.round(innerHeight - rect.bottom) + 'px'; }
+  return o;
+}
+function wsApplyAnchorPos(pop, pos) {   // 4 좌표 inline 적용 (auto 포함 — class 의 fallback 무력화)
+  pop.style.left   = pos.left;
+  pop.style.right  = pos.right;
+  pop.style.top    = pos.top;
+  pop.style.bottom = pos.bottom;
+}
+function wsSaveUI() {
+  try {
+    const pop = $('#ws-pop'); if (!pop) return;
+    const s = pop.style;
+    const o = { open: !!wsState.popOpen };
+    // 사용자가 옮기거나 리사이즈했을 때만 inline 좌표/크기 영속 (4 좌표 중 하나라도 있거나 width/height inline)
+    if (s.left || s.right || s.top || s.bottom || s.width || s.height) {
+      o.pos = { left: s.left || '', right: s.right || '', top: s.top || '', bottom: s.bottom || '', width: s.width || '', height: s.height || '' };
+    }
+    localStorage.setItem(WS_UI, JSON.stringify(o));
+  } catch {}
+}
+function wsLoadUI() {
+  try {
+    const o = JSON.parse(localStorage.getItem(WS_UI) || 'null') || {};
+    const pop = $('#ws-pop'); if (!pop) return;
+    // anchor class 먼저 적용 (preset 거리 fallback)
+    const pref = wsLoadPositionPref();
+    pop.classList.remove('pos-tl', 'pos-tr', 'pos-bl', 'pos-br');
+    pop.classList.add('pos-' + pref);
+    if (o.pos) {
+      // 마이그레이션 — 구 형식 (left/top 절대좌표만, right/bottom 키 없음) 감지 시 현재 anchor 기준 거리로 재계산 + 영속 갱신
+      const isLegacy = !('right' in o.pos) && !('bottom' in o.pos);
+      if (isLegacy && o.pos.left) {
+        const left  = parseInt(o.pos.left,   10) || 0;
+        const top   = parseInt(o.pos.top,    10) || 0;
+        const width = parseInt(o.pos.width,  10) || 645;
+        const height= parseInt(o.pos.height, 10) || 540;
+        const rect = { left, top, right: left + width, bottom: top + height };
+        const ap = wsRectToAnchorPos(rect, pref);
+        o.pos = { left: ap.left, right: ap.right, top: ap.top, bottom: ap.bottom, width: o.pos.width || '', height: o.pos.height || '' };
+        try { localStorage.setItem(WS_UI, JSON.stringify(o)); } catch {}
+      }
+      // 사용자가 옮긴 4 좌표 + 크기 복원 (anchor 모서리 거리 그대로 — 화면 resize 시 거리 유지)
+      pop.style.left   = o.pos.left   || '';
+      pop.style.right  = o.pos.right  || '';
+      pop.style.top    = o.pos.top    || '';
+      pop.style.bottom = o.pos.bottom || '';
+      if (o.pos.width)  pop.style.width  = o.pos.width;
+      if (o.pos.height) pop.style.height = o.pos.height;
+    }
+    if (o.open) toggleWsPop(true);
+  } catch {}
+}
+function wsLoadPositionPref() {
+  try { const p = localStorage.getItem(WS_POS); if (WS_POS_VALID.includes(p)) return p; } catch {}
+  return 'br';
+}
+function wsApplyPosition(p, opts) {
+  const pop = $('#ws-pop'); if (!pop) return;
+  opts = opts || {};
+  // 'center' — 현재 활성 anchor 기준으로 가운데 정렬 (anchor 모서리 거리로 표현하여 화면 resize 시 거리 유지)
+  if (p === 'center') {
+    const anchor = wsCurrentAnchor();
+    const r = pop.getBoundingClientRect();
+    const tLeft = Math.max(0, (innerWidth - r.width) / 2);
+    const tTop  = Math.max(0, (innerHeight - r.height) / 2);
+    const tRect = { left: tLeft, top: tTop, right: tLeft + r.width, bottom: tTop + r.height };
+    wsApplyAnchorPos(pop, wsRectToAnchorPos(tRect, anchor));
+    wsSaveUI();
+    return;
+  }
+  if (!WS_POS_VALID.includes(p)) p = 'br';
+  pop.classList.remove('pos-tl', 'pos-tr', 'pos-bl', 'pos-br');
+  pop.classList.add('pos-' + p);
+  // preset 클릭 = 기본 거리 (22px / 88px) 로 정렬. inline 4 좌표 클리어 → class 가 anchor 모서리 거리 제공.
+  pop.style.left = ''; pop.style.top = ''; pop.style.right = ''; pop.style.bottom = '';
+  if (opts.persist !== false) {
+    try { localStorage.setItem(WS_POS, p); } catch {}
+    try { const o = JSON.parse(localStorage.getItem(WS_UI) || 'null') || {}; delete o.pos; localStorage.setItem(WS_UI, JSON.stringify(o)); } catch {}
+  }
+}
+function toggleWsPop(show) {
+  const pop = $('#ws-pop'); if (!pop) return;
+  const open = show === undefined ? pop.hidden : show;
+  pop.hidden = !open;
+  wsState.popOpen = open;
+  if (open) {
+    const ch = wsState.active && wsState.channels.get(wsState.active); if (ch) ch.unseen = 0;
+    wsRenderTabs(); wsRenderActiveStream(); updateWsConn();
+    wsShowTextarea(wsState.active);   // 열 때 활성 채널 입력란 표시·포커스
+    if (wsPagerOn()) wsScrollToActive(false);   // #3a B: 모바일 — 열 때 페이저를 active 그룹 페이지로 정렬
+  }
+  updateWsBadge();
+  wsSaveUI();
+  syncMobileTabbar();
+}
+
+// ---- 모바일 하단 탭바 (A — 최상위 탭전환; 실시간=팝업 풀스크린 pane, ≤560px) ----
+function syncMobileTabbar() {
+  const bar = document.getElementById('mobile-tabbar'); if (!bar) return;
+  let popOpen, panes;
+  try { popOpen = wsState.popOpen; panes = ui.panes; } catch (e) { return; }   // 초기 applyPanes 호출은 wsState(const, 하단 정의) 초기화 전 — TDZ 가드(이후 setupMobileTabbar/재호출에서 정상 동기)
+  // 하단바 하이라이트: 분할이면 dashboard 우선(기존 semantics 유지), 단일 pane 이면 그 pane. org/wiki 도 이제 켜져요(종전 갭).
+  const MTABS = ['decisions', 'org', 'wiki'];
+  const active = popOpen ? 'realtime'
+    : (panes ? (panes.includes('dashboard') ? 'dashboard' : (MTABS.find((k) => panes.includes(k)) || null)) : null);
+  bar.querySelectorAll('[data-mtab]').forEach((b) => b.classList.toggle('active', b.dataset.mtab === active));
+}
+function setupMobileTabbar() {
+  const bar = document.getElementById('mobile-tabbar'); if (!bar) return;
+  bar.querySelectorAll('[data-mtab]').forEach((b) => { b.onclick = () => {
+    const t = b.dataset.mtab;   // 위키 = #4 Compendium 자리 (v0.2-d 구현 — else 분기에서 setPanes('wiki'))
+    if (t === 'realtime') { if (!wsState.popOpen) toggleWsPop(true); }
+    else { if (wsState.popOpen) toggleWsPop(false); setPanes(t, false); }
+    syncMobileTabbar();
+  }; });
+  WS_MOBILE_MQ.addEventListener('change', () => {   // #3a B: 560px 경계 교차 — 페이저↔단일스트림 모드 전환 재렌더
+    if (!wsState.popOpen) return;
+    wsRenderTabs(); wsRenderActiveStream(); updateWsConn();   // wsRenderActiveStream 이 wsPagerOn 분기
+    if (wsPagerOn()) wsScrollToActive(false);
+  });
+  syncMobileTabbar();
+}
+
+// ---- 8방향 리사이즈 (모든 면·모서리) ----
+// v2.4.163 — 포인터 이벤트 + 캡처. 종전엔 mousedown/mousemove/mouseup 이라 **손가락으로는 아무 일도 안 났어요**
+//   (터치는 탭만 마우스로 흉내 내고 드래그는 안 내요) — 태블릿·펼친 폴더블(>560px, 데스크탑 레이아웃)에서
+//   실시간 창 크기·위치를 못 바꾸던 자리. 캡처를 잡으면 손가락이 핸들 밖으로 나가도 move/up 이 핸들로 와요.
+//   워크플로 모니터 팝업(v2.4.85)이 이미 이 모양이에요 — 같은 화면의 두 창이 다른 입력 모델을 쓸 이유가 없어요.
+function setupWsResize(pop) {
+  let rz = null;
+  const MIN = 320;
+  pop.querySelectorAll('.ws-rsz').forEach(h => {
+    h.addEventListener('pointerdown', (e) => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return;   // 우클릭·휠클릭은 리사이즈가 아니에요
+      const r = pop.getBoundingClientRect();
+      rz = { id: e.pointerId, dir: h.dataset.dir, x: e.clientX, y: e.clientY, left: r.left, top: r.top, w: r.width, h: r.height, anchor: wsCurrentAnchor() };
+      // 리사이즈 진행 중에는 left/top + width/height 로 작업, 종료 시 anchor 기준 정규화
+      pop.style.left = r.left + 'px'; pop.style.top = r.top + 'px'; pop.style.right = 'auto'; pop.style.bottom = 'auto';
+      try { h.setPointerCapture(e.pointerId); } catch {}
+      e.preventDefault(); e.stopPropagation();
+    });
+    h.addEventListener('pointermove', (e) => {
+      if (!rz || e.pointerId !== rz.id) return;
+      const dx = e.clientX - rz.x, dy = e.clientY - rz.y;
+      let left = rz.left, top = rz.top, w = rz.w, h = rz.h;
+      if (rz.dir.includes('e')) w = Math.max(MIN, Math.min(rz.w + dx, innerWidth - rz.left));       // 뷰포트 밖으로 못 자라요
+      if (rz.dir.includes('s')) h = Math.max(MIN, Math.min(rz.h + dy, innerHeight - rz.top));
+      if (rz.dir.includes('w')) { const nw = Math.max(MIN, Math.min(rz.w - dx, rz.left + rz.w)); left = rz.left + (rz.w - nw); w = nw; }
+      if (rz.dir.includes('n')) { const nh = Math.max(MIN, Math.min(rz.h - dy, rz.top + rz.h)); top = rz.top + (rz.h - nh); h = nh; }
+      pop.style.left = left + 'px'; pop.style.top = top + 'px'; pop.style.width = w + 'px'; pop.style.height = h + 'px';
+    });
+    const end = (e) => {
+      if (!rz || e.pointerId !== rz.id) return;
+      // 리사이즈 종료 — 현재 rect → active anchor 기준 모서리 거리로 정규화 (화면 resize 시 거리 유지)
+      const r = pop.getBoundingClientRect();
+      wsApplyAnchorPos(pop, wsRectToAnchorPos(r, rz.anchor));
+      rz = null; wsSaveUI();
+    };
+    h.addEventListener('pointerup', end);
+    h.addEventListener('pointercancel', end);   // 시스템 제스처(알림 서랍·화면 회전)가 가로채면 여기로 — 잡은 채로 남지 않게
+  });
+}
+
+// ---- 자체 confirm/prompt 다이얼로그 (브라우저 native 대체, Promise 기반) ----
+// wsConfirm(message, opts?) → Promise<boolean>           — 사용자 OK=true / Cancel/ESC/backdrop=false
+// wsPrompt(message, initial?, opts?) → Promise<string|null> — OK=입력값 / Cancel=null
+// opts: { title?, okLabel?, cancelLabel?, danger?, placeholder? }
+function wsConfirm(message, opts) {
+  opts = opts || {};
+  return new Promise((resolve) => {
+    const modal = document.createElement('div'); modal.className = 'ws-confirm-modal';
+    const box = document.createElement('div'); box.className = 'ws-confirm-box';
+    if (opts.title) { const h = document.createElement('div'); h.className = 'ws-confirm-head'; h.textContent = opts.title; box.appendChild(h); }
+    const body = document.createElement('div'); body.className = 'ws-confirm-body'; body.textContent = message; box.appendChild(body);
+    const foot = document.createElement('div'); foot.className = 'ws-confirm-foot';
+    const cancelBtn = document.createElement('button'); cancelBtn.type = 'button'; cancelBtn.className = 'ws-confirm-btn'; cancelBtn.textContent = opts.cancelLabel || '취소';
+    const okBtn = document.createElement('button'); okBtn.type = 'button'; okBtn.className = 'ws-confirm-btn ' + (opts.danger ? 'danger' : 'primary'); okBtn.textContent = opts.okLabel || '확인';
+    foot.append(cancelBtn, okBtn); box.appendChild(foot); modal.appendChild(box); document.body.appendChild(modal);
+    const close = (result) => { modal.remove(); document.removeEventListener('keydown', onKey); resolve(result); };
+    cancelBtn.onclick = () => close(false);
+    okBtn.onclick = () => close(true);
+    modal.addEventListener('click', (e) => { if (e.target === modal) close(false); });
+    const onKey = (e) => { if (e.key === 'Escape') close(false); else if (e.key === 'Enter') close(true); };
+    document.addEventListener('keydown', onKey);
+    setTimeout(() => okBtn.focus(), 50);
+  });
+}
+function wsPrompt(message, initialValue, opts) {
+  opts = opts || {};
+  return new Promise((resolve) => {
+    const modal = document.createElement('div'); modal.className = 'ws-confirm-modal';
+    const box = document.createElement('div'); box.className = 'ws-confirm-box';
+    if (opts.title) { const h = document.createElement('div'); h.className = 'ws-confirm-head'; h.textContent = opts.title; box.appendChild(h); }
+    const body = document.createElement('div'); body.className = 'ws-confirm-body'; body.textContent = message; box.appendChild(body);
+    const input = document.createElement('input'); input.className = 'ws-confirm-input'; input.type = 'text'; input.value = initialValue == null ? '' : String(initialValue);
+    if (opts.placeholder) input.placeholder = opts.placeholder;
+    box.appendChild(input);
+    const foot = document.createElement('div'); foot.className = 'ws-confirm-foot';
+    const cancelBtn = document.createElement('button'); cancelBtn.type = 'button'; cancelBtn.className = 'ws-confirm-btn'; cancelBtn.textContent = opts.cancelLabel || '취소';
+    const okBtn = document.createElement('button'); okBtn.type = 'button'; okBtn.className = 'ws-confirm-btn primary'; okBtn.textContent = opts.okLabel || '확인';
+    foot.append(cancelBtn, okBtn); box.appendChild(foot); modal.appendChild(box); document.body.appendChild(modal);
+    const close = (result) => { modal.remove(); document.removeEventListener('keydown', onKey); resolve(result); };
+    cancelBtn.onclick = () => close(null);
+    okBtn.onclick = () => close(input.value);
+    modal.addEventListener('click', (e) => { if (e.target === modal) close(null); });
+    const onKey = (e) => { if (e.key === 'Escape') close(null); else if (e.key === 'Enter' && document.activeElement === input) close(input.value); };
+    document.addEventListener('keydown', onKey);
+    setTimeout(() => { input.focus(); input.select(); }, 50);
+  });
+}
+
+// ---- 실시간 창 설정 모달 (창 배치 등) ----
+let wsSettings = null;
+let wsAccessRefresh = null;   // #5a-2 접근 제어 섹션 GET 갱신 (설정 모달 open 시 호출)
+function setupWsSettings() {
+  const btn = $('#ws-settings-btn'); if (!btn) return;
+  let modal = null;
+  function build() {
+    if (modal) return modal;
+    modal = document.createElement('div'); modal.id = 'ws-settings-modal'; modal.className = 'ws-settings-modal'; modal.hidden = true;
+    const box = document.createElement('div'); box.className = 'ws-settings-box';
+    const head = document.createElement('div'); head.className = 'ws-settings-head';
+    const title = document.createElement('b'); title.textContent = '⚙ 설정';
+    const x = document.createElement('button'); x.className = 'ws-settings-mx'; x.type = 'button'; x.textContent = '✕'; x.onclick = close;
+    head.append(title, x);
+    const body = document.createElement('div'); body.className = 'ws-settings-body';
+    // 창 배치 preset 4종
+    const sec = document.createElement('div'); sec.className = 'ws-set-section';
+    const h = document.createElement('h4'); h.textContent = '창 배치 기준';
+    const hrt = document.createElement('span'); hrt.className = 'ws-rt-tag'; hrt.textContent = '실시간'; h.appendChild(hrt);
+    sec.appendChild(h);
+    const grid = document.createElement('div'); grid.className = 'ws-pos-grid';
+    const POS_DEFS = [
+      { v: 'tl', arrow: '↖', name: '좌상' },
+      { v: 'tr', arrow: '↗', name: '우상' },
+      { v: 'bl', arrow: '↙', name: '좌하' },
+      { v: 'br', arrow: '↘', name: '우하 (기본)' },
+    ];
+    const cur = wsLoadPositionPref();
+    POS_DEFS.forEach((pd) => {
+      const c = document.createElement('button'); c.type = 'button'; c.className = 'ws-pos-card' + (cur === pd.v ? ' active' : ''); c.dataset.pos = pd.v;
+      const a = document.createElement('span'); a.className = 'ws-pos-arrow'; a.textContent = pd.arrow;
+      const n = document.createElement('span'); n.className = 'ws-pos-name'; n.textContent = pd.name;
+      c.append(a, n);
+      c.onclick = () => {
+        wsApplyPosition(pd.v);
+        grid.querySelectorAll('.ws-pos-card').forEach((el) => el.classList.toggle('active', el.dataset.pos === pd.v));
+      };
+      grid.appendChild(c);
+    });
+    sec.appendChild(grid);
+    const desc = document.createElement('div'); desc.className = 'ws-set-desc';
+    desc.textContent = '선택한 모서리 기준 거리가 유지돼요 — 화면 / 창 크기가 변해도 그 모서리에서 같은 거리. 예: "우하" 선택 + 창을 우측 하단에 가깝게 놓으면 화면이 늘어나도 우하 모서리 거리 동일.';
+    sec.appendChild(desc);
+    const hint = document.createElement('div'); hint.className = 'ws-set-hint'; hint.textContent = '창을 드래그하면 그 위치가 새 거리로 자동 저장. 기본 거리로 되돌리려면 위 옵션 중 하나를 다시 클릭.';
+    sec.appendChild(hint);
+    body.appendChild(sec);
+
+    // #5a-4 접속 제어 — 노출 토글 + 표면별 차단/허용 + 키요구 + 저장/저장및재시작.
+    //   창 배치(실시간)와 달리 '저장' 으로 적용되는 별도 블록(ws-acc-block 카드 + "저장해야 적용" 태그).
+    const asec = document.createElement('div'); asec.className = 'ws-set-section ws-acc-block';
+    const ahd = document.createElement('div'); ahd.className = 'ws-acc-hd';
+    const ah = document.createElement('h4'); ah.textContent = '🔒 접속 제어'; ah.style.margin = '0';
+    const atag = document.createElement('span'); atag.className = 'ws-acc-tag'; atag.textContent = '저장해야 적용';
+    const astat = document.createElement('span'); astat.className = 'ws-acc-stat'; astat.textContent = '확인 중…';
+    ahd.append(ah, atag, astat); asec.appendChild(ahd);
+
+    let _exposeIntent = false;   // 대시보드에서 의도하는 노출 상태 (재시작 시 적용)
+    let _exposedNow = false;     // 서버의 현재 실제 bind 상태
+    const surfWrap = document.createElement('div'); surfWrap.className = 'ws-acc-surfs';
+    function updateWarn() {
+      const danger = _exposeIntent && sAgent && sAgent.state.mode === 'allow' && !reqCb.checked;
+      awarn.hidden = !danger;
+      if (danger) awarn.textContent = '⚠ 노출 시 에이전트가 키 없이 누구나 합류·보드 조작할 수 있어요. ‘에이전트 기본 차단’ 또는 ‘키 요구’ 권장.';
+    }
+    function applyExposeUi() {
+      exOff.classList.toggle('active', !_exposeIntent);
+      exOn.classList.toggle('active', _exposeIntent);
+      surfWrap.classList.toggle('ws-acc-dim', !_exposeIntent);
+      const changed = _exposeIntent !== _exposedNow;
+      exhint.textContent = !_exposeIntent
+        ? '꺼짐 — 이 컴퓨터에서만 접속. 아래 IP 정책은 노출해야 적용돼요.'
+        : (changed ? '켜기 예정 — [저장 및 재시작] 을 눌러야 실제로 LAN 에 열려요.' : 'LAN 에 열려 있어요. 아래 IP 정책이 지금 적용 중.');
+      updateWarn();
+    }
+    // 1) 네트워크 노출 마스터 (WS_BIND — 재시작으로 적용)
+    const exrow = document.createElement('div'); exrow.className = 'ws-acc-expose';
+    const exlab = document.createElement('span'); exlab.className = 'ws-acc-surf-lab'; exlab.textContent = '네트워크 노출 (다른 기기 접속)';
+    const exseg = document.createElement('div'); exseg.className = 'ws-acc-seg';
+    const exOff = document.createElement('button'); exOff.type = 'button'; exOff.className = 'ws-acc-seg-b'; exOff.textContent = '끄기';
+    const exOn = document.createElement('button'); exOn.type = 'button'; exOn.className = 'ws-acc-seg-b'; exOn.textContent = '켜기';
+    exseg.append(exOff, exOn); exrow.append(exlab, exseg); asec.appendChild(exrow);
+    const exhint = document.createElement('div'); exhint.className = 'ws-set-hint'; asec.appendChild(exhint);
+    exOff.onclick = () => { _exposeIntent = false; applyExposeUi(); };
+    exOn.onclick = () => { _exposeIntent = true; applyExposeUi(); };
+
+    // 2) 표면별 IP 정책 (노출 시 적용 — 노출 꺼지면 흐리게)
+    asec.appendChild(surfWrap);
+    function mkSurface(key, label) {
+      const row = document.createElement('div'); row.className = 'ws-acc-surf';
+      const top = document.createElement('div'); top.className = 'ws-acc-surf-top';
+      const lab = document.createElement('span'); lab.className = 'ws-acc-surf-lab'; lab.textContent = label;
+      const seg = document.createElement('div'); seg.className = 'ws-acc-seg';
+      const bBlock = document.createElement('button'); bBlock.type = 'button'; bBlock.className = 'ws-acc-seg-b'; bBlock.textContent = '기본 차단';
+      const bAllow = document.createElement('button'); bAllow.type = 'button'; bAllow.className = 'ws-acc-seg-b'; bAllow.textContent = '기본 허용';
+      seg.append(bBlock, bAllow); top.append(lab, seg); row.appendChild(top);
+      const ta = document.createElement('textarea'); ta.className = 'ws-acc-ta'; ta.rows = 2; ta.spellcheck = false; ta.placeholder = '허용할 IP/대역 — 한 줄에 하나 (예: 192.168.0.5 또는 192.168.0.0/24). 비우면 로컬만'; row.appendChild(ta);
+      const state = { mode: 'allow' };
+      function render() { bBlock.classList.toggle('active', state.mode === 'block'); bAllow.classList.toggle('active', state.mode === 'allow'); ta.style.display = state.mode === 'block' ? '' : 'none'; updateWarn(); }
+      bBlock.onclick = () => { state.mode = 'block'; render(); };
+      bAllow.onclick = () => { state.mode = 'allow'; render(); };
+      surfWrap.appendChild(row);
+      return { key, state, set(al) { state.mode = Array.isArray(al) ? 'block' : 'allow'; ta.value = Array.isArray(al) ? al.join('\n') : ''; render(); }, get() { return state.mode === 'allow' ? null : ta.value.split('\n').map((s) => s.trim()).filter(Boolean); } };
+    }
+    const sUi = mkSurface('ui', '이 화면 (UI)');
+    const sAgent = mkSurface('agent', '에이전트 (A2A)');
+    const sMcp = mkSurface('mcp', '도구 연결 (MCP)');
+    const reqWrap = document.createElement('label'); reqWrap.className = 'ws-acc-check';
+    const reqCb = document.createElement('input'); reqCb.type = 'checkbox'; reqCb.onchange = () => updateWarn();
+    reqWrap.append(reqCb, document.createTextNode(' 모르는 에이전트 막기 — /ws 합류에 키 요구'));
+    surfWrap.appendChild(reqWrap);
+    const awarn = document.createElement('div'); awarn.className = 'ws-acc-warn'; awarn.hidden = true; surfWrap.appendChild(awarn);
+
+    // 3) 버튼 — 저장(allowlist 즉시 hot-reload) · 저장 및 재시작(노출 변경 적용)
+    const arow = document.createElement('div'); arow.className = 'ws-acc-row';
+    const asave = document.createElement('button'); asave.type = 'button'; asave.className = 'ws-acc-save'; asave.textContent = '저장';
+    const arestart = document.createElement('button'); arestart.type = 'button'; arestart.className = 'ws-acc-save ws-acc-restart'; arestart.textContent = '저장 및 재시작';
+    const amsg = document.createElement('span'); amsg.className = 'ws-acc-msg'; arow.append(asave, arestart, amsg);
+    asec.appendChild(arow);
+    const adesc = document.createElement('div'); adesc.className = 'ws-set-desc'; adesc.textContent = '기본 허용 = 누구나 · 기본 차단 = 허용 IP/대역(CIDR)만(비우면 로컬만). IP 정책은 [저장] 시 즉시 반영, 노출 켜기/끄기는 [저장 및 재시작] 으로 적용(서버 재기동). 저장은 이 컴퓨터(로컬)에서만.';
+    asec.appendChild(adesc);
+
+    function buildPayload() { return { expose: _exposeIntent, ui: { allowlist: sUi.get() }, agent: { allowlist: sAgent.get(), requireKey: reqCb.checked }, mcp: { allowlist: sMcp.get() } }; }
+    function postAccess() { return fetch('/api/access', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(buildPayload()) }).then((r) => r.json().then((d) => ({ status: r.status, d }))); }
+    wsAccessRefresh = () => {
+      astat.textContent = '확인 중…'; astat.className = 'ws-acc-stat';
+      fetch('/api/access').then((r) => r.json()).then((d) => {
+        if (!d || !d.ok) { astat.textContent = '(서버 #5a 미지원)'; return; }
+        _exposedNow = !!d.exposed; _exposeIntent = !!(d.access && d.access.expose);
+        astat.textContent = d.exposed ? `🌐 열림 (bind=${d.bind})` : '🔒 이 컴퓨터에서만';
+        astat.className = 'ws-acc-stat' + (d.exposed ? ' exposed' : '');
+        sUi.set(d.access.ui && d.access.ui.allowlist);
+        sAgent.set(d.access.agent && d.access.agent.allowlist);
+        sMcp.set(d.access.mcp && d.access.mcp.allowlist);
+        reqCb.checked = !!(d.access.agent && d.access.agent.requireKey);
+        applyExposeUi();
+      }).catch(() => { astat.textContent = '(조회 실패)'; });
+    };
+    asave.onclick = () => {
+      amsg.textContent = '저장 중…'; amsg.className = 'ws-acc-msg';
+      postAccess().then(({ status, d }) => {
+        if (status === 200 && d.ok) { amsg.textContent = (_exposeIntent !== _exposedNow) ? '✓ 저장됨 — 노출 변경은 [저장 및 재시작] 필요' : '✓ 저장됨'; amsg.className = 'ws-acc-msg ok'; if (wsAccessRefresh) wsAccessRefresh(); }
+        else if (status === 403) { amsg.textContent = '✗ 로컬에서만 저장 가능 (이 화면은 원격 접속)'; amsg.className = 'ws-acc-msg err'; }
+        else { amsg.textContent = '✗ 저장 실패: ' + ((d && d.error) || status); amsg.className = 'ws-acc-msg err'; }
+      }).catch(() => { amsg.textContent = '✗ 저장 실패 (네트워크)'; amsg.className = 'ws-acc-msg err'; });
+    };
+    arestart.onclick = () => {
+      if (!window.confirm('저장하고 보드 서버를 재시작할까요? 잠시(수 초) 연결이 끊겼다 자동 복구돼요.')) return;
+      amsg.textContent = '저장 중…'; amsg.className = 'ws-acc-msg';
+      postAccess().then(({ status, d }) => {
+        if (status !== 200 || !d.ok) { amsg.textContent = status === 403 ? '✗ 로컬에서만 가능' : ('✗ 저장 실패: ' + ((d && d.error) || status)); amsg.className = 'ws-acc-msg err'; return; }
+        amsg.textContent = '재시작 중… 잠시 후 자동 새로고침'; amsg.className = 'ws-acc-msg';
+        fetch('/api/restart', { method: 'POST' }).catch(() => {}).finally(() => { setTimeout(() => location.reload(), 5000); });
+      }).catch(() => { amsg.textContent = '✗ 저장 실패 (네트워크)'; amsg.className = 'ws-acc-msg err'; });
+    };
+    body.appendChild(asec);
+
+    box.append(head, body); modal.appendChild(box);
+    modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+    document.body.appendChild(modal);
+    return modal;
+  }
+  function open() {
+    build(); modal.hidden = false;
+    // re-sync active 상태 (외부에서 변경됐을 수도)
+    const cur = wsLoadPositionPref();
+    modal.querySelectorAll('.ws-pos-card').forEach((el) => el.classList.toggle('active', el.dataset.pos === cur));
+    if (wsAccessRefresh) wsAccessRefresh();   // #5a-2 접근 제어 현재값 로드
+  }
+  function close() { if (modal) modal.hidden = true; }
+  btn.onclick = (e) => { e.stopPropagation(); open(); };
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && modal && !modal.hidden) close(); });
+  wsSettings = { open, close };
+}
+
+// ---- 토글 버튼 우클릭 컨텍스트 메뉴 (화면 가운데로 / 키 관리 / 설정) ----
+function setupWsContextMenu() {
+  const fab = $('#ws-fab'); if (!fab) return;
+  let menu = null;
+  function close() { if (menu) { menu.remove(); menu = null; } }
+  fab.addEventListener('contextmenu', (e) => {
+    e.preventDefault(); close();
+    menu = document.createElement('div'); menu.className = 'ws-fab-ctx';
+    const items = [
+      { icon: '⊕', label: '화면 가운데로', act: () => { if (!wsState.popOpen) toggleWsPop(true); wsApplyPosition('center'); } },
+      { icon: '🔑', label: '키 발행',      act: () => { if (!wsState.popOpen) toggleWsPop(true); if (wsKeyMgmt && wsKeyMgmt.openIssuePanel) wsKeyMgmt.openIssuePanel(); } },
+      { icon: '🔐', label: '키 관리',      act: () => { if (!wsState.popOpen) toggleWsPop(true); if (wsKeyMgmt && wsKeyMgmt.openManager) wsKeyMgmt.openManager(); } },
+      { icon: '⚙',  label: '설정',         act: () => { if (!wsState.popOpen) toggleWsPop(true); if (wsSettings) wsSettings.open(); } },
+    ];
+    items.forEach((it) => {
+      const b = document.createElement('button'); b.className = 'ws-fab-ctx-item'; b.type = 'button';
+      b.textContent = it.icon + '  ' + it.label;
+      b.onclick = (ev) => { ev.stopPropagation(); close(); it.act(); };
+      menu.appendChild(b);
+    });
+    document.body.appendChild(menu);
+    const r = fab.getBoundingClientRect(), mr = menu.getBoundingClientRect();
+    // fab 좌상단 기준으로 메뉴를 띄움 — 화면 안 들어가도록 clamp
+    let left = r.left, top = r.top - mr.height - 6;
+    if (top < 8) top = r.bottom + 6;
+    if (left + mr.width > innerWidth - 8) left = innerWidth - mr.width - 8;
+    menu.style.left = Math.max(8, left) + 'px';
+    menu.style.top = Math.max(8, top) + 'px';
+  });
+  document.addEventListener('click', (e) => { if (menu && !e.target.closest('.ws-fab-ctx')) close(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+  window.addEventListener('blur', close);
+}
+
+function setupWS() {
+  const fab = $('#ws-fab'), pop = $('#ws-pop'), close = $('#ws-pop-close'), head = $('#ws-pop-head');
+  if (!fab || !pop) return;
+  fab.onclick = () => toggleWsPop();
+  if (close) close.onclick = (e) => { e.stopPropagation(); toggleWsPop(false); };
+  // 헤더 드래그 — 진행 중에는 left/top, 종료 시 active anchor 기준 모서리 거리로 정규화 (화면 resize 시 거리 유지)
+  // v2.4.163 — 포인터 이벤트 + 캡처 (setupWsResize 와 같은 이유: 마우스 이벤트만 듣던 헤더는 손가락으로 못 옮겼어요).
+  //   모바일 풀스크린(≤560px)에선 CSS 가 위치를 !important 로 고정하니 여기 값이 화면에 안 나타나요 — 그 경우만 건너뛰어요.
+  let drag = null;
+  if (head) {
+    head.addEventListener('pointerdown', (e) => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      if (e.target.closest('button, input, select, textarea, a, .ws-collab-panel, .ws-pop-close')) return;   // 인터랙티브 요소(close·collab 라벨 input·패널 등)는 드래그 제외 — 클릭/포커스 보존. ✕ 는 span 이라 이름을 대야 해요
+      if (wsPagerOn()) return;   // 풀스크린 모바일 — 이동 불가(고정)라 잡지 않아요
+      const r = pop.getBoundingClientRect();
+      drag = { id: e.pointerId, x: e.clientX, y: e.clientY, left: r.left, top: r.top, anchor: wsCurrentAnchor() };
+      pop.style.left = r.left + 'px'; pop.style.top = r.top + 'px'; pop.style.right = 'auto'; pop.style.bottom = 'auto';
+      try { head.setPointerCapture(e.pointerId); } catch {}
+      e.preventDefault();
+    });
+    head.addEventListener('pointermove', (e) => {
+      if (!drag || e.pointerId !== drag.id) return;
+      pop.style.left = Math.max(0, Math.min(innerWidth - 80, drag.left + (e.clientX - drag.x))) + 'px';
+      pop.style.top = Math.max(0, Math.min(innerHeight - 40, drag.top + (e.clientY - drag.y))) + 'px';
+    });
+    const endDrag = (e) => {
+      if (!drag || e.pointerId !== drag.id) return;
+      // 드래그 종료 — anchor 기준 정규화
+      const r = pop.getBoundingClientRect();
+      wsApplyAnchorPos(pop, wsRectToAnchorPos(r, drag.anchor));
+      drag = null; wsSaveUI();
+    };
+    head.addEventListener('pointerup', endDrag);
+    head.addEventListener('pointercancel', endDrag);
+  }
+  setupWsResize(pop);
+  wsLoadDrafts();   // 채널별 입력 draft·통일 높이 복원(새로고침 영속)
+  // 첨부: 드롭·버튼은 공통(채널별 textarea 의 paste 첨부는 wsTextareaFor 가 연결)
+  attachable({ dropEl: pop, textarea: null, fileBtn: $('#ws-attach'), fileInput: $('#ws-file'), listEl: $('#ws-atts'), atts: wsAtts, persist: () => {} });
+  const send = $('#ws-send'); if (send) send.onclick = wsSendPrompt;
+  const wfb = $('#ws-wf-inbtn'); if (wfb) { wfb.onclick = wsWfPopToggle; wsWfBtnSync(); }   // v2.4.64 입력줄 활동 모니터 토글
+  const pause = $('#ws-pause'); if (pause) pause.onclick = () => wsSendCommand('pause');
+  const resume = $('#ws-resume'); if (resume) resume.onclick = () => wsSendCommand('resume');
+  const cancel = $('#ws-cancel'); if (cancel) cancel.onclick = wsSendCancel;
+  const dbg = $('#ws-dbg-btn'); if (dbg) dbg.onclick = wsToggleDebug;
+  const tedit = $('#ws-tabedit-btn'); if (tedit) tedit.onclick = wsToggleTabEdit;   // 탭 편집 토글
+  const treset = $('#ws-tabreset-btn'); if (treset) treset.onclick = wsResetTabOrder;   // 탭 순서 초기화
+  const arch = $('#ws-arch-btn'), archMenu = $('#ws-arch-menu');
+  if (arch) arch.onclick = (e) => { e.stopPropagation(); if (archMenu) { wsRenderArchived(); archMenu.hidden = !archMenu.hidden; } };
+  document.addEventListener('click', (e) => { if (archMenu && !archMenu.hidden && !e.target.closest('.ws-arch-wrap')) archMenu.hidden = true; });
+  // v2.4.2 UI 통합: setupWsCollab (🔗 별도 버튼) 제거 — setupWsKeyMgmt 가 kind dropdown 으로 모든 종류 발행 통합
+  setupWsKeyMgmt();                                   // v2.4.0 #406 UI4/UI5 업스트림 키 발행 🔑 + 키 관리 모달 🗂
+  setupWsSettings();                                  // 실시간 창 설정 모달 (창 배치 preset 등) — 헤드 ⚙ 버튼
+  setupWsNotif();                                     // tier-1 알림 설정 (🔔 — 항목별 토글 + 권한)
+  setupMobileTabbar();                                // 모바일 하단 탭바 (≤560px — 최상위 탭전환 + 실시간 pane)
+  setupWsContextMenu();                               // 🌐 fab 우클릭 → 화면 가운데로 / 키 관리 / 설정
+  updateWsConn(); updateWsBadge(); wsRenderTabs();
+  wsLoadBackends();                                   // C1 backend registry overlay (board-worker 분리 + model badge); 부재 시 graceful
+  wsWfFabInit();                                      // v2.4.63 에이전트 활동 모니터 토글 fab
+  wsOpsStripInit();                                   // v2.4.71 입력줄 상태 스트립 (OpsState)
+  wsActInit();                                        // Pantty §8 확장 — 실시간 활성 스트림 지표 (AgentActivity)
+  wsTermInit();                                       // Pantty §9 — 터미널 중계 버튼 (🖥, relay 모드)
+  wsLoadUI();                                         // 팝업 위치·크기·열림 상태 복원
+  connectWS();
+}
+setupWS();

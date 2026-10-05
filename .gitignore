@@ -1,0 +1,65 @@
+/assets/
+.claude/settings.local.json
+# Obsidian vault config — local app state (workspace layout / graph view / enabled plugins).
+# Created wherever a folder is opened as a vault (e.g. compendium/ for the §11 dogfood). Never tracked.
+.obsidian/
+
+# Constellation reference runtime — single-instance lockfile (per _proposals/003 Fix 1, local-bridge.cjs L53)
+# Per-agentId PID lockfile written by the single-instance guard; never tracked.
+constellation/reference/runtime/.*-bridge.lock
+# v2.5.65 — runtime/single-instance.cjs helper 가 작성하는 PID lock 파일들 (agentId 별 분리).
+# join-local / watchdog / 기타 client 가 동일 패턴으로 lock 파일 생성.
+constellation/reference/runtime/.*.pid
+constellation/reference/runtime/scripts/.*.pid
+# v2.6.130 후속 — 게이트웨이 클라이언트도 자기 옆에 lock 을 쓰고, join-local 은 런타임 폴더에 local-<id>.log 를 써요.
+#   제자리 실행(검사 포함)의 부산물이 공개 저장소에 한 번 섞였어요 — 규율이 아니라 무시 규칙으로 막아요.
+constellation/reference/gateway/main/.*.pid
+constellation/reference/runtime/local-*.log
+# v2.4.43 (#3b webpush) — push.cjs 가 생성하는 VAPID 개인키 + 구독 저장 (배포별 런타임, 절대 추적 금지).
+constellation/reference/runtime/.vapid.json
+constellation/reference/runtime/.push-subs.json
+
+# Constellation runtime credential files — server-keys hazard: NEVER commit.
+# server.cjs writes key.json (KEY-MGMT 5-state store) + local-keys/<label>.key
+# (per-worker wire-private keys) into its own directory when run in-place.
+# server-keys.eux declares these "gitignored MUST"; this block is that mitigation.
+key.json
+operators.json
+ws-keys.json
+local-keys/
+*.key
+# #5a 표면별 접근 제어 설정 (server.cjs 가 /api/access POST 로 작성; 배포별 IP allowlist → 커밋 금지)
+access.json
+
+# Constellation reference runtime — operational JSONL streams (inbox / outbox / etc.)
+# Written by the running runtime when it acts as the local bridge for an interactive
+# session. Reference impl source (*.cjs, *.sh, *.md) stays tracked; these jsonl
+# operational artifacts do not. Memory feedback_workspace_cleanliness applies.
+constellation/reference/runtime/*.jsonl
+
+# Ultrasafe runtime working dir — adopter-repo state (state.json + finding/audit
+# JSONL). The PreToolUse hook records publish-command previews here; even with
+# secret-masking, this is runtime data, not a tracked plugin surface. NEVER commit.
+.ultrasafe/
+
+# Local agent-workspace artifacts at repo root (bootstrap policy).
+# Public reference docs and the constellation/ tree stay tracked; agent-local rule sheets / config / scratch dirs do not.
+/AGENTS.md
+/.agent/
+/.agent-*
+/agents.json
+
+# Agent-local scratch directory — one-off helper scripts the agent writes when
+# orchestrating multi-turn work (outbox push helpers, bundle decode scripts,
+# probe wrappers, etc). Ephemeral and project-local; never tracked.
+# Memory feedback_workspace_cleanliness applies.
+/tmp/
+
+# P4b dynamic-gate anchor dev-deps (constellation/package.json devDependencies — fast-check).
+# Installed modules and the lockfile are dev-only harness state; runtime stays dependency-zero.
+constellation/node_modules/
+constellation/package-lock.json
+
+# 컴파일된 파이썬 바이트코드 — 기계 특정(cpython-NNN)이고 아무도 읽지 않아요.
+__pycache__/
+*.pyc
