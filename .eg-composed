@@ -1,7 +1,7 @@
 {
   "composedBy": "compose-eg.cjs",
-  "edition": "2026.10.8",
-  "upstreamCommit": "a53d0efe7c0207820306982424597645797dc78c",
-  "upstreamTag": "v2.6.162",
+  "edition": "2026.10.9",
+  "upstreamCommit": "1a71fdd92a40eaa1de7b9662b25dfbedbed5a1b4",
+  "upstreamTag": "v2.6.163",
   "note": "This tree is generated. Edit upstream and recompose — discovery tools skip trees carrying this marker."
 }
