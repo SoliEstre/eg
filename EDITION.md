@@ -1,14 +1,14 @@
-# EG OS — edition 2026.11.6
+# EG OS — edition 2026.11.7
 
 > This repository is **composed**, not authored. Every file here is extracted from a single
 > upstream commit by `compose-eg.cjs`. Do not edit it in place — fix it upstream and recompose.
 
 | | |
 |---|---|
-| Edition | `2026.11.6` |
+| Edition | `2026.11.7` |
 | Upstream | [EstreGenesis](https://github.com/SoliEstre/EstreGenesis) |
-| Source commit | `add89af64d28f65450acd9c4e8dc80a44e50b3e3` |
-| Source tag | `v2.6.176` |
+| Source commit | `6af99f9e739409768e29b954154019d14ce7b55a` |
+| Source tag | `v2.6.177` |
 
 ## Modules in this edition
 
