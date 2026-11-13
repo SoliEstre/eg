@@ -1,14 +1,14 @@
-# EG OS — edition 2026.11.9
+# EG OS — edition 2026.11.10
 
 > This repository is **composed**, not authored. Every file here is extracted from a single
 > upstream commit by `compose-eg.cjs`. Do not edit it in place — fix it upstream and recompose.
 
 | | |
 |---|---|
-| Edition | `2026.11.9` |
+| Edition | `2026.11.10` |
 | Upstream | [EstreGenesis](https://github.com/SoliEstre/EstreGenesis) |
-| Source commit | `13365f7fb328df07aa7c85f178b811e82ed72b9a` |
-| Source tag | `v2.6.179` |
+| Source commit | `dae3c433f6494db021730f0b3e47d4872844f07a` |
+| Source tag | `v2.6.180` |
 
 ## Modules in this edition
 
@@ -16,12 +16,12 @@
 |---|---|---|
 | `estregenesis` | 0.4.2 | _(kit — no spec)_ |
 | `constellation` | 0.3.46 | [Constellation.md](Constellation.md) |
-| `superscalar` | 0.5.30 | [Superscalar.md](Superscalar.md) |
+| `superscalar` | 0.5.31 | [Superscalar.md](Superscalar.md) |
 | `hyperbrief` | 0.9.2 | [Hyperbrief.md](Hyperbrief.md) |
 | `greatpractice` | 0.3.5 | [Greatpractice.md](Greatpractice.md) |
 | `ultrasafe` | 0.2.16 | [Ultrasafe.md](Ultrasafe.md) |
 | `compendium` | 0.2.12 | [Compendium.md](Compendium.md) |
-| `corporate` | 0.1.9 | [Corporate.md](Corporate.md) |
+| `corporate` | 0.1.10 | [Corporate.md](Corporate.md) |
 
 **Specification-stage modules** — shipped as a spec, with no plugin to install yet. They are
 in this edition because a module spec is the record of what changed, and they are listed
