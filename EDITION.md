@@ -1,14 +1,14 @@
-# EG OS — edition 2026.11.15
+# EG OS — edition 2026.11.16
 
 > This repository is **composed**, not authored. Every file here is extracted from a single
 > upstream commit by `compose-eg.cjs`. Do not edit it in place — fix it upstream and recompose.
 
 | | |
 |---|---|
-| Edition | `2026.11.15` |
+| Edition | `2026.11.16` |
 | Upstream | [EstreGenesis](https://github.com/SoliEstre/EstreGenesis) |
-| Source commit | `27d6a785376e94692745e6b35381181fcaef9889` |
-| Source tag | `v2.6.186` |
+| Source commit | `600e2d6eb14d88de5d8056c53aca55e5036b56f6` |
+| Source tag | `v2.6.187` |
 
 ## Modules in this edition
 
@@ -16,7 +16,7 @@
 |---|---|---|
 | `estregenesis` | 0.4.2 | _(kit — no spec)_ |
 | `constellation` | 0.3.46 | [Constellation.md](Constellation.md) |
-| `superscalar` | 0.5.36 | [Superscalar.md](Superscalar.md) |
+| `superscalar` | 0.5.37 | [Superscalar.md](Superscalar.md) |
 | `hyperbrief` | 0.9.3 | [Hyperbrief.md](Hyperbrief.md) |
 | `greatpractice` | 0.3.5 | [Greatpractice.md](Greatpractice.md) |
 | `ultrasafe` | 0.2.16 | [Ultrasafe.md](Ultrasafe.md) |
